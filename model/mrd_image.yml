@@ -1,0 +1,132 @@
+ImageFlags: !flags
+  base: uint64
+  values:
+    isNavigationData: 0x1
+    firstInAverage: 0x10
+    lastInAverage: 0x20
+    firstInSlice: 0x40
+    lastInSlice: 0x80
+    firstInContrast: 0x100
+    lastInContrast: 0x200
+    firstInPhase: 0x400
+    lastInPhase: 0x800
+    firstInRepetition: 0x1000
+    lastInRepetition: 0x2000
+    firstInSet: 0x4000
+    lastInSet: 0x8000
+
+# EDIT: Image Type. Used flags to allow requests for multiple types with one command. Added 'quantitative' types
+ImageType: !flags
+  base: uint64
+  values:
+    magnitude: 0x1
+    phase: 0x2
+    real: 0x4
+    imag: 0x8
+    complex: 0x10
+    bitmap: 0x20           # a uint32 image in which MSB = R, G, B, LSB = alpha
+    spinDensityMap: 0x40   # in mol/m^3
+    t1Map: 0x80            # in s
+    t2Map: 0x100           # in s
+    t2starMap: 0x200       # in s
+    adcMap: 0x400          # in s/m^2
+    b0Map: 0x800           # in Hz (offset from Image.head.measurementFreq[0])
+    b1Map: 0x1000          # in rad/s/V, channel dimension is xmit channels
+    sensitivityMap: 0x2000 # in Vm^3/mol, channel dimension is rcv channels
+    userMap: 0x4000        # details found in free form text descriptor in image metadata (Image.meta)
+
+ImageData<Y>: !array
+  items: Y
+  dimensions:
+    channel:
+    z:
+    y:
+    x:
+    freq: # SKADD 8/17/25
+
+ImageHeader: !record
+  fields:
+    # A bit mask of common attributes applicable to individual images
+    flags: ImageFlags
+    # Unique ID corresponding to the image
+    measurementUid: uint
+    # NMR frequencies of this measurement (Hz). Same size as ImageData freq dimension SKADD 2/7/25
+    measurementFreq: uint[]?
+    # NMR label of the measurementFreqs. Same size as measurementFreq. SKADD 8/17/25
+    measurementFreqLabel: string[]?
+    # Physical size (in mm) in each of the 3 dimensions in the image
+    fieldOfView: float[3]
+    # Center of the excited volume, in LPS coordinates relative to isocenter in millimeters
+    position: float[3]
+    # Directional cosine of readout/frequency encoding
+    colDir: float[3]
+    # Directional cosine of phase encoding (2D)
+    lineDir: float[3]
+    # Directional cosine of 3D phase encoding direction
+    sliceDir: float[3]
+    # Offset position of the patient table, in LPS coordinates
+    patientTablePosition: float[3]
+    # Signal average
+    average: uint?
+    # Slice number (multi-slice 2D)
+    slice: uint?
+    # Echo number in multi-echo
+    contrast: uint?
+    # Cardiac phase
+    phase: uint?
+    # Counter in repeated/dynamic acquisitions
+    repetition: uint?
+    # Sets of different preparation, e.g. flow encoding, diffusion weighting
+    set: uint?
+    # Clock time stamp, ns since midnight
+    acquisitionTimeStampNs: uint64?
+    # Time stamp ns relative to physiological triggering, e.g. ECG, pulse oximetry, respiratory
+    physiologyTimeStampNs: uint64*
+    # Interpretation type of the image
+    imageType: ImageType
+    # Image index number within a series of images, corresponding to DICOM InstanceNumber (0020,0013)
+    imageIndex: uint?
+    # Series index, used to separate images into different series, corresponding to DICOM SeriesNumber (0020,0011)
+    imageSeriesIndex: uint?
+    # User-defined int parameters
+    userInt: int*
+    # User-defined float parameters
+    userFloat: float*
+
+ImageMetaValue: [string, long, double]
+
+ImageMeta: string->ImageMetaValue*
+
+Image<T>: !record
+  fields:
+    # Image header
+    head: ImageHeader
+    # Image data array
+    data: ImageData<T>
+    # Meta attributes
+    meta: ImageMeta
+  computedFields:
+    channels: size(data, "channel")
+    slices: size(data, "z")
+    rows: size(data, "y")
+    cols: size(data, "x")
+
+ImageUint16: Image<uint16>
+ImageInt16: Image<int16>
+ImageUint32: Image<uint>
+ImageInt32: Image<int>
+ImageFloat: Image<float>
+ImageDouble: Image<double>
+ImageComplexFloat: Image<complexfloat>
+ImageComplexDouble: Image<complexdouble>
+
+# Union of all MRD Image types
+AnyImage:
+  - ImageUint16
+  - ImageInt16
+  - ImageUint32
+  - ImageInt32
+  - ImageFloat
+  - ImageDouble
+  - ImageComplexFloat
+  - ImageComplexDouble

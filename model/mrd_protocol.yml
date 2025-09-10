@@ -1,0 +1,32 @@
+# Union of all primary types that can be streamed in the MRD Protocol
+StreamItem:
+  - Acquisition
+  - Pulse
+  - Gradient
+  - WaveformUint32
+  - ImageUint16
+  - ImageInt16
+  - ImageUint32
+  - ImageInt32
+  - ImageFloat
+  - ImageDouble
+  - ImageComplexFloat
+  - ImageComplexDouble
+  - AcquisitionBucket
+  - ReconData
+  - ArrayComplexFloat
+  - ImageArray
+
+
+# The MRD Protocol
+Mrd: !protocol
+  sequence:
+    header: Header?
+    data: !stream
+      items: StreamItem
+
+
+# Protocol for serializing a noise covariance matrix
+MrdNoiseCovariance: !protocol
+  sequence:
+    noiseCovariance: NoiseCovariance

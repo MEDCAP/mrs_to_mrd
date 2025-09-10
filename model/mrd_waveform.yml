@@ -1,0 +1,27 @@
+WaveformSamples<T>: !array
+  items: T
+  dimensions:
+    - channels
+    - samples
+
+Waveform<T>: !record
+  fields:
+    # Bit field of flags. Currently unused
+    flags: uint64
+    # Unique ID for this measurement
+    measurementUid: uint
+    # Number of the acquisition after this waveform
+    scanCounter: uint
+    # EDIT: Starting timestamp of this waveform, nanoseconds since midnight
+    timeStampNs: uint64
+    # EDIT: Time between samples in nanoseconds
+    sampleTimeNs: uint64
+    # ID matching the waveform in the MRD header
+    waveformId: uint
+    # Waveform sample array
+    data: WaveformSamples<T>
+  computedFields:
+    channels: size(data, "channels")
+    numberOfSamples: size(data, "samples")
+
+WaveformUint32: Waveform<uint32>
