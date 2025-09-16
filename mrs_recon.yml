@@ -1,0 +1,25 @@
+'''
+h5 file to stream as command, stream pipe to output
+ismrmrd_hdf5_to_stream -i testdata.h5 --use-stdout \
+| tyger run exec -f  basic_gadgetron.yml \
+| ismrmrd_stream_to_hdf5 --use-stdin -o out_basic.h5
+
+Start a bash shell in the tyger to use unix commands
+command:
+  - "bash"
+  - "-c" 
+  - "echo "
+
+'''
+
+job:
+  codespec:
+    image: ghcr.io/medcap/mrsrecon:latest
+    buffers:
+      inputs:
+        - input
+      outputs:
+        - output
+    args:
+      - python
+      
