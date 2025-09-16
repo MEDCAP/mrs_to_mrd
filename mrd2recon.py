@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 from statistics import mode
 import os
 from scipy.optimize import minimize, Bounds
+from typing import BinaryIO
+
 from MRSreader import MRSdata
 from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
         lorngetpeakparams, lornputpeakparams
@@ -41,7 +43,7 @@ def get_clarg(clarg, arg, ty):
         if(clargarr[iarg] == arg):
             return(ty(clargarr[iarg + 1]))
 
-def generate_epsi_images(h, m):
+def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.ndarray, peaknames: list):
     # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
     time_between_images = 3   # approximately 3s between images
     nmet = m.shape[0]
@@ -58,7 +60,7 @@ def generate_epsi_images(h, m):
         elif(ide == nimg - 1):
             imghead.flags = mrd.ImageFlags.LAST_IN_SET
         imghead.measurement_uid = ide
-        imghead.measurement_freq = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
+        imghead.measurement_freq = measfreq + np.uint32(measfreq * np.array(peakoffsets) / 1E+6 + 0.5)
         imghead.measurement_freq_label = np.array(peaknames, dtype=np.dtype(np.object_))
         imghead.field_of_view = fov
         imghead.position = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
@@ -79,10 +81,10 @@ def generate_epsi_images(h, m):
         imghead.image_series_index = ide
         imghead.user_int = []
         imghead.user_float = []
-        img = mrd.Image(head=imghead, data=np.expand_dims(np.transpose(m[:, ide, :, :]), (0, 1)))
+        img = mrd.Image(head=imghead, data=np.expand_dims(np.transpose(metabolite[:, ide, :, :]), (0, 1)))
         yield(mrd.StreamItem.ImageDouble(img))
 
-def epsi_recon():
+def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: np.ndarray):
     auximages = []
     numimages = sum([a.head.flags & mrd.AcquisitionFlags.LAST_IN_PHASE == \
             mrd.AcquisitionFlags.LAST_IN_PHASE for a in raw_acquisition_list])
@@ -164,6 +166,7 @@ def epsi_recon():
     lornputspect(xscale, globalspect, widthguess, 1.0, debuglorn)
     # fit global spectrum to 6 lorentzians. Biggest peak has got to be either pyruvate or urea. 
     # Maybe some day this will fail if it's lactate
+    npeaks = len(peakoffsets)
     x0 = np.zeros(((4 * npeaks) + 2))
     x1 = np.zeros((len(biggestpeaklist), len(x0)))
     diff = np.zeros((len(biggestpeaklist)))
@@ -274,7 +277,7 @@ def generate_spectra(h, measurementtimes_ns, peakfrequencies, peakamplitudes, sp
         spect = mrd.Image(head=imghead, data=np.expand_dims(np.transpose(peakamplitudes[:, ispect]), (0, 1, 2, 3)))
         yield(mrd.StreamItem.ImageDouble(spect))
 
-def spectra_recon(h):
+def spectra_recon(h, raw_acquisition_list: list, npeaks, wigglefactor):
     auximages = []
     numspectra = len(raw_acquisition_list)
     a = raw_acquisition_list[0]
@@ -326,11 +329,11 @@ def spectra_recon(h):
     lornputspect(xscale, globalspect, widthguess, wigglefactor, debuglorn)
     # fit global spectrum to npeaks lorentzians.
     x0 = np.zeros(((4 * npeaks) + 2))
-    x1 = np.zeros((len(biggestpeaklist), len(x0)))
-    diff = np.zeros((len(biggestpeaklist)))
-    for icg in range(len(biggestpeaklist)):
+    x1 = np.zeros((len(biggestpeakidx), len(x0)))
+    diff = np.zeros((len(biggestpeakidx)))
+    for icg in range(len(biggestpeakidx)):
         centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
-                peakoffsets[biggestpeaklist[icg]])) % (BW / centerfreq * 1E+6)
+                peakoffsets[biggestpeakidx[icg]])) % (BW / centerfreq * 1E+6)
         for ip in range(npeaks):
              x0[3 * npeaks + ip] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
              x0[2 * npeaks + ip] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
@@ -343,7 +346,7 @@ def spectra_recon(h):
                  x1[icg, 2 * npeaks + ip] += np.pi
         diff[icg] = np.sum(np.abs(globalspect - lorneval(x1[icg, :])))
     centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
-                peakoffsets[biggestpeaklist[np.argmin(diff)]])) % (BW / centerfreq * 1E+6)
+                peakoffsets[biggestpeakidx[np.argmin(diff)]])) % (BW / centerfreq * 1E+6)
     lornputpeakparams(centers, np.ones((npeaks)) * widthguess, x0[(2 * npeaks):(3 * npeaks)], debuglorn)
     thex1 = x1[np.argmin(diff)]
     centers, widths, phases, amplitudes, baseline = lornunpackx0(thex1, debuglorn)

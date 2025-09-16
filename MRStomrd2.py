@@ -174,3 +174,6 @@ for g in groups:
             w.write_header(h)
         w.write_data(generate_acquisition(mrs, ig))
     w.close()
+
+# -u 3 consolidates the files as appropriate for EPSI. 
+# spectral data like Bukola's and David's uses -u 1
