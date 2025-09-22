@@ -3,14 +3,11 @@ import matplotlib.pyplot as plt
 import sys
 import os
 from statistics import mode
-sys.path.insert(0, 'python')
+sys.path.insert(0, '../../mrd-fork/python')
 import mrd
 from MRSreader import MRSdata
 
 mrs = MRSdata()
-
-# basedir = "C:/Users/steph/Desktop/data/shurik_all_ischemia_data_081425"
-# basedir = "C:/Users/steph/Desktop/data/cirrhrat data"
 
 def generate_acquisition(g, ide):
     # make the pulse, gradient, and (raw data) acquisitions. g is the MRSdata structure read in from an individual
@@ -92,14 +89,6 @@ def generate_acquisition(g, ide):
             a.phase = np.zeros((g.rawdata.shape[0]), dtype=np.float32)
             yield mrd.StreamItem.Acquisition(a)
 
-# def generate_dummy_image(mrs):
-#     img = mrd.Image(data=np.expand_dims(np.array([0.0]),(0,1,2,3)))
-#     img.image_type=mrd.ImageType.DUMMY
-#     img.head.field_of_view = np.array([mrs.FOV, mrs.FOV, mrs.FOV], dtype=np.float32) # use slc thk as param 3?
-#     img.head.position = np.array(mrs.FOVoff, dtype=np.float32)
-#     img.head.measurement_freq = np.uint32(mrs.basefreq)
-#     yield mrd.StreamItem.ImageDouble(img)
-
 def groupMRDfiles_collect(rootdir):
     l = []
     d = os.listdir(rootdir)
@@ -108,7 +97,6 @@ def groupMRDfiles_collect(rootdir):
             l.extend(groupMRDfiles_collect(rootdir + '/' + f))
         elif(f.find('.MRD') > 0):
             l.append(rootdir + '/' + f)
-#            return([rootdir + '/' + f])
     return(l)
 
 def groupMRDfiles(rootdir, unifylevel):
@@ -132,20 +120,24 @@ def groupMRDfiles(rootdir, unifylevel):
             groups.append([f])
     return(groups)
 
-def make_header(mrs):
+def make_header(mrs, measID):
     # make mrd2 header. For now only filling in sequence name but some day should do more
     h = mrd.Header()
     h.measurement_information = mrd.MeasurementInformationType()
     h.measurement_information.sequence_name = mrs.pplfile
-    h.measurement_information.measurement_id = 'THE NAME OF THE FOLDER'
-    clargs = '-fovl ' + str(mrs.FOV) + ' -fovp ' + str(mrs.FOV) + ' -fovs ' + str(mrs.FOV)
-    clargs += ' -fovposl ' + str(mrs.FOVoff[0]) + ' -fovposp ' + str(mrs.FOVoff[1]) + ' -fovposs ' + str(mrs.FOVoff[2])
-    clargs += ' -freq ' + str(mrs.basefreq)
-    up = mrd.UserParametersType()
-    up.user_parameter_string = [mrd.UserParameterStringType()]
-    up.user_parameter_string[0].name = 'clargs'
-    up.user_parameter_string[0].value = clargs
-    h.user_parameters = up
+    h.measurement_information.relative_table_position = mrd.ThreeDimensionalFloat()
+    # this may be a misuse of the relative table position but I couldn't find FOV offset anywhere
+    h.measurement_information.relative_table_position.x = mrs.FOVoff[0]
+    h.measurement_information.relative_table_position.y = mrs.FOVoff[1]
+    h.measurement_information.relative_table_position.z = mrs.FOVoff[2]
+    # This is definitely a misuse of h1 resonance frequency for non-1H acquisitions
+    h.experimental_conditions.h1_resonance_frequency_hz = mrs.basefreq
+    h.measurement_information.measurement_id = measID
+    et = mrd.EncodingType()
+    et.encoded_space.field_of_view_mm.x = mrs.FOV
+    et.encoded_space.field_of_view_mm.y = mrs.FOV
+    et.encoded_space.field_of_view_mm.z = mrs.FOV
+    h.encoding = [et]
     return(h)
 
 # MAIN SCRIPT
@@ -170,6 +162,7 @@ groups = groupMRDfiles(basedir, unifylevel)
 groups = [[f for f in g if os.path.getsize(f) == mode([os.path.getsize(f) for f in g])] for g in groups]
 
 for g in groups:
+    measID = g[0].split('/')[-(unifylevel + 1)]
     basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
     print('grouping', len(g), 'files into', basedir)
     w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
@@ -177,7 +170,7 @@ for g in groups:
     for ig in range(len(g)):
         mrs.mread3d(g[ig])
         if(ig == 0):
-            h = make_header(mrs)
+            h = make_header(mrs, measID)
             w.write_header(h)
         w.write_data(generate_acquisition(mrs, ig))
     w.close()

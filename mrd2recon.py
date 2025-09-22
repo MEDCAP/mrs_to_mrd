@@ -46,13 +46,10 @@ def generate_epsi_images(h, m):
     time_between_images = 3   # approximately 3s between images
     nmet = m.shape[0]
     nimg = m.shape[1]
-    # change this to search out the "clarg" user parameter
-    clarg = h.user_parameters.user_parameter_string[0].value
-    measfreq = get_clarg(clarg, '-freq', np.uint32)
-    fov = np.array([get_clarg(clarg, '-fovl', np.float32), get_clarg(clarg, '-fovp', np.float32), \
-            get_clarg(clarg, '-fovs', np.float32)])
-    pos = np.array([get_clarg(clarg, '-fovposl', np.float32), get_clarg(clarg, '-fovposp', np.float32), \
-            get_clarg(clarg, '-fovposs', np.float32)])
+    measfreq = h.experimental_conditions.h1_resonance_frequency
+    fov = np.array([h.encoding[0].encoded_space.field_of_view_mm.x, h.encoding[0].encoded_space.field_of_view_mm.y, \
+            h.encoding[0].encoded_space.field_of_view_mm.z])
+    pos = h.measurement_information.relative_table_position
     for ide in range(nimg):
         imghead = mrd.ImageHeader(image_type=mrd.ImageType.MAGNITUDE)
         if(ide == 0):
@@ -61,6 +58,7 @@ def generate_epsi_images(h, m):
             imghead.flags = mrd.ImageFlags.LAST_IN_SET
         imghead.measurement_uid = ide
         imghead.measurement_freq = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
+    measfreq = h.experimental_conditions.h1_resonance_frequency
         imghead.measurement_freq_label = np.array(peaknames, dtype=np.dtype(np.object_))
         imghead.field_of_view = fov
         imghead.position = pos
@@ -241,8 +239,7 @@ def generate_spectra(h, measurementtimes_ns, peakfrequencies, peakamplitudes, sp
     # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
     nspect = spectra.shape[0]
     ntimepoints = spectra.shape[1]
-    clarg = h.user_parameters.user_parameter_string[0].value
-    measfreq = get_clarg(clarg, '-freq', np.uint32)
+    measfreq = h.experimental_conditions.h1_resonance_frequency
     for ispect in range(nspect):
         # 'image' that is the measured spectrum at this time point
         imghead = mrd.ImageHeader(image_type=mrd.ImageType.COMPLEX)
@@ -432,7 +429,6 @@ npeaks = len(peakoffsets)
 for f in fnames:
     with mrd.BinaryMrdReader(f) as w:
         raw_header = w.read_header()
-        clarg = raw_header.user_parameters.user_parameter_string[0].value
         raw_streamables_list = list(w.read_data())
         raw_pulse_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Pulse]
         raw_pulse_list.sort(key = lambda x: x.head.pulse_time_stamp_ns)
