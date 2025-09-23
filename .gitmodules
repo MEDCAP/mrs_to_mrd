@@ -1,4 +1,4 @@
 [submodule "mrd-fork"]
 	path = mrd-fork
-	url = git@github.com:MEDCAP/mrd-fork.git
+	url =  https://github.com/MEDCAP/mrd-fork.git
 	branch = dev
