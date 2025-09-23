@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import sys
 import os
 from statistics import mode
-sys.path.insert(0, '../../mrd-fork/python')
+sys.path.insert(0, 'mrd-fork/python')
 import mrd
 from MRSreader import MRSdata
 

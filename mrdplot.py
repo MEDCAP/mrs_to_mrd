@@ -3,7 +3,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import mapvbvd
-sys.path.insert(0, '../../mrd-fork/python')
+sys.path.insert(0, 'mrd-fork/python')
 import mrd
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
