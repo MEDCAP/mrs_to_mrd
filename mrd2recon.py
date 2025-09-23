@@ -46,7 +46,7 @@ def generate_epsi_images(h, m):
     time_between_images = 3   # approximately 3s between images
     nmet = m.shape[0]
     nimg = m.shape[1]
-    measfreq = h.experimental_conditions.h1_resonance_frequency
+    measfreq = h.experimental_conditions.h1resonance_frequency_hz
     fov = np.array([h.encoding[0].encoded_space.field_of_view_mm.x, h.encoding[0].encoded_space.field_of_view_mm.y, \
             h.encoding[0].encoded_space.field_of_view_mm.z])
     pos = h.measurement_information.relative_table_position
@@ -58,7 +58,6 @@ def generate_epsi_images(h, m):
             imghead.flags = mrd.ImageFlags.LAST_IN_SET
         imghead.measurement_uid = ide
         imghead.measurement_freq = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
-    measfreq = h.experimental_conditions.h1_resonance_frequency
         imghead.measurement_freq_label = np.array(peaknames, dtype=np.dtype(np.object_))
         imghead.field_of_view = fov
         imghead.position = pos
