@@ -199,9 +199,12 @@ def epsi_recon():
     plt.plot(xscale, np.real(specteval), 'k')
     plt.plot(xscale, np.imag(specteval), 'k')
     plt.gcf().canvas.draw()
-    thisbmp = np.array(plt.gcf().canvas.renderer._renderer, dtype=np.uint32)
-    thisbmp[:,:,0] = thisbmp[:,:,0]*2**12 + thisbmp[:,:,1]*2**8 + thisbmp[:,:,2]*2**4 + thisbmp[:,:,3]
-    auximages.append(thisbmp[:,:,0])
+    width, height = plt.gcf().canvas.get_width_height()
+    bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
+    bmp = bmp.astype(np.uint32)
+    encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
+    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*256 + bmp[:,:,3]
+    auximages.append(encodedbmp)
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
@@ -354,9 +357,11 @@ def spectra_recon(h):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
     plt.gcf().canvas.draw()
-    thisbmp = np.array(plt.gcf().canvas.renderer._renderer, dtype=np.uint32)
-    thisbmp[:,:,0] = thisbmp[:,:,0]*2**12 + thisbmp[:,:,1]*2**8 + thisbmp[:,:,2]*2**4 + thisbmp[:,:,3]
-    auximages.append(thisbmp[:,:,0])
+    width, height = plt.gcf().canvas.get_width_height()
+    bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
+    encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
+    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*256 + bmp[:,:,3]
+    auximages.append(encodedbmp)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
     peakamplitudes = np.zeros((npeaks, numspectra))
@@ -379,9 +384,11 @@ def spectra_recon(h):
     for ipeak in range(npeaks):
         plt.plot(np.array(measurementtimes_ns) * 1.0E-9, peakamplitudes[ipeak,:])
     plt.gcf().canvas.draw()
-    thisbmp = np.array(plt.gcf().canvas.renderer._renderer, dtype=np.uint32)
-    thisbmp[:,:,0] = thisbmp[:,:,0]*2**12 + thisbmp[:,:,1]*2**8 + thisbmp[:,:,2]*2**4 + thisbmp[:,:,3]
-    auximages.append(thisbmp[:,:,0])
+    width, height = plt.gcf().canvas.get_width_height()
+    bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
+    encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
+    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*256 + bmp[:,:,3]
+    auximages.append(encodedbmp)
     return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
             peakamplitudes, auximages)
 
@@ -425,6 +432,10 @@ fnames = findmrd2files(basedir, targetfiletype)
 peakoffsets = np.array(peakoffsets)
 npeaks = len(peakoffsets)
 
+def generate_streamables(l):
+    for s in l:
+        yield(s)
+
 # read raw data mrd file
 for f in fnames:
     print('doing', f)
@@ -442,6 +453,8 @@ for f in fnames:
     with mrd.BinaryMrdWriter(f.replace('raw.mrd2', 'recon.mrd2')) as w:
         # write output file header
         w.write_header(raw_header)
+        w.write_data(raw_streamables_list)
+#        w.write_data(generate_streamables(raw_streamables_list))
         if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
             [metabolites, auximages] = epsi_recon()
             w.write_data(generate_epsi_images(raw_header, metabolites))

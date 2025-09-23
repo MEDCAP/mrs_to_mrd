@@ -9,6 +9,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from scipy.ndimage import zoom
 
+current_filename = ""
 current_header = []
 current_streamables_list = []
 current_pulse_list = []
@@ -16,8 +17,10 @@ current_gradient_list = []
 current_acquisition_list = []
 current_image_list = []
 
-# read all streamable items and sort them into types
-with mrd.BinaryMrdReader(sys.stdin.buffer) as w:
+refresh_plot = 0
+
+fname = 'C:\\Users\\steph\\Desktop\\data\\shurik_all_ischemia_data_081425\\ischemia_100_1\\recon.mrd2'
+with mrd.BinaryMrdReader(fname) as w:
     current_header = w.read_header()
     current_streamables_list = list(w.read_data())
     current_pulse_list = [x.value for x in current_streamables_list if type(x.value) == mrd.Pulse]
@@ -27,11 +30,9 @@ with mrd.BinaryMrdReader(sys.stdin.buffer) as w:
     current_acquisition_list = [x.value for x in current_streamables_list if type(x.value) == mrd.Acquisition]
     current_acquisition_list.sort(key = lambda x: x.head.acquisition_time_stamp_ns)
     current_image_list = [x.value for x in current_streamables_list if type(x.value) == mrd.Image]
-    # images do not necessarily have a time, so don't sort them
-
+#    current_image_list.sort(key = lambda x: x.head.acquisition_time_stamp_ns)
 plt.figure()
 if(current_pulse_list):
-    # draw pulses
     plt.subplot(3,1,1)
     for p in current_pulse_list:
         for q in range(p.amplitude.shape[0]):
@@ -41,7 +42,6 @@ if(current_pulse_list):
     plt.xlabel('time (s)')
     plt.ylabel('pulse amplitude (V)')
 if(current_gradient_list):
-    # draw gradients
     plt.subplot(3,1,2)
     for g in current_gradient_list:
         plt.plot((np.array(range(len(g.rl))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
@@ -53,7 +53,6 @@ if(current_gradient_list):
     plt.xlabel('time (s)')
     plt.ylabel('pulse amplitude (V)')
 if(current_acquisition_list):
-    # draw acquisition raw data
     plt.subplot(3,1,3)
     for a in current_acquisition_list:
         plt.plot(np.array(range(len(a.data))) * a.head.sample_time_ns + a.head.acquisition_time_stamp_ns, \
@@ -61,45 +60,40 @@ if(current_acquisition_list):
         plt.plot(np.array(range(len(a.data))) * a.head.sample_time_ns + a.head.acquisition_time_stamp_ns, \
                 np.imag(a.data[:,0]))
 plt.show()
-
 if(current_image_list):
     nimg = 0
     for i in current_image_list:
         if(i.head.image_type == mrd.ImageType.BITMAP):
-            # show each bitmap figure in a separate window
-            bmp = np.squeeze(i.data)
+            bmp = np.squeeze(i.data).copy()
             unpacked_bmp = np.zeros([bmp.shape[0], bmp.shape[1], 4], dtype=np.uint8)
             unpacked_bmp[:,:,0] = ((bmp & 0x000000FF) / 2**0).astype(np.uint8)
-            unpacked_bmp[:,:,1] = ((bmp & 0x0000FF00) / 2**8).astype(np.uint8)
-            unpacked_bmp[:,:,2] = ((bmp & 0x00FF0000) / 2**16).astype(np.uint8)
-            unpacked_bmp[:,:,3] = ((bmp & 0xFFFF0000) / 2**24).astype(np.uint8)
+            unpacked_bmp[:,:,1] = ((bmp & 0x0000FF00) / 2**4).astype(np.uint8)
+            unpacked_bmp[:,:,2] = ((bmp & 0x00FF0000) / 2**8).astype(np.uint8)
+            unpacked_bmp[:,:,3] = ((bmp & 0x00FF0000) / 2**12).astype(np.uint8)
             plt.imshow(unpacked_bmp)
             plt.show()
         else:
-            # this is a metabolite image (for epsi)
             nimg += 1
             metshape = np.shape(i.data)[-3:] + (nimg,)
-    zf = 2 # zoom factor for image interpolation
+    zf = 2
     met = np.zeros(metshape, dtype=np.float32)
-    [height, width, nmet, nimg] = metshape
-    plotfig = np.zeros((height * nmet * zf, width * nimg * zf))
-    iimg = 0
+    plotfig = np.zeros((met.shape[0]*met.shape[2]*zf, met.shape[1]*met.shape[3]*zf))
+    nimg = 0
     for i in current_image_list:
         if(i.head.image_type == mrd.ImageType.BITMAP):
             continue
-        # put this image's data into the global metabolite array (for plotting and saving)
-        met[: ,: ,:, iimg] = np.squeeze(i.data)
-        iimg += 1
-    for imet in range(nmet):
-        # find maximum (positive or negative) for scaling 
-        themax = np.max(met[:, :, imet, :])
-        for iimg in range(nimg):
-            thisimg = met[:, :, imet, iimg]
-            plotfig[(imet * height * zf):((imet + 1) * height * zf), (iimg * width * zf):((iimg + 1) * width * zf)] = \
-                    zoom(np.rot90(thisimg), zf, order=2) / themax
-            plotfig[imet * height * zf, :] = 1
-    plt.imshow(plotfig, cmap='gray')
+        met[:,:,:,nimg] = np.squeeze(i.data)
+        nimg += 1
+    for j in range(met.shape[2]):
+        themax = np.max(met[:,:,:,j])
+        if(np.max(-met[j,:,:,:]) > themax):
+            themax = np.max(-met[j,:,:,:])
+        for k in range(met.shape[3]):
+            thisimg = met[:,:,j,k]
+            plotfig[(j*met.shape[0]*zf):((j+1)*met.shape[0]*zf),(k*met.shape[1]*zf):((k+1)*met.shape[1]*zf)] = \
+                    zoom(np.rot90(thisimg),zf,order=2) / themax
+            plotfig[j*met.shape[0]*zf,:] = 1
+    plt.imshow(plotfig,cmap='gray')
     plt.xticks([])
     plt.yticks([])
     plt.show()
-    np.save(sys.stdout.buffer, met)
