@@ -59,7 +59,6 @@ def generate_epsi_images(h, m):
             imghead.flags = mrd.ImageFlags.LAST_IN_SET
         imghead.measurement_uid = ide
         imghead.measurement_freq = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
-        measfreq = h.experimental_conditions.h1resonance_frequency_hz
         imghead.measurement_freq_label = np.array(peaknames, dtype=np.dtype(np.object_))
         imghead.field_of_view = fov
         imghead.position = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
