@@ -7,7 +7,7 @@ from MRSreader import MRSdata
 from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
         lorngetpeakparams, lornputpeakparams
 import sys
-sys.path.insert(0, '../../mrd-fork/python')
+sys.path.insert(0, 'python')
 import mrd
 
 debugphasing = False
@@ -30,7 +30,7 @@ def findmrd2files(basedir, targetfiletype):
 
 def generate_aux_images(imglist):
     for iimg in range(len(imglist)):
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.RGBA)
+        imghead = mrd.ImageHeader(image_type=mrd.ImageType.BITMAP)
         img = mrd.Image(head=imghead, data=np.expand_dims(imglist[iimg], (2, 3, 4)))
         yield(mrd.StreamItem.ImageUint32(img))
 
@@ -46,9 +46,10 @@ def generate_epsi_images(h, m):
     time_between_images = 3   # approximately 3s between images
     nmet = m.shape[0]
     nimg = m.shape[1]
-    measfreq = h.experimental_conditions.h1_resonance_frequency
-    fov = np.array([h.encoding[0].encoded_space.field_of_view_mm.x, h.encoding[0].encoded_space.field_of_view_mm.y, \
-            h.encoding[0].encoded_space.field_of_view_mm.z])
+    measfreq = h.experimental_conditions.h1resonance_frequency_hz
+    fov = np.array([h.encoding[0].encoded_space.field_of_view_mm.x, \
+            h.encoding[0].encoded_space.field_of_view_mm.y, \
+            h.encoding[0].encoded_space.field_of_view_mm.z], dtype=np.float32)
     pos = h.measurement_information.relative_table_position
     for ide in range(nimg):
         imghead = mrd.ImageHeader(image_type=mrd.ImageType.MAGNITUDE)
@@ -58,10 +59,10 @@ def generate_epsi_images(h, m):
             imghead.flags = mrd.ImageFlags.LAST_IN_SET
         imghead.measurement_uid = ide
         imghead.measurement_freq = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
-    measfreq = h.experimental_conditions.h1_resonance_frequency
+        measfreq = h.experimental_conditions.h1resonance_frequency_hz
         imghead.measurement_freq_label = np.array(peaknames, dtype=np.dtype(np.object_))
         imghead.field_of_view = fov
-        imghead.position = pos
+        imghead.position = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
         imghead.col_dir = np.zeros((3,), dtype=np.dtype(np.float32))
         imghead.line_dir = np.zeros((3,), dtype=np.dtype(np.float32))
         imghead.slice_dir = np.zeros((3,), dtype=np.dtype(np.float32))
@@ -239,7 +240,7 @@ def generate_spectra(h, measurementtimes_ns, peakfrequencies, peakamplitudes, sp
     # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
     nspect = spectra.shape[0]
     ntimepoints = spectra.shape[1]
-    measfreq = h.experimental_conditions.h1_resonance_frequency
+    measfreq = h.experimental_conditions.h1resonance_frequency_hz
     for ispect in range(nspect):
         # 'image' that is the measured spectrum at this time point
         imghead = mrd.ImageHeader(image_type=mrd.ImageType.COMPLEX)
@@ -427,6 +428,7 @@ npeaks = len(peakoffsets)
 
 # read raw data mrd file
 for f in fnames:
+    print('doing', f)
     with mrd.BinaryMrdReader(f) as w:
         raw_header = w.read_header()
         raw_streamables_list = list(w.read_data())
