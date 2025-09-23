@@ -10,6 +10,7 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
         lorngetpeakparams, lornputpeakparams
 import sys
 sys.path.insert(0, 'python')
+
 import mrd
 
 debugphasing = False
@@ -46,13 +47,15 @@ def get_clarg(clarg, arg, ty):
 def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.ndarray, peaknames: list):
     # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
     time_between_images = 3   # approximately 3s between images
-    nmet = m.shape[0]
-    nimg = m.shape[1]
-    measfreq = h.experimental_conditions.h1resonance_frequency_hz
-    fov = np.array([h.encoding[0].encoded_space.field_of_view_mm.x, \
-            h.encoding[0].encoded_space.field_of_view_mm.y, \
-            h.encoding[0].encoded_space.field_of_view_mm.z], dtype=np.float32)
-    pos = h.measurement_information.relative_table_position
+    nmet = metabolite.shape[0]
+    nimg = metabolite.shape[1]
+    # change this to search out the "clarg" user parameter
+    clarg = h.user_parameters.user_parameter_string[0].value
+    measfreq = get_clarg(clarg, '-freq', np.uint32)
+    fov = np.array([get_clarg(clarg, '-fovl', np.float32), get_clarg(clarg, '-fovp', np.float32), \
+            get_clarg(clarg, '-fovs', np.float32)])
+    pos = np.array([get_clarg(clarg, '-fovposl', np.float32), get_clarg(clarg, '-fovposp', np.float32), \
+            get_clarg(clarg, '-fovposs', np.float32)])
     for ide in range(nimg):
         imghead = mrd.ImageHeader(image_type=mrd.ImageType.MAGNITUDE)
         if(ide == 0):
@@ -394,57 +397,13 @@ def spectra_recon(h, raw_acquisition_list: list, npeaks, wigglefactor):
     auximages.append(encodedbmp)
     return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
             peakamplitudes, auximages)
-
-# read command line arguments
-wigglefactor = 1.0
-peakoffsets = []
-peaknames = []
-biggestpeaklist = []
-targetfiletype = ''
-for iarg in range(len(sys.argv) - 1):
-    try:
-        floatarg = float(sys.argv[iarg + 1])
-    except:
-        floatarg = np.nan
-    if(sys.argv[iarg] == '-f'):
-        basedir = sys.argv[iarg + 1]
-        print('setting base dir to', basedir)
-        continue
-    if(sys.argv[iarg] == '-w' and not np.isnan(floatarg)):
-        wigglefactor = floatarg
-        print('setting wiggle factor to', wigglefactor)
-        continue
-    if(sys.argv[iarg] == '-n'):
-        targetfiletype = sys.argv[iarg + 1]
-        print('setting target file type to', targetfiletype)
-        continue
-    if(sys.argv[iarg][0] == '-' and not np.isnan(floatarg)):
-        if(sys.argv[iarg][-1] == '*'):
-            # this peak is certified small, do not include it in the 'biggest peak' list
-            peaknames.append(sys.argv[iarg][1:-1])
-        else:
-            peaknames.append(sys.argv[iarg][1:])
-            biggestpeaklist.append(len(peaknames) - 1)
-        peakoffsets.append(floatarg)
-fnames = findmrd2files(basedir, targetfiletype)
-# now look for specification of metabolite peaks
-# BA's cirrhrat is -bic* 0.0 -urea 2.3 -pyr 9.7 -ala* 15.2 -hyd* 18.1 -lac 21.8
-# SZ's mouse kidney is -bic 0.0 -urea 2.3 -pyr 9.7 -ala 15.2 -poop 15.9 -hyd 18.1 -lac 21.8
-# BA's spectra is -bic* -0.4 -urea 2.1 -urea2* 2.3 -pyr 9.7 -ala* 15.2 -hyd* 18.1 -lac 21.8 -w 0.5
-# DT's spectra is -urea 0.0 -KIC 8.6 -leu* 13.0 -hyd* 18.1 -?* 21.8 -w 1.5
-peakoffsets = np.array(peakoffsets)
-npeaks = len(peakoffsets)
-
-def generate_streamables(l):
-    for s in l:
-        yield(s)
-
-# read raw data mrd file
-for f in fnames:
-    print('doing', f)
-    with mrd.BinaryMrdReader(f) as w:
-        raw_header = w.read_header()
-        raw_streamables_list = list(w.read_data())
+        
+# Take single file as input and reconstruct output
+def reconstruct_mrs(input: BinaryIO, output: BinaryIO, biggestpeakidx: list, peakoffsets: np.ndarray, peaknames: list):
+    with mrd.BinaryMrdReader(input) as reader:
+        raw_header = reader.read_header()
+        clarg = raw_header.user_parameters.user_parameter_string[0].value
+        raw_streamables_list = list(reader.read_data())
         raw_pulse_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Pulse]
         raw_pulse_list.sort(key = lambda x: x.head.pulse_time_stamp_ns)
         raw_gradient_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Gradient]
@@ -453,16 +412,61 @@ for f in fnames:
         raw_acquisition_list.sort(key = lambda x: x.head.acquisition_time_stamp_ns)
         img_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Image]
 
-    with mrd.BinaryMrdWriter(f.replace('raw.mrd2', 'recon.mrd2')) as w:
-        # write output file header
-        w.write_header(raw_header)
-        w.write_data(raw_streamables_list)
-#        w.write_data(generate_streamables(raw_streamables_list))
+    with mrd.BinaryMrdWriter(output) as writer:
+        # write the same header from input mrd file
+        writer.write_header(raw_header)
         if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
-            [metabolites, auximages] = epsi_recon()
-            w.write_data(generate_epsi_images(raw_header, metabolites))
+            [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
+            writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
         elif(raw_header.measurement_information.sequence_name.find('1pul') > -1):
             [measurementtimes_ns, spectra, peakfrequencies, peakamplitudes, auximages] = spectra_recon(raw_header)
-            w.write_data(generate_spectra(raw_header, measurementtimes_ns, peakfrequencies, peakamplitudes, spectra))
+            writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakfrequencies, peakamplitudes, spectra))
         if(len(auximages) > 0):
-            w.write_data(generate_aux_images(auximages))
+            writer.write_data(generate_aux_images(auximages))
+
+if __name__ == "__main__":
+    wigglefactor = 1.0
+    peakoffsets = []
+    peaknames = []
+    biggestpeakidx = []
+    targetfiletype = ''
+    for iarg in range(len(sys.argv) - 1):
+        try:
+            floatarg = float(sys.argv[iarg + 1])
+        except:
+            floatarg = np.nan
+        if(sys.argv[iarg] == '-f'):
+            basedir = sys.argv[iarg + 1]
+            print('setting base dir to', basedir)
+            continue
+        if(sys.argv[iarg] == '-w' and not np.isnan(floatarg)):
+            wigglefactor = floatarg
+            print('setting wiggle factor to', wigglefactor)
+            continue
+        if(sys.argv[iarg] == '-n'):
+            targetfiletype = sys.argv[iarg + 1]
+            print('setting target file type to', targetfiletype)
+            continue
+        if(sys.argv[iarg][0] == '-' and not np.isnan(floatarg)):
+            if(sys.argv[iarg][-1] == '*'):
+                # this peak is certified small, do not include it in the 'biggest peak' list
+                peaknames.append(sys.argv[iarg][1:-1])
+            else:
+                peaknames.append(sys.argv[iarg][1:])
+                biggestpeakidx.append(len(peaknames) - 1)
+            peakoffsets.append(floatarg)
+            print('peaknames', peaknames)
+            print('peakoffsets', peakoffsets)
+            print('bigpeaks', biggestpeakidx)
+
+    fnames = findmrd2files(basedir, targetfiletype)
+
+    # read raw data mrd file
+    for f in fnames:
+        reconstruct_mrs(f, f.replace('raw.mrd2', 'recon.mrd2'), biggestpeakidx, np.array(peakoffsets), peaknames)
+
+    # now look for specification of metabolite peaks
+    # BA's cirrhrat is -bic* 0.0 -urea 2.3 -pyr 9.7 -ala* 15.2 -hyd* 18.1 -lac 21.8
+    # SZ's mouse kidney is -bic 0.0 -urea 2.3 -pyr 9.7 -ala 15.2 -poop 15.9 -hyd 18.1 -lac 21.8
+    # BA's spectra is -bic* -0.4 -urea 2.1 -urea2* 2.3 -pyr 9.7 -ala* 15.2 -hyd* 18.1 -lac 21.8 -w 0.5
+    # DT's spectra is -urea 0.0 -KIC 8.6 -leu* 13.0 -hyd* 18.1 -?* 21.8 -w 1.5
