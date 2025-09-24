@@ -2,11 +2,11 @@ import sys
 import time
 import numpy as np
 import matplotlib.pyplot as plt
-import mapvbvd
+# import mapvbvd
 sys.path.insert(0, 'python')
 import mrd
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+# from watchdog.observers import Observer
+# from watchdog.events import FileSystemEventHandler
 from scipy.ndimage import zoom
 
 current_header = []
