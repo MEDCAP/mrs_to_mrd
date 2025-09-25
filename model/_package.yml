@@ -1,4 +1,0 @@
-namespace: Mrd
-
-python:
-  outputDir: ../python/
