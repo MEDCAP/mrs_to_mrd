@@ -28,5 +28,7 @@ else
 fi
 
 # call python scripts
-python MRStomrd2.py -f "$folder_path" -u 3
-python mrd2recon.py -f "$folder_path" -p "-bic 0.0 -urea 2.3 -pyr 9.7 -ala 15.2 -poop 15.9 -hyd 18.1 -lac 21.8"
+winpty python MRStomrd2.py -f "$folder_path" -u 3
+echo "run reconstruction code"
+winpty python mrd2recon.py -f "$folder_path" -p "-bic 0.0 -urea 2.3 -pyr 9.7 -ala 15.2 -poop 15.9 -hyd 18.1 -lac 21.8"
+# winpty python mrdplot.py -i "$folder_path\recon.mrd2"
