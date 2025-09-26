@@ -1,7 +1,9 @@
+# copy python scripts 
+# use conda environment to activate environment
+
 FROM python:3.12-slim
 WORKDIR /app
 LABEL org.opencontainers.image.source=https://github.com/MEDCAP/mrs_to_mrd
-
 
 # install dependencies
 COPY requirements.txt ./
