@@ -246,6 +246,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                         np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
                 x1 = minimize(lor1fit, x0, bounds=bounds)
                 metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
+    np.save('metabolites', metabolites)
     return([metabolites, auximages])
 
 def generate_spectra(h, measurementtimes_ns, peakfrequencies, peakamplitudes, spectra):
@@ -429,7 +430,7 @@ def reconstruct_mrs(input: BinaryIO, output: BinaryIO, biggestpeakidx: list, pea
         if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
             [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-            np.save(input.replace('raw.mrd2', 'metabolites.npy'), np.transpose(metabolites, (0,1,3,2)))
+            np.save(input.replace('raw.mrd2', 'metabolites.npy'), metabolites)
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
             # read_data can be called only once to get StreamItem
             # write_data can be rewritten by converting list of mrd objects to StreamItem
@@ -475,8 +476,8 @@ if __name__ == "__main__":
         fnames = findmrd2files(basedir, targetfiletype)
         for f in fnames:
             output_path = f.replace('raw.mrd2', 'recon.mrd2')
+            print('reconstructing', output_path)
             reconstruct_mrs(f, output_path, biggestpeakidx, np.array(peakoffsets), peaknames, wiggle)
-            print('reconstructed at', output_path)
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, biggestpeakidx, np.array(peakoffsets), peaknames, wiggle)
 
