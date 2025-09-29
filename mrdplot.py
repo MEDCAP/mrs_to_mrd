@@ -11,8 +11,6 @@ sys.path.append(os.path.join(Path(__file__).parent, 'mrd-fork','python'))
 import mrd
 # from watchdog.observers import Observer
 # from watchdog.events import FileSystemEventHandler
-# from watchdog.observers import Observer
-# from watchdog.events import FileSystemEventHandler
 from scipy.ndimage import zoom
 
 def plot_mrd(input: BinaryIO):
@@ -38,8 +36,7 @@ def plot_mrd(input: BinaryIO):
         print('found', len(current_pulse_list), 'pulses,', len(current_gradient_list), 'gradients,', \
             len(current_acquisition_list), 'acquisitions,', len(current_image_list), 'images')
 
-    plt.figure(1)
-    plt.title('figure1: pulses, gradients, acquisitions')
+    plt.figure()
     if(current_pulse_list):
         # draw pulses
         plt.subplot(3,1,1)
@@ -54,14 +51,14 @@ def plot_mrd(input: BinaryIO):
         # draw gradients
         plt.subplot(3,1,2)
         for g in current_gradient_list:
-            plt.plot((np.array(range(g.samples())) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
-                    1.0E-9, g.data)
-            # plt.plot((np.array(range(len(g.ap))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
-            #          1.0E-9, g.ap)
-            # plt.plot((np.array(range(len(g.fh))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
-            #          1.0E-9, g.fh)
+            plt.plot((np.array(range(len(g.rl))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
+                    1.0E-9, g.rl)
+            plt.plot((np.array(range(len(g.ap))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
+                    1.0E-9, g.ap)
+            plt.plot((np.array(range(len(g.fh))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
+                    1.0E-9, g.fh)
         plt.xlabel('time (s)')
-        plt.ylabel('pulse amplitude (V)')
+        plt.ylabel('gradient amplitude (mT/m)')
     if(current_acquisition_list):
         # draw acquisition raw data
         plt.subplot(3,1,3)
@@ -70,6 +67,10 @@ def plot_mrd(input: BinaryIO):
                     np.real(a.data[:,0]))
             plt.plot(np.array(range(len(a.data))) * a.head.sample_time_ns + a.head.acquisition_time_stamp_ns, \
                     np.imag(a.data[:,0]))
+        plt.xlabel('time (s)')
+        plt.ylabel('signal (uV)')
+    plt.xticks([])
+    plt.yticks([])
     plt.show()
 
     if(current_image_list):
@@ -83,35 +84,39 @@ def plot_mrd(input: BinaryIO):
                 unpacked_bmp[:,:,1] = ((bmp & 0x0000FF00) / 2**8).astype(np.uint8)
                 unpacked_bmp[:,:,2] = ((bmp & 0x00FF0000) / 2**16).astype(np.uint8)
                 unpacked_bmp[:,:,3] = ((bmp & 0xFFFF0000) / 2**24).astype(np.uint8)
+                plt.xticks([])
+                plt.yticks([])
                 plt.imshow(unpacked_bmp)
                 plt.show()
             else:
                 # this is a metabolite image (for epsi)
                 nimg += 1
                 metshape = np.shape(i.data)[-3:] + (nimg,)
+        print(metshape)
         zf = 2 # zoom factor for image interpolation
         met = np.zeros(metshape, dtype=np.float32)
-        [height, width, nmet, nimg] = metshape
-        plotfig = np.zeros((height * nmet * zf, width * nimg * zf))
-        iimg = 0
-        for i in current_image_list:
-            if(i.head.image_type == mrd.ImageType.BITMAP):
-                continue
-            # put this image's data into the global metabolite array (for plotting and saving)
-            met[: ,: ,:, iimg] = np.squeeze(i.data)
-            iimg += 1
-        for imet in range(nmet):
-            # find maximum (positive or negative) for scaling 
-            themax = np.max(met[:, :, imet, :])
-            for iimg in range(nimg):
-                thisimg = met[:, :, imet, iimg]
-                plotfig[(imet * height * zf):((imet + 1) * height * zf), (iimg * width * zf):((iimg + 1) * width * zf)] = \
-                        zoom(np.rot90(thisimg), zf, order=2) / themax
-                plotfig[imet * height * zf, :] = 1
-        plt.imshow(plotfig, cmap='gray')
-        plt.xticks([])
-        plt.yticks([])
-        plt.show()
+        if(metshape[0] * metshape[1] > 1):
+            [height, width, nmet, nimg] = metshape
+            plotfig = np.zeros((height * nmet * zf, width * nimg * zf))
+            iimg = 0
+            for i in current_image_list:
+                if(i.head.image_type == mrd.ImageType.BITMAP):
+                    continue
+                # put this image's data into the global metabolite array (for plotting and saving)
+                met[: ,: ,:, iimg] = np.squeeze(i.data)
+                iimg += 1
+            for imet in range(nmet):
+                # find maximum (positive or negative) for scaling 
+                themax = np.max(met[:, :, imet, :])
+                for iimg in range(nimg):
+                    thisimg = met[:, :, imet, iimg]
+                    plotfig[(imet * height * zf):((imet + 1) * height * zf), (iimg * width * zf):((iimg + 1) * width * zf)] = \
+                            zoom(np.rot90(thisimg), zf, order=2) / themax
+                    plotfig[imet * height * zf, :] = 1
+            plt.imshow(plotfig, cmap='gray')
+            plt.xticks([])
+            plt.yticks([])
+            plt.show()
         # np.save(sys.stdout.buffer, met)
 
 if __name__ == "__main__":
