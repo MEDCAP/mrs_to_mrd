@@ -1,9 +1,18 @@
+"""
+python script to convert MRS folder to MRD files in place
+"""
+
 import numpy as np
-import matplotlib.pyplot as plt
 import sys
 import os
+import argparse
 from statistics import mode
-sys.path.insert(0, 'python')
+
+# mrd python package
+# https://github.com/MEDCAP/mrd-fork/tree/dev# is added at root of this repository as a git submodule
+# path to mrd python package is 'root/mrd-fork/python' 
+from pathlib import Path
+sys.path.append(os.path.join(Path(__file__).parent, 'mrd-fork','python'))
 import mrd
 from MRSreader import MRSdata
 
@@ -49,7 +58,7 @@ def generate_acquisition(g, ide):
             a.head.acquisition_center_frequency = g.basefreq
             a.head.idx.phase = iacq
             a.head.acquisition_time_stamp_ns = pulse_start + np.uint64(TE * 1.0E+9)
-            a.head.num_echoes = g.nswitch
+            a.head.idx.contrast = g.nswitch
             totalppswitch = int(g.rawdata.shape[0] / g.nswitch + 0.7)
             a.head.discard_pre = int((totalppswitch - g.nppswitch) / 2)
             a.head.discard_post = a.head.discard_pre
@@ -83,7 +92,7 @@ def generate_acquisition(g, ide):
             print('writing center freq = ', a.head.acquisition_center_frequency)
             a.head.idx.repetition = iacq
             a.head.acquisition_time_stamp_ns = pulse_start + np.uint64(TE * 1.0E+9)
-            a.head.num_echoes = 1
+            a.head.idx.contrast = 1
             a.head.discard_pre = 0
             a.head.discard_post = 0
             a.head.sample_time_ns = g.sampleperiod * 100  # convert to ns (sampleperiod is in units of 100ns)
@@ -93,18 +102,20 @@ def generate_acquisition(g, ide):
 def groupMRDfiles_collect(rootdir):
     l = []
     d = os.listdir(rootdir)
+    # find all .MRD files in this directory and subdirectories
     for f in d:
         if(os.path.isdir(rootdir + '/' + f)):
             l.extend(groupMRDfiles_collect(rootdir + '/' + f))
-        elif(f.find('.MRD') > 0):
+        elif(f.find('.MRD') > 0)    :
             l.append(rootdir + '/' + f)
     return(l)
 
 def groupMRDfiles(rootdir, unifylevel):
     if(not os.path.isdir(rootdir)):
         return([])
-    l = groupMRDfiles_collect(basedir)
+    l = groupMRDfiles_collect(rootdir)
     groups = []
+    # for each .MRD files in the list,
     for f in l:
         fs = f.split('/')
         addedtogroup = False
@@ -141,37 +152,38 @@ def make_header(mrs, measID):
     h.encoding = [et]
     return(h)
 
-# MAIN SCRIPT
 # check to see if a directory is specified
-basedir = '.'
-for iarg in range(len(sys.argv)):
-    if(sys.argv[iarg] == '-f' and iarg < len(sys.argv) - 1):
-        basedir = sys.argv[iarg + 1]
-unifylevel = 1
-for iarg in range(len(sys.argv)):
-    if(sys.argv[iarg] == '-u' and iarg < len(sys.argv) - 1):
-        try:
-            unifylevel = int(sys.argv[iarg + 1])
-        except:
-            print('bad unify level set format')
-print('running with base director =', basedir)
-print('unify level set to', unifylevel)
+def convert_mrs_to_mrd(basedir, unifylevel):
+    # assemble groups of MRD files
+    groups = groupMRDfiles(basedir, unifylevel)
+    # clean groups so they all have the same length
+    groups = [[f for f in g if os.path.getsize(f) == mode([os.path.getsize(f) for f in g])] for g in groups]
 
-# assemble groups of MRD files
-groups = groupMRDfiles(basedir, unifylevel)
-# clean groups so they all have the same length
-groups = [[f for f in g if os.path.getsize(f) == mode([os.path.getsize(f) for f in g])] for g in groups]
+    for g in groups:
+        measID = g[0].split('/')[-(unifylevel + 1)]
+        basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
+        print('grouping', len(g), 'files into', basedir)
+        w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
+        # make and write output file header
+        for ig in range(len(g)):
+            mrs.mread3d(g[ig])
+            if(ig == 0):
+                h = make_header(mrs, measID)
+                w.write_header(h)
+            w.write_data(generate_acquisition(mrs, ig))
+        w.close()
 
-for g in groups:
-    measID = g[0].split('/')[-(unifylevel + 1)]
-    basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
-    print('grouping', len(g), 'files into', basedir)
-    w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
-    # make and write output file header
-    for ig in range(len(g)):
-        mrs.mread3d(g[ig])
-        if(ig == 0):
-            h = make_header(mrs, measID)
-            w.write_header(h)
-        w.write_data(generate_acquisition(mrs, ig))
-    w.close()
+# -u 3 consolidates the files as appropriate for EPSI. 
+# spectral data like Bukola's and David's uses -u 1p[
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Convert MRS data folder to MRD2 format')
+    parser.add_argument('-f', '--folder', type=str, required=True,
+                        help='Base directory containing MRS data files')
+    parser.add_argument('-u', '--unifylevel', type=int, required=False, default=1,
+                        help='Directory levels to unify when grouping files (default: 1)')
+    args = parser.parse_args()
+    print('running with base director =', args.folder)
+    print('unify level set to', args.unifylevel)
+    convert_mrs_to_mrd(args.folder, args.unifylevel)
+    # groupMRDfiles(args.folder, args.unifylevel)
