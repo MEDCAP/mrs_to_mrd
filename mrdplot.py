@@ -11,6 +11,8 @@ sys.path.append(os.path.join(Path(__file__).parent, 'mrd-fork','python'))
 import mrd
 # from watchdog.observers import Observer
 # from watchdog.events import FileSystemEventHandler
+# from watchdog.observers import Observer
+# from watchdog.events import FileSystemEventHandler
 from scipy.ndimage import zoom
 
 def plot_mrd(input: BinaryIO):
