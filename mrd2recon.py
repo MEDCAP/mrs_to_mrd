@@ -41,6 +41,30 @@ def get_clarg(clarg, arg, ty):
         if(clargarr[iarg] == arg):
             return(ty(clargarr[iarg + 1]))
 
+def append_auximage(a):
+    plt.gcf().canvas.draw()
+    width, height = plt.gcf().canvas.get_width_height()
+    bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
+    bmp = bmp.astype(np.uint32)
+    encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
+    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*256 + bmp[:,:,3]
+    a.append(encodedbmp)
+
+def kABfiteval(x):
+    # uses P, t, y
+    yp = np.zeros(len(y))
+    yp[0] = x[2]
+    # numerically integrate, x[0] is kAB, k[1] is 1/T1, x[2] is the amount of B at the beginning of acquisition
+    for j in range(1, len(t)):
+         dt = t[j] - t[j-1]
+         Pbar = (P[j-1] + P[j]) / 2
+         yp[j] = yp[j-1] * np.exp(-x[1] * dt) + x[0] * Pbar * np.exp(-x[1] * dt / 2)
+    return(yp)
+
+def kABfit(x):
+    yp = kABfiteval(x)
+    return(np.sum((yp - y)**2))
+
 def generate_epsi_images(h, m):
     # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
     time_between_images = 3   # approximately 3s between images
@@ -198,24 +222,10 @@ def epsi_recon():
     plt.plot(xscale, np.imag(globalspect), 'g')
     plt.plot(xscale, np.real(specteval), 'k')
     plt.plot(xscale, np.imag(specteval), 'k')
-    plt.gcf().canvas.draw()
-    width, height = plt.gcf().canvas.get_width_height()
-    bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
-    bmp = bmp.astype(np.uint32)
-    encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
-    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*256 + bmp[:,:,3]
-    auximages.append(encodedbmp)
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-#    plt.savefig(basedir + '/' + fn + '/epsi/globalfit', dpi=300, bbox_inches='tight')
-#    np.save(basedir + '/' + fn + '/epsi/xscale', xscale)
-#    np.save(basedir + '/' + fn + '/epsi/globalfit_centers', centers)
-#    np.save(basedir + '/' + fn + '/epsi/globalfit_widths', widths)
-#    np.save(basedir + '/' + fn + '/epsi/globalfit_amplitudes', amplitudes)
-#    np.save(basedir + '/' + fn + '/epsi/globalfit_phases', phases)
-#    np.save(basedir + '/' + fn + '/epsi/gloablfit_baseline', baseline)
-#    np.save(basedir + '/' + fn + '/epsi/globalfit_globalspect', globalspect)
+    append_auximage(auximages)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
     metabolites = np.zeros((npeaks, numimages, npe, nro))
@@ -251,7 +261,6 @@ def generate_spectra(h, measurementtimes_ns, peakfrequencies, peakamplitudes, sp
         elif(ispect == nspect - 1):
             imghead.flags = mrd.ImageFlags.LAST_IN_SET
         imghead.measurement_uid = ispect
-        imghead.measurement_freq = measfreq
         imghead.repetition = ispect
         imghead.acquisition_time_stamp_ns = measurementtimes_ns[ispect]
         imghead.image_index = ispect
@@ -265,7 +274,7 @@ def generate_spectra(h, measurementtimes_ns, peakfrequencies, peakamplitudes, sp
         elif(ispect == ntimepoints - 1):
             imghead.flags = mrd.ImageFlags.LAST_IN_SET
         imghead.measurement_uid = ispect
-        imghead.measurement_freq = peakfrequencies
+        imghead.measurement_freq = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
         imghead.measurement_freq_label = np.array(peaknames, dtype=np.dtype(np.object_))
         imghead.repetition = ispect
         imghead.acquisition_time_stamp_ns = measurementtimes_ns[ispect]
@@ -275,6 +284,7 @@ def generate_spectra(h, measurementtimes_ns, peakfrequencies, peakamplitudes, sp
         yield(mrd.StreamItem.ImageDouble(spect))
 
 def spectra_recon(h):
+    global P, y, t
     auximages = []
     numspectra = len(raw_acquisition_list)
     a = raw_acquisition_list[0]
@@ -298,7 +308,6 @@ def spectra_recon(h):
             maxispect = ispect
     # estimate noise level by looking at the last image in the series
     noise = np.mean(np.abs(spectra[-1, :]))
-    print('noise =', noise)
     maxspect = spectra[maxispect,:].copy()
     maxpt = np.argmax(np.abs(maxspect))
     BW = 1 / sampletime
@@ -356,12 +365,7 @@ def spectra_recon(h):
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-    plt.gcf().canvas.draw()
-    width, height = plt.gcf().canvas.get_width_height()
-    bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
-    encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
-    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*256 + bmp[:,:,3]
-    auximages.append(encodedbmp)
+    append_auximage(auximages)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
     peakamplitudes = np.zeros((npeaks, numspectra))
@@ -378,17 +382,36 @@ def spectra_recon(h):
             x0[ip] = np.abs(thisspect[np.argmin(np.abs(xscale - centers[ip]))])
         bounds = Bounds(np.concatenate((np.zeros((npeaks)), [-.1, -.1])), np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
         x1 = minimize(lor1fit, x0, bounds=bounds)
-        print(x1.x)
         peakamplitudes[:, ispect] = x1.x[:npeaks] * scaling
+    auc = np.sum(peakamplitudes, axis=(1))
+    auc /= max(auc)
+    auc *= 100
+    peakamplitudes /= np.max(peakamplitudes)
+    # now do model fit
+    legend = []
     plt.clf()
-    for ipeak in range(npeaks):
-        plt.plot(np.array(measurementtimes_ns) * 1.0E-9, peakamplitudes[ipeak,:])
-    plt.gcf().canvas.draw()
-    width, height = plt.gcf().canvas.get_width_height()
-    bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
-    encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
-    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*256 + bmp[:,:,3]
-    auximages.append(encodedbmp)
+    colors=['r', 'b', 'g', 'c', 'k', 'r', 'b']
+    for ip in range(npeaks):
+        P = peakamplitudes[sourcepeak, :]
+        t = np.array(measurementtimes_ns) * 1.0E-9
+        y = peakamplitudes[ip, :]
+        if(ip in metabolitelist):
+            x1 = minimize(kABfit, [.01, .03, 1]).x
+            plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
+                    label = peaknames[ip]+'/{:.5f}'.format(x1[0])+'/{:.2f}'.format(1/x1[1]) + \
+                    '/{:.2f}'.format(auc[ip]))
+            plt.plot(np.array(measurementtimes_ns) * 1.0E-9, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
+        else:
+            if(ip == sourcepeak):
+                plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'-', label=peaknames[ip] + \
+                    '/{:.2f}'.format(auc[ip]))
+            else:
+                plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'--', label=peaknames[ip] + \
+                    '/{:.2f}'.format(auc[ip]))
+    plt.legend()
+    plt.xlabel('time (s)')
+    plt.yticks([])
+    append_auximage(auximages)
     return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
             peakamplitudes, auximages)
 
@@ -397,7 +420,9 @@ wigglefactor = 1.0
 peakoffsets = []
 peaknames = []
 biggestpeaklist = []
+metabolitelist = []
 targetfiletype = ''
+sourcepeak = 0
 for iarg in range(len(sys.argv) - 1):
     try:
         floatarg = float(sys.argv[iarg + 1])
@@ -415,20 +440,26 @@ for iarg in range(len(sys.argv) - 1):
         targetfiletype = sys.argv[iarg + 1]
         print('setting target file type to', targetfiletype)
         continue
+    modifiers = '__'
+    if('_' in sys.argv[iarg]):
+        # a peak name string with modifiers
+        modifiers = sys.argv[iarg][(sys.argv[iarg].find('_')):]
+        sys.argv[iarg] = sys.argv[iarg][:sys.argv[iarg].find('_')]
     if(sys.argv[iarg][0] == '-' and not np.isnan(floatarg)):
-        if(sys.argv[iarg][-1] == '*'):
-            # this peak is certified small, do not include it in the 'biggest peak' list
-            peaknames.append(sys.argv[iarg][1:-1])
-        else:
-            peaknames.append(sys.argv[iarg][1:])
-            biggestpeaklist.append(len(peaknames) - 1)
+        if('s' in modifiers):
+            sourcepeak = len(peaknames)
+        if(not 't' in modifiers):
+            biggestpeaklist.append(len(peaknames))
+        if('m' in modifiers):
+            metabolitelist.append(len(peaknames))
+        peaknames.append(sys.argv[iarg][1:])
         peakoffsets.append(floatarg)
 fnames = findmrd2files(basedir, targetfiletype)
 # now look for specification of metabolite peaks
-# BA's cirrhrat is -bic* 0.0 -urea 2.3 -pyr 9.7 -ala* 15.2 -hyd* 18.1 -lac 21.8
-# SZ's mouse kidney is -bic 0.0 -urea 2.3 -pyr 9.7 -ala 15.2 -poop 15.9 -hyd 18.1 -lac 21.8
-# BA's spectra is -bic* -0.4 -urea 2.1 -urea2* 2.3 -pyr 9.7 -ala* 15.2 -hyd* 18.1 -lac 21.8 -w 0.5
-# DT's spectra is -urea 0.0 -KIC 8.6 -leu* 13.0 -hyd* 18.1 -?* 21.8 -w 1.5
+# BA's cirrhrat is -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
+# SZ's mouse kidney is -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -poop_tm 15.9 -hyd_tm 18.1 -lac_m 21.8
+# BA's spectra is -bic_tm -0.4 -urea 2.1 -urea2_t 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8 -w 0.5
+# DT's spectra is -urea 0.0 -KIC_s 8.6 -leu_tm 13.0 -hyd_tm 18.1 -?_tm 21.8 -w 1.5
 peakoffsets = np.array(peakoffsets)
 npeaks = len(peakoffsets)
 

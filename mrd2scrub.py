@@ -15,7 +15,7 @@ debuglorn = True
 
 g = MRSdata()
 
-basedir = "C:/Users/steph/Desktop/data/shurik_all_ischemia_data_081425"
+basedir = "C:/Users/steph/Desktop/data/dynamic spectra extra"
 #basedir = "C:/Users/steph/Desktop/data/cirrhrat data"
 fidpad = 4 
 lb = 42 # Hz
