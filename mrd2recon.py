@@ -263,6 +263,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
 def generate_spectra(h: mrd.Header,
                      measurementtimes_ns: float,
                      peakamplitudes: np.ndarray,
+                     peakoffsets: np.ndarray,
                      spectra):
     # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
     nspect = spectra.shape[0]
@@ -307,6 +308,7 @@ def spectra_recon(h: mrd.Header,
                   peaknames: list, 
                   wigglefactor: float):
     global P, y, t
+
     auximages = []
     numspectra = len(raw_acquisition_list)
     a = raw_acquisition_list[0]
@@ -488,7 +490,7 @@ def reconstruct_mrs(input: BinaryIO,
                 peakoffsets=peakoffsets,
                 peaknames=peaknames,
                 wigglefactor=wigglefactor)
-            writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakamplitudes, spectra))
+            writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakamplitudes, peakoffsets, spectra))
         if(len(auximages) > 0):
             writer.write_data(generate_aux_images(auximages))
 
