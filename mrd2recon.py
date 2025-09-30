@@ -34,6 +34,7 @@ def findmrd2files(basedir, targetfiletype):
             if 'recon.mrd2' in filenames:
                 print("Reconstruction completed", os.path.join(root, 'recon.mrd2'))
                 continue
+            print("Reconstructing", os.path.join(root, 'raw.mrd2'))
             mrd2list.append(os.path.join(root, 'raw.mrd2'))
     return(mrd2list)
 
@@ -257,10 +258,12 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                         np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
                 x1 = minimize(lor1fit, x0, bounds=bounds)
                 metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
-    np.save('metabolites', metabolites)
     return([metabolites, auximages])
 
-def generate_spectra(h, measurementtimes_ns, peakfrequencies, peakamplitudes, spectra):
+def generate_spectra(h: mrd.Header,
+                     measurementtimes_ns: float,
+                     peakamplitudes: np.ndarray,
+                     spectra):
     # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
     nspect = spectra.shape[0]
     ntimepoints = spectra.shape[1]
@@ -295,7 +298,14 @@ def generate_spectra(h, measurementtimes_ns, peakfrequencies, peakamplitudes, sp
         spect = mrd.Image(head=imghead, data=np.expand_dims(np.transpose(peakamplitudes[:, ispect]), (0, 1, 2, 3)))
         yield(mrd.StreamItem.ImageDouble(spect))
 
-def spectra_recon(h: mrd.Header, raw_acquisition_list: list, peakoffsets: np.ndarray, biggestpeakidx: list, wigglefactor):
+def spectra_recon(h: mrd.Header, 
+                  raw_acquisition_list: list, 
+                  sourcepeak: int, 
+                  metabolitelist: list, 
+                  biggestpeakidx: list,
+                  peakoffsets: np.ndarray,
+                  peaknames: list, 
+                  wigglefactor: float):
     global P, y, t
     auximages = []
     numspectra = len(raw_acquisition_list)
@@ -427,21 +437,15 @@ def spectra_recon(h: mrd.Header, raw_acquisition_list: list, peakoffsets: np.nda
     return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
             peakamplitudes, auximages)
 
-    # plt.clf()
-    # for ipeak in range(len(peakoffsets)):
-    #     plt.plot(np.array(measurementtimes_ns) * 1.0E-9, peakamplitudes[ipeak,:])
-    # plt.gcf().canvas.draw()
-    # width, height = plt.gcf().canvas.get_width_height()
-    # bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
-    # encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
-    # encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*256 + bmp[:,:,3]
-    # auximages.append(encodedbmp)
-    # return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
-    #         peakamplitudes, auximages)
-
-
 # Take single file as input and reconstruct output
-def reconstruct_mrs(input: BinaryIO, output: BinaryIO, biggestpeakidx: list, peakoffsets: np.ndarray, peaknames: list, wiggle: float):
+def reconstruct_mrs(input: BinaryIO,
+                    output: str,
+                    sourcepeak: int,
+                    metabolitelist: list,
+                    biggestpeakidx: list,
+                    peakoffsets: np.ndarray,
+                    peaknames: list,
+                    wigglefactor: float):
     def generate_stream(input: list):
         for item in input:
             if isinstance(item, mrd.Pulse):
@@ -475,8 +479,16 @@ def reconstruct_mrs(input: BinaryIO, output: BinaryIO, biggestpeakidx: list, pea
             writer.write_data(generate_stream(raw_gradient_list))
             writer.write_data(generate_stream(raw_acquisition_list))
         elif(raw_header.measurement_information.sequence_name.find('1pul') > -1):
-            [measurementtimes_ns, spectra, peakfrequencies, peakamplitudes, auximages] = spectra_recon(raw_header, raw_acquisition_list, biggestpeakidx, wiggle)
-            writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakfrequencies, peakamplitudes, spectra))
+            [measurementtimes_ns, spectra, peakfrequencies, peakamplitudes, auximages] = spectra_recon(
+                h=raw_header,
+                raw_acquisition_list=raw_acquisition_list,
+                sourcepeak=sourcepeak,
+                metabolitelist=metabolitelist,
+                biggestpeakidx=biggestpeakidx,
+                peakoffsets=peakoffsets,
+                peaknames=peaknames,
+                wigglefactor=wigglefactor)
+            writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakamplitudes, spectra))
         if(len(auximages) > 0):
             writer.write_data(generate_aux_images(auximages))
 
@@ -526,10 +538,9 @@ if __name__ == "__main__":
         fnames = findmrd2files(basedir, targetfiletype)
         for f in fnames:
             output_path = f.replace('raw.mrd2', 'recon.mrd2')
-            print('reconstructing', output_path)
-            reconstruct_mrs(f, output_path, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
+            reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
     else:
-        reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
+        reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
 
 # now look for specification of metabolite peaks
 # BA's cirrhrat is -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
