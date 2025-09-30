@@ -447,10 +447,13 @@ for iarg in range(len(sys.argv) - 1):
         sys.argv[iarg] = sys.argv[iarg][:sys.argv[iarg].find('_')]
     if(sys.argv[iarg][0] == '-' and not np.isnan(floatarg)):
         if('s' in modifiers):
+            # this peak is the source of metabolite signal (like pyruvate)
             sourcepeak = len(peaknames)
         if(not 't' in modifiers):
+            # this peak is 'tiny' so don't try to match peak pattern with it as the biggest peak
             biggestpeaklist.append(len(peaknames))
         if('m' in modifiers):
+            # this peak is a metabolite so assume all of its signal comes from the source peak when modeling
             metabolitelist.append(len(peaknames))
         peaknames.append(sys.argv[iarg][1:])
         peakoffsets.append(floatarg)

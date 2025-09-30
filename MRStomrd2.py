@@ -164,6 +164,8 @@ groups = [[f for f in g if os.path.getsize(f) == mode([os.path.getsize(f) for f 
 
 for g in groups:
     measID = g[0].split('/')[-(unifylevel + 1)]
+    print(measID)
+    barf
     basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
     print('grouping', len(g), 'files into', basedir)
     w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')

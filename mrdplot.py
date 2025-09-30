@@ -85,8 +85,6 @@ if(current_image_list):
             # this is a metabolite image (for epsi)
             nimg += 1
             metshape = np.shape(i.data)[-3:] + (nimg,)
-    print(metshape)
-    barf
     zf = 2 # zoom factor for image interpolation
     met = np.zeros(metshape, dtype=np.float32)
     if(metshape[0] * metshape[1] > 1):
