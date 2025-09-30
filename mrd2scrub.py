@@ -7,8 +7,6 @@ from MRSreader import MRSdata
 from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
         lorngetpeakparams, lornputpeakparams
 import sys
-sys.path.insert(0, 'python')
-import mrd
 
 debugphasing = False
 debuglorn = True
