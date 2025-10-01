@@ -41,6 +41,8 @@ class MRSdata:
                     self.basefreq = int(float(fdstr[(freqidx + 5):(freqidx + 19)]) * 1.0E+6 + 0.5)
                     if(MRSdatadebug):
                         print('   setting base frequency to ', self.basefreq, ' Hz')
+            if self.basefreq == 0:
+                self.basefreq = 74941736
         # now read MRS file
         fd = open(f, 'rb')
         fdbytes = fd.read()

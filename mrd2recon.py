@@ -74,15 +74,17 @@ def kABfiteval(x):
     for j in range(1, len(t)):
         dt = t[j] - t[j-1]
         Pbar = (P[j-1] + P[j]) / 2
-        if Pbar < 1e-10:
-            yp[j] = 0
-        else:
-            yp[j] = yp[j-1] * np.exp(-x[1] * dt) + x[0] * Pbar * np.exp(-x[1] * dt / 2)
+        yp[j] = yp[j-1] * np.exp(-x[1] * dt) + x[0] * Pbar * np.exp(-x[1] * dt / 2)
     return(yp)
 
 def kABfit(x):
     # x1 = minimize(kABfit, [.01, .03, 1]).x
     yp = kABfiteval(x)
+    print('x=', x, 'sum((yp-y)^2)=', np.sum((yp - y)**2))
+    try:
+        np.sum((yp - y)**2)
+    except RuntimeWarning:
+        print('yp-y', yp - y)
     return(np.sum((yp - y)**2))
 
 def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.ndarray, peaknames: list):
@@ -352,6 +354,7 @@ def spectra_recon(h: mrd.Header,
     spectra = spectra[:, lowpt:hipt]
     globalspect = np.zeros(hipt - lowpt, dtype = 'complex')
     xscale = np.array(range(len(globalspect))) / len(globalspect) * newBW / centerfreq * 1E+6
+    import pdb; pdb.set_trace()
     for ispect in range(numspectra):
         if(np.max(np.abs(spectra[ispect, :])) > noise * 5):
             globalspect += spectra[ispect, :]
@@ -425,17 +428,22 @@ def spectra_recon(h: mrd.Header,
     legend = []
     plt.clf()
     colors=['r', 'b', 'g', 'c', 'k', 'r', 'b']
+    auc_data = {}
     for ip in range(len(peakoffsets)):
         P = peakamplitudes[sourcepeak, :]   # peak amp of injected sample
         t = np.array(measurementtimes_ns) * 1.0E-9
         y = peakamplitudes[ip, :]           # peak amp of each metabolite
+        auc_data[peaknames[ip]] = auc[ip]
         if(ip in metabolitelist):
-            x1 = minimize(kABfit, [.01, .03, 1]).x
+            # x[0]=kAB, x[1]=1/T1, x[2]=initial amount of metabolite
+            bounds = [(None, None), (1/100, 1), (None, None)]
+            x1 = minimize(kABfit, [.01, .03, 1], bounds=bounds).x
+            # x1 = minimize(kABfit, [.01, .03, 1]).x
             # sample plot
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
                     label = peaknames[ip]+'/{:.5f}'.format(x1[0])+'/{:.2f}'.format(1/x1[1]) + \
                     '/{:.2f}'.format(auc[ip]))
-            # fitted line 
+            # fitted line
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
         else:
             if(ip == sourcepeak):
@@ -448,6 +456,8 @@ def spectra_recon(h: mrd.Header,
     plt.xlabel('time (s)')
     plt.yticks([])
     append_auximage(auximages)
+    print('auc_data', auc_data)
+
     return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
             peakamplitudes, auximages)
 
