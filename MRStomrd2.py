@@ -69,7 +69,7 @@ def generate_acquisition(g, ide):
         nrep = g.rawdata.shape[5]  # number of acquisitions per image file (phase-encodes)
         print(nrep)
         for iacq in range(nrep):
-            print(iacq)
+            print('converting measurement #: ', iacq)
             # make the pulse
             p = mrd.Pulse()
             CO_freq = g.basefreq
@@ -89,7 +89,7 @@ def generate_acquisition(g, ide):
             a = mrd.Acquisition()
             a.data = np.transpose(np.expand_dims(g.rawdata[:, 0, 0, 0, 0, iacq], (0)))
             a.head.acquisition_center_frequency = g.basefreq
-            print('writing center freq = ', a.head.acquisition_center_frequency)
+            # print('writing center freq = ', a.head.acquisition_center_frequency)
             a.head.idx.repetition = iacq
             a.head.acquisition_time_stamp_ns = pulse_start + np.uint64(TE * 1.0E+9)
             a.head.idx.contrast = 1

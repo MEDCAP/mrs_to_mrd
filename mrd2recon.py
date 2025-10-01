@@ -29,11 +29,13 @@ def findmrd2files(basedir, targetfiletype):
     If recon.mrd2 already exists, don't look further in that directory
     '''
     mrd2list = []
+    if os.path.isfile(basedir):
+        return [basedir]
     for root, dirnames, filenames in os.walk(basedir):
         if 'raw.mrd2' in filenames or targetfiletype in filenames:
-            if 'recon.mrd2' in filenames:
-                print("Reconstruction completed", os.path.join(root, 'recon.mrd2'))
-                continue
+            # if 'recon.mrd2' in filenames:
+            #     print("Reconstruction completed", os.path.join(root, 'recon.mrd2'))
+            #     continue
             print("Reconstructing", os.path.join(root, 'raw.mrd2'))
             mrd2list.append(os.path.join(root, 'raw.mrd2'))
     return(mrd2list)
@@ -62,16 +64,24 @@ def append_auximage(a):
 
 def kABfiteval(x):
     # uses P, t, y
-    yp = np.zeros(len(y))
+    # P=peak amplitudes of the source metabolite
+    # t=time points of the acquisitions
+    # y=peak amplitudes of the metabolite to be fitted
+    # x[.01, .03, 1] for initial guess
+    yp = np.zeros(len(y), dtype=np.float64)
     yp[0] = x[2]
     # numerically integrate, x[0] is kAB, k[1] is 1/T1, x[2] is the amount of B at the beginning of acquisition
     for j in range(1, len(t)):
-         dt = t[j] - t[j-1]
-         Pbar = (P[j-1] + P[j]) / 2
-         yp[j] = yp[j-1] * np.exp(-x[1] * dt) + x[0] * Pbar * np.exp(-x[1] * dt / 2)
+        dt = t[j] - t[j-1]
+        Pbar = (P[j-1] + P[j]) / 2
+        if Pbar < 1e-10:
+            yp[j] = 0
+        else:
+            yp[j] = yp[j-1] * np.exp(-x[1] * dt) + x[0] * Pbar * np.exp(-x[1] * dt / 2)
     return(yp)
 
 def kABfit(x):
+    # x1 = minimize(kABfit, [.01, .03, 1]).x
     yp = kABfiteval(x)
     return(np.sum((yp - y)**2))
 
@@ -416,14 +426,16 @@ def spectra_recon(h: mrd.Header,
     plt.clf()
     colors=['r', 'b', 'g', 'c', 'k', 'r', 'b']
     for ip in range(len(peakoffsets)):
-        P = peakamplitudes[sourcepeak, :]
+        P = peakamplitudes[sourcepeak, :]   # peak amp of injected sample
         t = np.array(measurementtimes_ns) * 1.0E-9
-        y = peakamplitudes[ip, :]
+        y = peakamplitudes[ip, :]           # peak amp of each metabolite
         if(ip in metabolitelist):
             x1 = minimize(kABfit, [.01, .03, 1]).x
+            # sample plot
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
                     label = peaknames[ip]+'/{:.5f}'.format(x1[0])+'/{:.2f}'.format(1/x1[1]) + \
                     '/{:.2f}'.format(auc[ip]))
+            # fitted line 
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
         else:
             if(ip == sourcepeak):
@@ -491,6 +503,10 @@ def reconstruct_mrs(input: BinaryIO,
                 peaknames=peaknames,
                 wigglefactor=wigglefactor)
             writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakamplitudes, peakoffsets, spectra))
+            # fill in pulse, gradient, acq data
+            writer.write_data(generate_stream(raw_pulse_list))
+            writer.write_data(generate_stream(raw_gradient_list))
+            writer.write_data(generate_stream(raw_acquisition_list))
         if(len(auximages) > 0):
             writer.write_data(generate_aux_images(auximages))
 

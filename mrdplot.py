@@ -36,8 +36,9 @@ def plot_mrd(input: BinaryIO):
         print('found', len(current_pulse_list), 'pulses,', len(current_gradient_list), 'gradients,', \
             len(current_acquisition_list), 'acquisitions,', len(current_image_list), 'images')
 
-    plt.figure()
     if(current_pulse_list):
+        plt.figure()
+        plt.tight_layout()
         # draw pulses
         plt.subplot(3,1,1)
         for p in current_pulse_list:
@@ -47,6 +48,7 @@ def plot_mrd(input: BinaryIO):
                         1.0E-9, np.concatenate((np.array([0]), p.amplitude[q, :], np.array([0]))))
         plt.xlabel('time (s)')
         plt.ylabel('pulse amplitude (V)')
+        plt.title('RF Pulses')
     if(current_gradient_list):
         # draw gradients
         plt.subplot(3,1,2)
@@ -59,6 +61,7 @@ def plot_mrd(input: BinaryIO):
                     1.0E-9, g.fh)
         plt.xlabel('time (s)')
         plt.ylabel('gradient amplitude (mT/m)')
+        plt.title('Gradients')
     if(current_acquisition_list):
         # draw acquisition raw data
         plt.subplot(3,1,3)
@@ -69,6 +72,7 @@ def plot_mrd(input: BinaryIO):
                     np.imag(a.data[:,0]))
         plt.xlabel('time (s)')
         plt.ylabel('signal (uV)')
+        plt.title('Acquisitions')
     plt.xticks([])
     plt.yticks([])
     plt.show()
@@ -86,6 +90,7 @@ def plot_mrd(input: BinaryIO):
                 plt.xticks([])
                 plt.yticks([])
                 plt.imshow(unpacked_bmp)
+                plt.title('Fitted metabolite peaks')
                 plt.show()
             else:
                 # this is a metabolite image (for epsi)
