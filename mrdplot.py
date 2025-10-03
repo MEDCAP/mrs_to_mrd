@@ -13,7 +13,7 @@ import mrd
 # from watchdog.events import FileSystemEventHandler
 from scipy.ndimage import zoom
 
-def plot_mrd(input: BinaryIO):
+def plot_mrd(input: BinaryIO, filename: str):
     current_header = []
     current_streamables_list = []
     current_pulse_list = []
@@ -35,10 +35,10 @@ def plot_mrd(input: BinaryIO):
         # images do not necessarily have a time, so don't sort them
         print('found', len(current_pulse_list), 'pulses,', len(current_gradient_list), 'gradients,', \
             len(current_acquisition_list), 'acquisitions,', len(current_image_list), 'images')
-
+    fig1 = plt.figure()
+    fig1.suptitle('Grad, Acq, Pulse File: ' + filename)
+    plt.tight_layout()
     if(current_pulse_list):
-        plt.figure()
-        plt.tight_layout()
         # draw pulses
         plt.subplot(3,1,1)
         for p in current_pulse_list:
@@ -75,7 +75,6 @@ def plot_mrd(input: BinaryIO):
         plt.title('Acquisitions')
     plt.xticks([])
     plt.yticks([])
-    plt.show()
     if(current_image_list):
         nimg = 0
         for i in current_image_list:
@@ -87,11 +86,11 @@ def plot_mrd(input: BinaryIO):
                 unpacked_bmp[:,:,1] = ((bmp & 0x0000FF00) / 2**8).astype(np.uint8)
                 unpacked_bmp[:,:,2] = ((bmp & 0x00FF0000) / 2**16).astype(np.uint8)
                 unpacked_bmp[:,:,3] = ((bmp & 0xFFFF0000) / 2**24).astype(np.uint8)
+                fig2 = plt.figure()
+                fig2.suptitle('File: ' + filename)
                 plt.xticks([])
                 plt.yticks([])
                 plt.imshow(unpacked_bmp)
-                plt.title('Fitted metabolite peaks')
-                plt.show()
             else:
                 # this is a metabolite image (for epsi)
                 nimg += 1
@@ -116,14 +115,21 @@ def plot_mrd(input: BinaryIO):
                     plotfig[(imet * height * zf):((imet + 1) * height * zf), (iimg * width * zf):((iimg + 1) * \
                             width * zf)] = zoom(np.rot90(thisimg), zf, order=2) / themax
                     plotfig[imet * height * zf, :] = 1
+            fig3 = plt.figure()
+            fig3.suptitle('metabolic images, File: ' + filename)
             plt.imshow(plotfig, cmap='gray')
             plt.xticks([])
             plt.yticks([])
-            plt.show()
+    plt.show()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Plot MRD file contents')
     parser.add_argument('-i', '--input', type=str, required=False, help='Input file, defaults to stdin')
     args = parser.parse_args()
-    input = open(args.input, 'rb') if args.input is not None else sys.stdin.buffer
-    plot_mrd(input)
+    if args.input is None:
+        input = sys.stdin.buffer
+        filename = ''
+    else:
+        input = open(args.input, 'rb')
+        filename = Path(args.input).parent.stem
+    plot_mrd(input, filename)
