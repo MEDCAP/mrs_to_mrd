@@ -1,16 +1,18 @@
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for headless Docker environments
 import matplotlib.pyplot as plt
 from statistics import mode
 import os
 from scipy.optimize import minimize, Bounds
 import sys
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Union
 import argparse
 import re
 
-# path to mrd python package is 'root/mrd-fork/python' 
-sys.path.append(os.path.join(Path(__file__).parent, 'mrd-fork','python'))
+# # path to mrd python package is 'root/mrd-fork/python' 
+# sys.path.append(os.path.join(Path(__file__).parent, 'mrd-fork','python'))
 import mrd
 from MRSreader import MRSdata
 from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
@@ -36,7 +38,7 @@ def findmrd2files(basedir, targetfiletype):
             # if 'recon.mrd2' in filenames:
             #     print("Reconstruction completed", os.path.join(root, 'recon.mrd2'))
             #     continue
-            print("Reconstructing", os.path.join(root, 'raw.mrd2'))
+            # print("Reconstructing", os.path.join(root, 'raw.mrd2'))
             mrd2list.append(os.path.join(root, 'raw.mrd2'))
     return(mrd2list)
 
@@ -49,7 +51,7 @@ def generate_aux_images(imglist):
 def get_clarg(clarg, arg, ty):
     clargarr = clarg.split(' ')
     for iarg in range(len(clargarr) - 1):
-        print(iarg, clargarr[iarg])
+        # print(iarg, clargarr[iarg])
         if(clargarr[iarg] == arg):
             return(ty(clargarr[iarg + 1]))
 
@@ -80,7 +82,7 @@ def kABfiteval(x):
 def kABfit(x):
     # x1 = minimize(kABfit, [.01, .03, 1]).x
     yp = kABfiteval(x)
-    print('x=', x, 'sum((yp-y)^2)=', np.sum((yp - y)**2))
+    # print('x=', x, 'sum((yp-y)^2)=', np.sum((yp - y)**2))
     try:
         np.sum((yp - y)**2)
     except RuntimeWarning:
@@ -148,9 +150,9 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                 kspace[iimg, ipe, :, iecho] = a.data[(iecho * totalppswitch + \
                     a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0]
             ia += 1
-    print('doing fft')
+    # print('doing fft')
     img = np.fft.fftshift(np.fft.fftn(kspace, axes = (1, 2, 3)), axes = (1, 2, 3))
-    print('finding biggest voxel')
+    # print('finding biggest voxel')
     currmax = 0
     for ide in range(numimages):
         for j in range(npe):
@@ -163,11 +165,11 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     maxide = ide
     # estimate noise level by looking at the last image in the series
     noise = np.mean(np.abs(img[-1, :, :, :]))
-    print('noise =', noise)
+    # print('noise =', noise)
     maxspect = img[maxide,maxj,maxk,:].copy()
     globalspect = np.zeros((a.head.idx.contrast * fidpad), dtype = 'complex')
     for ide in range(numimages):
-        print('phasing img', ide)
+        # print('phasing img', ide)
         # go through all the voxels and minimize the phase difference
         for j in range(npe):
             for k in range(nro):
@@ -194,7 +196,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     plt.pause(.1)
                 if(ide > 1):
                     globalspect += img[ide, j, k, :]
-    print('end phasing')
+    # print('end phasing')
     BW = 1 / sampletime / totalppswitch
     xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
     globalspect /= np.max(np.abs(globalspect))
@@ -222,7 +224,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
             x0[3 * npeaks + ip] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
             x0[2 * npeaks + ip] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
         lornputpeakparams(centers, np.ones((npeaks)) * widthguess, x0[(2 * npeaks):(3 * npeaks)], debuglorn)
-        print('begin minimize', icg)
+        # print('begin minimize', icg, flush=True)
         x1[icg, :] = minimize(lornfit, x0).x
         for ip in range(npeaks):
             if(x1[icg, 3 * npeaks + ip] < 0):
@@ -235,7 +237,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
 #        plt.plot(xscale, np.imag(lorneval(x1[icg, :])), 'k')
 #        plt.draw()
 #        plt.pause(.1)
-        print("icg ", icg, "diff = ", diff[icg])
+        # print("icg ", icg, "diff = ", diff[icg], flush=True)
     centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
             peakoffsets[biggestpeaklist[np.argmin(diff)]])) % (BW / centerfreq * 1E+6)
     lornputpeakparams(centers, np.ones((npeaks)) * widthguess, x0[(2 * npeaks):(3 * npeaks)], debuglorn)
@@ -253,8 +255,10 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
     metabolites = np.zeros((npeaks, numimages, npe, nro))
-    for ide in range(numimages):
-        print('voxel fit img', ide)
+    # shorten the list for quick debugging
+    for ide in range(3):
+    # for ide in range(numimages):
+        # print('voxel fit img', ide, flush=True)
         for j in range(npe):
             for k in range(nro):
                 thisspect = img[ide,j,k,:]
@@ -328,6 +332,7 @@ def spectra_recon(h: mrd.Header,
     centerfreq = a.head.acquisition_center_frequency
     sampletime = a.head.sample_time_ns / 1.0E+9
     npts = len(a.data)
+    # kspace shape=(spectra, measurements)
     kspace = np.zeros((numspectra, len(a.data)), dtype = 'complex')
     ia = 0
     for ispect in range(kspace.shape[0]):
@@ -352,9 +357,12 @@ def spectra_recon(h: mrd.Header,
     hipt = int(maxpt + 25E-6 / (BW / centerfreq) * npts)
     newBW = BW * (hipt - lowpt) / npts
     spectra = spectra[:, lowpt:hipt]
+    # global spectrum across +-25ppm of highest peak
     globalspect = np.zeros(hipt - lowpt, dtype = 'complex')
     xscale = np.array(range(len(globalspect))) / len(globalspect) * newBW / centerfreq * 1E+6
-    import pdb; pdb.set_trace()
+    # TODO: measure noise auc of source KIC and leucine at meas 35-40 and 30-40
+    #
+    #
     for ispect in range(numspectra):
         if(np.max(np.abs(spectra[ispect, :])) > noise * 5):
             globalspect += spectra[ispect, :]
@@ -381,7 +389,7 @@ def spectra_recon(h: mrd.Header,
              x0[3 * len(peakoffsets) + ip] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
              x0[2 * len(peakoffsets) + ip] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
         lornputpeakparams(centers, np.ones((len(peakoffsets))) * widthguess, x0[(2 * len(peakoffsets)):(3 * len(peakoffsets))], debuglorn)
-        print('begin minimize', icg)
+        # print('begin minimize', icg, flush=True)
         x1[icg, :] = minimize(lornfit, x0).x
         for ip in range(len(peakoffsets)):
              if(x1[icg, 3 * len(peakoffsets) + ip] < 0):
@@ -409,7 +417,7 @@ def spectra_recon(h: mrd.Header,
     measurementtimes_ns = [a.head.acquisition_time_stamp_ns - \
             raw_acquisition_list[0].head.acquisition_time_stamp_ns for a in raw_acquisition_list]
     for ispect in range(numspectra):
-        print('voxel fit img', ispect)
+        # print('voxel fit img', ispect, flush=True)
         thisspect = spectra[ispect,:]
         scaling = np.max(np.abs(thisspect))
         thisspect /= scaling
@@ -452,18 +460,22 @@ def spectra_recon(h: mrd.Header,
             else:
                 plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'--', label=peaknames[ip] + \
                     '/{:.2f}'.format(auc[ip]))
-    plt.legend()
+    plt.legend(title='')
     plt.xlabel('time (s)')
     plt.yticks([])
     append_auximage(auximages)
-    print('auc_data', auc_data)
+    # import csv
+    # with open('aux.csv', 'w', newline='') as f:
+    #     writer = csv.DictWriter(f, fieldnames=auc_data.keys())
+    #     writer.writeheader()
+    #     writer.writerow(auc_data)
 
     return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
             peakamplitudes, auximages)
 
 # Take single file as input and reconstruct output
-def reconstruct_mrs(input: BinaryIO,
-                    output: str,
+def reconstruct_mrs(input: Union[str, BinaryIO],
+                    output: Union[str, BinaryIO],
                     sourcepeak: int,
                     metabolitelist: list,
                     biggestpeakidx: list,
@@ -494,10 +506,13 @@ def reconstruct_mrs(input: BinaryIO,
         writer.write_header(raw_header)
         if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
             [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
+            #############################################################################
+            # ATTENTION: np save may not work in tyger stream 
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-            np.save(input.replace('raw.mrd2', 'metabolites.npy'), metabolites)
+            # np.save(os.path.join(basedir, 'metabolites.npy'), metabolites)
+
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
-            # read_data can be called only once to get StreamItem
+            # read_data can be called only once to get Stream +Item
             # write_data can be rewritten by converting list of mrd objects to StreamItem
             writer.write_data(generate_stream(raw_pulse_list))
             writer.write_data(generate_stream(raw_gradient_list))
@@ -522,6 +537,10 @@ def reconstruct_mrs(input: BinaryIO,
 
 
 if __name__ == "__main__":
+    # Save original stdout buffer before redirecting print statements to stderr
+    # original_stdout_buffer = sys.stdout.buffer
+    # sys.stdout = sys.stderr
+    
     # read command line arguments
     wigglefactor = 1.0
     peakoffsets = []
@@ -537,15 +556,15 @@ if __name__ == "__main__":
             floatarg = np.nan
         if(sys.argv[iarg] == '-f'):
             basedir = sys.argv[iarg + 1]
-            print('setting base dir to', basedir)
+            print('setting base dir to', basedir, file=sys.stderr)
             continue
         if(sys.argv[iarg] == '-w' and not np.isnan(floatarg)):
             wigglefactor = floatarg
-            print('setting wiggle factor to', wigglefactor)
+            # print('setting wiggle factor to', wigglefactor)
             continue
         if(sys.argv[iarg] == '-n'):
             targetfiletype = sys.argv[iarg + 1]
-            print('setting target file type to', targetfiletype)
+            # print('setting target file type to', targetfiletype)
             continue
         modifiers = '__'
         if('_' in sys.argv[iarg]):
@@ -562,18 +581,17 @@ if __name__ == "__main__":
             peaknames.append(sys.argv[iarg][1:])
             peakoffsets.append(floatarg)
     # run all mrd2 files in the directory for local run
-    if basedir:
+    if basedir != '.':
         fnames = findmrd2files(basedir, targetfiletype)
         for f in fnames:
-            output_path = f.replace('raw.mrd2', 'recon.mrd2')
+            output_path = f.replace('raw.mrd2', Path(f).parent.name + '_recon.mrd2')
             reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
+        # reconstruct_mrs(sys.stdin.buffer, original_stdout_buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
 
 # now look for specification of metabolite peaks
 # BA's cirrhrat is -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
 # SZ's mouse kidney is -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -poop_tm 15.9 -hyd_tm 18.1 -lac_m 21.8
 # BA's spectra is -bic_tm -0.4 -urea 2.1 -urea2_t 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8 -w 0.5
 # DT's spectra is -urea 0.0 -KIC_s 8.6 -leu_tm 13.0 -hyd_tm 18.1 -?_tm 21.8 -w 1.
-
-

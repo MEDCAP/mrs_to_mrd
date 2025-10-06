@@ -6,3 +6,7 @@ __pycache__/
 *.swo
 *.swn
 *~
+
+# ignore binary files
+*.bin
+*.mrd2

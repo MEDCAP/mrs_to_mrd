@@ -53,12 +53,12 @@ def plot_mrd(input: BinaryIO, filename: str):
         # draw gradients
         plt.subplot(3,1,2)
         for g in current_gradient_list:
-            plt.plot((np.array(range(len(g.rl))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
-                    1.0E-9, g.rl)
-            plt.plot((np.array(range(len(g.ap))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
-                    1.0E-9, g.ap)
-            plt.plot((np.array(range(len(g.fh))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
-                    1.0E-9, g.fh)
+            plt.plot((np.array(range(len(g.data))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
+                    1.0E-9, g.data)
+            # plt.plot((np.array(range(len(g.data))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
+            #         1.0E-9, g.data[:,1])
+            # plt.plot((np.array(range(len(g.data))) * g.head.gradient_sample_time_ns + g.head.gradient_time_stamp_ns) * \
+            #         1.0E-9, g.data[:,2])
         plt.xlabel('time (s)')
         plt.ylabel('gradient amplitude (mT/m)')
         plt.title('Gradients')
