@@ -11,8 +11,8 @@ from typing import BinaryIO, Union
 import argparse
 import re
 
-# # path to mrd python package is 'root/mrd-fork/python' 
-# sys.path.append(os.path.join(Path(__file__).parent, 'mrd-fork','python'))
+# path to mrd python package is 'root/mrd-fork/python' 
+sys.path.append(os.path.join(Path(__file__).parent, 'mrd-fork','python'))
 import mrd
 from MRSreader import MRSdata
 from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
@@ -24,6 +24,7 @@ debuglorn = True
 basedir = '.'
 fidpad = 4 
 lb = 42 # Hz
+experiment_name = ''
 
 def findmrd2files(basedir, targetfiletype):
     '''
@@ -52,7 +53,7 @@ def get_clarg(clarg, arg, ty):
     clargarr = clarg.split(' ')
     for iarg in range(len(clargarr) - 1):
         # print(iarg, clargarr[iarg])
-        if(clargarr[iarg] == arg):
+        if(clargarr[iarg] == arg): 
             return(ty(clargarr[iarg + 1]))
 
 def append_auximage(a):
@@ -132,6 +133,7 @@ def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.
         yield(mrd.StreamItem.ImageDouble(img))
 
 def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: np.ndarray):
+    global experiment_name
     auximages = []
     numimages = sum([a.head.flags & mrd.AcquisitionFlags.LAST_IN_PHASE == \
             mrd.AcquisitionFlags.LAST_IN_PHASE for a in raw_acquisition_list])
@@ -251,13 +253,19 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
+    # save current figure as a PNG file
+    # create directory if it doesn't exist
+    if not os.path.exists(os.path.join(Path(basedir).parent, 'lorn_fit')):
+        os.makedirs(os.path.join(Path(basedir).parent, 'lorn_fit'))
+    png_filepath = os.path.join(Path(basedir).parent, 'lorn_fit', experiment_name + '_lorn_fit.png')
+    plt.savefig(png_filepath)
+    
     append_auximage(auximages)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
     metabolites = np.zeros((npeaks, numimages, npe, nro))
     # shorten the list for quick debugging
-    for ide in range(3):
-    # for ide in range(numimages):
+    for ide in range(numimages):
         # print('voxel fit img', ide, flush=True)
         for j in range(npe):
             for k in range(nro):
@@ -482,6 +490,7 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
                     peakoffsets: np.ndarray,
                     peaknames: list,
                     wigglefactor: float):
+    global experiment_name
     def generate_stream(input: list):
         for item in input:
             if isinstance(item, mrd.Pulse):
@@ -505,12 +514,15 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
         # write the same header from input mrd file
         writer.write_header(raw_header)
         if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
+            experiment_name = str(Path(input).parents[0].name)
             [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
-            #############################################################################
             # ATTENTION: np save may not work in tyger stream 
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-            # np.save(os.path.join(basedir, 'metabolites.npy'), metabolites)
-
+            # if basedir/processed_npy doesn't exist create it
+            if not os.path.exists(os.path.join(Path(basedir).parent, 'processed_npyfiles')):
+                os.makedirs(os.path.join(Path(basedir).parent, 'processed_npyfiles'))
+            npy_filepath = os.path.join(Path(basedir).parent, 'processed_npyfiles', experiment_name + '_metabolites.npy')
+            np.save(npy_filepath, metabolites)
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
             # read_data can be called only once to get Stream +Item
             # write_data can be rewritten by converting list of mrd objects to StreamItem
@@ -549,6 +561,7 @@ if __name__ == "__main__":
     metabolitelist = []
     targetfiletype = ''
     sourcepeak = 0
+    get_npy = True
     for iarg in range(len(sys.argv) - 1):
         try:
             floatarg = float(sys.argv[iarg + 1])

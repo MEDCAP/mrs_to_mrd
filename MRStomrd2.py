@@ -100,17 +100,38 @@ def generate_acquisition(g, ide):
             yield mrd.StreamItem.Acquisition(a)
 
 def groupMRDfiles_collect(rootdir):
+    '''
+    Find all .MRD files in this directory and subdirectories. Skip files with more than 1 average as they are phantom data.
+    Args:
+        rootdir: path to the root directory as a string specified by -f command line argument
+    Returns
+        List of paths of .MRD files as strings with / as path separator
+    '''
     l = []
     d = os.listdir(rootdir)
-    # find all .MRD files in this directory and subdirectories
     for f in d:
         if(os.path.isdir(rootdir + '/' + f)):
             l.extend(groupMRDfiles_collect(rootdir + '/' + f))
-        elif(f.find('.MRD') > 0)    :
-            l.append(rootdir + '/' + f)
+        elif(f.find('.MRD') > 0):
+            mrsdata_filepath = rootdir + '/' + f
+            mrs.mread3d(mrsdata_filepath)
+            if mrs.navg > 1:
+                print(f'Skipping {mrsdata_filepath} with {mrs.navg} avg as phantom data')
+                continue
+            l.append(mrsdata_filepath)
     return(l)
 
 def groupMRDfiles(rootdir, unifylevel):
+    '''
+    Group .MRD files into groups of files that have the same path up to the unifylevel
+    Args:
+        rootdir: path to the root directory as a string specified by -f command line argument
+        unifylevel: 3 to concatenate each image file into single MRD file
+                    1 to keep each image file as a separate MRD file
+                    as an integer specified by -u command line argument
+    Returns
+        List of paths of .MRD files to be grouped together
+    '''
     if(not os.path.isdir(rootdir)):
         return([])
     l = groupMRDfiles_collect(rootdir)
@@ -156,18 +177,16 @@ def make_header(mrs, measID):
 def convert_mrs_to_mrd(basedir, unifylevel):
     # assemble groups of MRD files
     groups = groupMRDfiles(basedir, unifylevel)
-    # clean groups so they all have the same length
-    groups = [[f for f in g if os.path.getsize(f) == mode([os.path.getsize(f) for f in g])] for g in groups]
-
+    # groups are lists of MRS files to be grouped together in a single .MRD2 file format
     for g in groups:
+        # get the measurement ID from the first file in the group
         measID = g[0].split('/')[-(unifylevel + 1)]
         basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
         print('grouping', len(g), 'files into', basedir)
         w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
-        # make and write output file header
         for ig in range(len(g)):
-            mrs.mread3d(g[ig])
-            if(ig == 0):
+            # write the header once for the entire group after continue
+            if ig == 0:
                 h = make_header(mrs, measID)
                 w.write_header(h)
             w.write_data(generate_acquisition(mrs, ig))
@@ -175,7 +194,6 @@ def convert_mrs_to_mrd(basedir, unifylevel):
 
 # -u 3 consolidates the files as appropriate for EPSI. 
 # spectral data like Bukola's and David's uses -u 1
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Convert MRS data folder to MRD2 format')
     parser.add_argument('-f', '--folder', type=str, required=True,
@@ -186,4 +204,3 @@ if __name__ == "__main__":
     print('running with base director =', args.folder)
     print('unify level set to', args.unifylevel)
     convert_mrs_to_mrd(args.folder, args.unifylevel)
-    # groupMRDfiles(args.folder, args.unifylevel)
