@@ -1,0 +1,31 @@
+# The Tyger server URL
+serverUrl: https://spinhance.tyger.cloud
+
+# The service principal AppID
+servicePrincipal: de80f553-71ed-4418-88cc-28619be79aaf
+
+# The path to a file with the service principal certificate
+certificatePath: ./tyger-sp.pem
+
+# The thumbprint of a certificate in a Windows certificate store to use for service principal authentication (Windows only)
+# certificateThumbprint: 37e4bbee7c605380882ed8f23cdc7651519d1e13
+
+# A list of CIDR ranges that are allowed to access the proxy.
+# If empty, there are no restrictions.
+allowedClientCIDRs:
+  # - 172.19.176.0/20
+  # - 172.19.184.80/32
+  # - 172.19.176.1/32
+  - 10.0.0.51/24
+  - 10.0.0.110/32
+  - 172.17.0.1/32
+  - 127.0.0.1/32
+
+# The port to listen on. If not specified, 6888 is used. If 0, a random port is used.
+port: 6888
+
+# The HTTP proxy to use. Can be 'auto[matic]', 'none', or a URL. The default is 'auto'.
+proxy: auto
+
+# A path either to a directory or to a file to write logs. If it is a directory, a log file will be created in it.
+logPath: /tmp/tyger-sp
