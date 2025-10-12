@@ -19,7 +19,7 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
         lorngetpeakparams, lornputpeakparams
 
 debugphasing = False
-debuglorn = True
+debuglorn = False
 
 basedir = '.'
 fidpad = 4 
@@ -255,9 +255,12 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
     # save current figure as a PNG file
     # create directory if it doesn't exist
-    if not os.path.exists(os.path.join(Path(basedir).parent, 'lorn_fit')):
-        os.makedirs(os.path.join(Path(basedir).parent, 'lorn_fit'))
-    png_filepath = os.path.join(Path(basedir).parent, 'lorn_fit', experiment_name + '_lorn_fit.png')
+    # lorn_fit_dir = 'C:/Users/MRS/dev/rawdata/mrsolutions/test_shur/lorn_fit'
+    lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
+    if not os.path.exists(lorn_fit_dir):
+        os.makedirs(lorn_fit_dir)
+    png_filepath = os.path.join(lorn_fit_dir, experiment_name + '_lorn_fit.png')
+    print("Save fitting plot at filepath", png_filepath)
     plt.savefig(png_filepath)
     
     append_auximage(auximages)
@@ -519,9 +522,11 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             # ATTENTION: np save may not work in tyger stream 
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
             # if basedir/processed_npy doesn't exist create it
-            if not os.path.exists(os.path.join(Path(basedir).parent, 'processed_npyfiles')):
-                os.makedirs(os.path.join(Path(basedir).parent, 'processed_npyfiles'))
-            npy_filepath = os.path.join(Path(basedir).parent, 'processed_npyfiles', experiment_name + '_metabolites.npy')
+            # npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
+            npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
+            if not os.path.exists(npy_dir):
+                os.makedirs(npy_dir)
+            npy_filepath = os.path.join(npy_dir, experiment_name + '_metabolites.npy')
             np.save(npy_filepath, metabolites)
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
             # read_data can be called only once to get Stream +Item
@@ -569,7 +574,7 @@ if __name__ == "__main__":
             floatarg = np.nan
         if(sys.argv[iarg] == '-f'):
             basedir = sys.argv[iarg + 1]
-            print('setting base dir to', basedir, file=sys.stderr)
+            # print('setting base dir to', basedir, file=sys.stderr)
             continue
         if(sys.argv[iarg] == '-w' and not np.isnan(floatarg)):
             wigglefactor = floatarg
@@ -596,8 +601,9 @@ if __name__ == "__main__":
     # run all mrd2 files in the directory for local run
     if basedir != '.':
         fnames = findmrd2files(basedir, targetfiletype)
-        for f in fnames:
+        for i, f in enumerate(fnames):
             output_path = f.replace('raw.mrd2', Path(f).parent.name + '_recon.mrd2')
+            print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {output_path}', file=sys.stderr)
             reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)

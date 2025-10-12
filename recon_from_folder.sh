@@ -35,13 +35,13 @@ fi
 
 # call python scripts
 winpty python MRStomrd2.py -f "$folder_path" -u 3 
-echo "run reconstruction code"
+echo "Conversion to MRD2 completed."
 winpty python mrd2recon.py -f "$folder_path" -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -poop_tm 15.9 -hyd_tm 18.1 -lac_m 21.8
 
 echo "🔍 Searching for recon.mrd2 files..."
 
-# Find all recon.mrd2 files under the folder path
-mapfile -t mrd2_files < <(find "$folder_path" -name "recon.mrd2" -type f 2>/dev/null)
+# Find all files that end with recon.mrd2 files under the folder path
+mapfile -t mrd2_files < <(find "$folder_path" -name "*recon.mrd2" -type f 2>/dev/null)
 
 # Check if any files were found
 if [ ${#mrd2_files[@]} -eq 0 ]; then

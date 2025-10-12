@@ -114,10 +114,11 @@ def groupMRDfiles_collect(rootdir):
             l.extend(groupMRDfiles_collect(rootdir + '/' + f))
         elif(f.find('.MRD') > 0):
             mrsdata_filepath = rootdir + '/' + f
+            # mrs class is filled when reading navg
             mrs.mread3d(mrsdata_filepath)
             if mrs.navg > 1:
-                print(f'Skipping {mrsdata_filepath} with {mrs.navg} avg as phantom data')
-                continue
+                print(f'Skipping phantom {mrsdata_filepath} with {mrs.navg} avg as phantom data')
+            #     continue
             l.append(mrsdata_filepath)
     return(l)
 
@@ -186,6 +187,8 @@ def convert_mrs_to_mrd(basedir, unifylevel):
         w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
         for ig in range(len(g)):
             # write the header once for the entire group after continue
+            # re-read the data to set the correct header for each group
+            mrs.mread3d(g[ig])
             if ig == 0:
                 h = make_header(mrs, measID)
                 w.write_header(h)
