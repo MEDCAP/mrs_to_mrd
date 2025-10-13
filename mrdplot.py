@@ -109,7 +109,7 @@ def plot_mrd(input: BinaryIO, filename: str):
                 for iimg in range(nimg):
                     thisimg = met[:, :, imet, iimg]
                     plotfig[(imet * height * zf):((imet + 1) * height * zf), (iimg * width * zf):((iimg + 1) * \
-                            width * zf)] = zoom(np.rot90(thisimg), zf, order=2) / themax
+                            width * zf)] = zoom(thisimg, zf, order=2) / themax
                     plotfig[imet * height * zf, :] = 1
             fig3 = plt.figure()
             fig3.suptitle('metabolic images, File: ' + filename)

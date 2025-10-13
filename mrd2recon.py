@@ -130,10 +130,14 @@ def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.
         imghead.image_series_index = ide
         imghead.user_int = []
         imghead.user_float = []
-        img = mrd.Image(head=imghead, data=np.expand_dims(np.transpose(metabolite[:, ide, :, :]), (0, 1)))
+        # rotate counterclock-wise 90deg and flip leftright
+        # metabolite shape = (freq, meas, rows, cols)
+        # mrd2 image shape = (channels, slices, rows, cols, freqs)
+        imgdata = np.expand_dims(np.moveaxis(metabolite[:, ide, :, :], 0, 2), (0, 1))
+        img = mrd.Image(head=imghead, data=imgdata)
         yield(mrd.StreamItem.ImageDouble(img))
 
-def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: np.ndarray):
+def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: np.ndarray):#
     global experiment_name
     auximages = []
     numimages = sum([a.head.flags & mrd.AcquisitionFlags.LAST_IN_PHASE == \
@@ -256,7 +260,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
     # save current figure as a PNG file
     # create directory if it doesn't exist
-    # lorn_fit_dir = 'C:/Users/MRS/dev/rawdata/mrsolutions/test_shur/lorn_fit'
+    # lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
     lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
     if not os.path.exists(lorn_fit_dir):
         os.makedirs(lorn_fit_dir)
@@ -286,6 +290,8 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                         np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
                 x1 = minimize(lor1fit, x0, bounds=bounds)
                 metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
+    # rotate by 90deg
+    metabolites = np.rot90(metabolites, k=1, axes=(2,3))
     return([metabolites, auximages])
 
 def generate_spectra(h: mrd.Header,

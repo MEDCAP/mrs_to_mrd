@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import argparse
 import numpy as np
+import matplotlib.pyplot as plt
 
 from MRSreader import MRSdata
 
@@ -15,8 +16,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.input.endswith('.npy'):
         metabolites = np.load(args.input)
-        print(metabolites.shape)
-        print(metabolites[0,0,:,:])
+        plt.title("npy file rotated")
+        plt.imshow(metabolites[3,0,:,:], cmap='gray')
+        plt.show()
     else:
         mrs.mread3d(args.input)
         print(mrs.navg)
