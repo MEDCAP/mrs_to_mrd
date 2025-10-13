@@ -36,6 +36,7 @@ def findmrd2files(basedir, targetfiletype):
         return [basedir]
     for root, dirnames, filenames in os.walk(basedir):
         if 'raw.mrd2' in filenames or targetfiletype in filenames:
+            print('dirnames', Path(root).name)
             # if 'recon.mrd2' in filenames:
             #     print("Reconstruction completed", os.path.join(root, 'recon.mrd2'))
             #     continue
