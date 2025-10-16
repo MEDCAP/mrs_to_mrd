@@ -20,6 +20,7 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 
 debugphasing = False
 debuglorn = False
+debuglorn = False
 
 basedir = '.'
 fidpad = 4 
@@ -154,8 +155,10 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         for ipe in range(kspace.shape[1]):
             a = raw_acquisition_list[ia]
             for iecho in range(a.head.idx.contrast):
+                tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
                 kspace[iimg, ipe, :, iecho] = a.data[(iecho * totalppswitch + \
-                    a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0]
+                    a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0] * \
+                    np.exp(-tk * lb)
             ia += 1
     # print('doing fft')
     img = np.fft.fftshift(np.fft.fftn(kspace, axes = (1, 2, 3)), axes = (1, 2, 3))
@@ -203,6 +206,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     plt.pause(.1)
                 if(ide > 1):
                     globalspect += img[ide, j, k, :]
+    np.save(os.path.join(basedir, 'img.npy'), img)
     # print('end phasing')
     BW = 1 / sampletime / totalppswitch
     xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
