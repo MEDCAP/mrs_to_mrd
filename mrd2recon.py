@@ -206,7 +206,9 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     plt.pause(.1)
                 if(ide > 1):
                     globalspect += img[ide, j, k, :]
-    np.save(os.path.join(basedir, 'img.npy'), img)
+    # pre_correction_dir = "C:/Users/kento/dev/rawdata/mrsolutions/test_shur/pre_correction"
+    pre_correction_dir = "C:/Users/MRS/Desktop/shurik/pre_correction"
+    np.save(os.path.join(pre_correction_dir, experiment_name, '_precorrect.npy'), img)
     # print('end phasing')
     BW = 1 / sampletime / totalppswitch
     xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
@@ -264,8 +266,8 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
     # save current figure as a PNG file
     # create directory if it doesn't exist
-    # lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
-    lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
+    lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
+    # lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
     if not os.path.exists(lorn_fit_dir):
         os.makedirs(lorn_fit_dir)
     png_filepath = os.path.join(lorn_fit_dir, experiment_name + '_lorn_fit.png')
@@ -533,8 +535,8 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             # ATTENTION: np save may not work in tyger stream 
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
             # if basedir/processed_npy doesn't exist create it
-            # npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
-            npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
+            npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
+            # npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
             if not os.path.exists(npy_dir):
                 os.makedirs(npy_dir)
             npy_filepath = os.path.join(npy_dir, experiment_name + '_metabolites.npy')
