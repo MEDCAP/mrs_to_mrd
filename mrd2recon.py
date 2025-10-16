@@ -12,14 +12,14 @@ import argparse
 import re
 
 # # path to mrd python package is 'root/mrd-fork/python' 
-# sys.path.append(os.path.join(Path(__file__).parent, 'mrd-fork','python'))
+sys.path.append(os.path.join(Path(__file__).parent, 'mrd-fork','python'))
 import mrd
 from MRSreader import MRSdata
 from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
         lorngetpeakparams, lornputpeakparams
 
 debugphasing = False
-debuglorn = True
+debuglorn = False
 
 basedir = '.'
 fidpad = 4 
@@ -147,8 +147,10 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         for ipe in range(kspace.shape[1]):
             a = raw_acquisition_list[ia]
             for iecho in range(a.head.idx.contrast):
+                tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
                 kspace[iimg, ipe, :, iecho] = a.data[(iecho * totalppswitch + \
-                    a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0]
+                    a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0] * \
+                    np.exp(-tk * lb)
             ia += 1
     # print('doing fft')
     img = np.fft.fftshift(np.fft.fftn(kspace, axes = (1, 2, 3)), axes = (1, 2, 3))
@@ -196,6 +198,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     plt.pause(.1)
                 if(ide > 1):
                     globalspect += img[ide, j, k, :]
+    np.save(os.path.join(basedir, 'img.npy'), img)
     # print('end phasing')
     BW = 1 / sampletime / totalppswitch
     xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
@@ -256,8 +259,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     lornputpeakparams(centers, widths, phases, debuglorn)
     metabolites = np.zeros((npeaks, numimages, npe, nro))
     # shorten the list for quick debugging
-    for ide in range(3):
-    # for ide in range(numimages):
+    for ide in range(numimages):
         # print('voxel fit img', ide, flush=True)
         for j in range(npe):
             for k in range(nro):
@@ -509,7 +511,7 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             #############################################################################
             # ATTENTION: np save may not work in tyger stream 
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-            # np.save(os.path.join(basedir, 'metabolites.npy'), metabolites)
+            np.save(os.path.join(basedir, 'metabolites.npy'), metabolites)
 
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
             # read_data can be called only once to get Stream +Item
@@ -585,6 +587,7 @@ if __name__ == "__main__":
         fnames = findmrd2files(basedir, targetfiletype)
         for f in fnames:
             output_path = f.replace('raw.mrd2', Path(f).parent.name + '_recon.mrd2')
+            print(output_path)
             reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
