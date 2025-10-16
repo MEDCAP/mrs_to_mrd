@@ -21,6 +21,7 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 debugphasing = False
 debuglorn = False
 debuglorn = False
+debuglorn = False
 
 basedir = '.'
 fidpad = 4 
@@ -155,6 +156,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         for ipe in range(kspace.shape[1]):
             a = raw_acquisition_list[ia]
             for iecho in range(a.head.idx.contrast):
+                tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
                 tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
                 kspace[iimg, ipe, :, iecho] = a.data[(iecho * totalppswitch + \
                     a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0] * \
