@@ -4,7 +4,7 @@ import os
 from scipy.optimize import minimize
 import sys
 
-MRSdatadebug = False
+MRSdatadebug = True
 
 class MRSdata:
     def __init__(self):
@@ -16,7 +16,7 @@ class MRSdata:
         self.nex = 0
         self.basefreq = 0
         self.pplfile = ''
-        self.sampleperiod = 0
+        self.sampleperiod = 0   # in 100ns
         self.nslc = 0
         self.acqstarttime = 0
         self.alpha = 0
@@ -26,7 +26,7 @@ class MRSdata:
         self.FOVoff = [0.0, 0.0, 0.0]
         self.FOVaspect = 0.0
         self.FOV = 0.0
-        self.tr = 0.0
+        self.tr = 0.0           # in ms
     def mread3d(self, f):
         if(MRSdatadebug):
             print(f'reading MRS file {f}', file=sys.stderr)
@@ -220,3 +220,9 @@ class MRSdata:
         self.acqstarttime = int(self.parameters[beginidx:endidx])
         if(MRSdatadebug):
             print(f'   setting acq start time to {self.acqstarttime} since some time in units of 100ns', file=sys.stderr)
+
+if __name__ == '__main__':
+    filepath = sys.argv[1]
+    m = MRSdata()
+    m.mread3d(filepath)
+    print(m.sampleperiod)
