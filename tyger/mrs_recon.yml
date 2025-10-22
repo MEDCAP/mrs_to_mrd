@@ -21,5 +21,5 @@ job:
       outputs:
         - output
     args:
-      - python
+      - python mrd2recon.py -i $INPUT_PIPELINE -o $OUTPUT_PIPELINE
       
