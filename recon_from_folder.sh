@@ -1,11 +1,4 @@
 #!/bin/bash
-
-# 1. Select folder to feed to recon with slicing arguments or select
-#    If parent folder is passed, 
-# 2. Ideally use the 
-
-
-
 # A single-line PowerShell command to open the dialog.
 # Note the backslashes to escape the dollar signs for bash.
 win_path=$(powershell.exe -Command "
@@ -34,7 +27,7 @@ else
 fi
 
 # call python scripts
-winpty python MRStomrd2.py -f "$folder_path" -u 3 
+winpty python MRStomrd2.py -f "$folder_path" -u 1 
 echo "Conversion to MRD2 completed."
 winpty python mrd2recon.py -f "$folder_path" -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -poop_tm 15.9 -hyd_tm 18.1 -lac_m 21.8
 

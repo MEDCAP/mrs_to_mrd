@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 from scipy.optimize import minimize
+import sys
 
 MRSdatadebug = False
 
@@ -28,7 +29,7 @@ class MRSdata:
         self.tr = 0.0
     def mread3d(self, f):
         if(MRSdatadebug):
-            print('reading MRS file ', f)
+            print(f'reading MRS file {f}', file=sys.stderr)
         containingfolder = '/'.join(f.split('/')[:-1])
         d = os.listdir(containingfolder)
         # first get base frequency from SPR file
@@ -40,7 +41,7 @@ class MRSdata:
                 if(freqidx > 0):
                     self.basefreq = int(float(fdstr[(freqidx + 5):(freqidx + 19)]) * 1.0E+6 + 0.5)
                     if(MRSdatadebug):
-                        print('   setting base frequency to ', self.basefreq, ' Hz')
+                        print(f'   setting base frequency to {self.basefreq}Hz', file=sys.stderr)
             if self.basefreq == 0:
                 self.basefreq = 74941736
         # now read MRS file
@@ -83,13 +84,13 @@ class MRSdata:
             d = np.frombuffer(fdbytes[dstart:dend], dtype = 'float64')
             rawdata = d[::2] + 1j * d[1::2]
         else:
-            print('unknown data format')
+            print('unknown data format', file=sys.stderr)
             return
         # parameters describes settings, appended to the end of the file
         self.rawdata = np.reshape(rawdata, (self.samples, self.views, self.sliceviews, self.slices, \
                 self.echoes, self.nex), order = 'F')
         if(MRSdatadebug):
-            print('   reading data ', self.rawdata.shape, ' nsamp x nview x nslcview x nslc x necho x nex')
+            print(f'   reading data {self.rawdata.shape} nsamp x nview x nslcview x nslc x necho x nex', file=sys.stderr)
         self.parameters = str(fdbytes[dend:])
         # set ppm file name
         endidx = self.parameters.find('.ppl')
@@ -100,7 +101,7 @@ class MRSdata:
                  break
         self.pplfile = self.parameters[(beginidx + 1):endidx]
         if(MRSdatadebug):
-            print('   setting ppl file name =', self.pplfile)
+            print(f'   setting ppl file name ={self.pplfile}', file=sys.stderr)
         # set sample period in 1/10ths of a microsecond
         beginidx = self.parameters.find('SAMPLE_PERIOD')
         beginidx += self.parameters[beginidx:].find(',') + 1
@@ -108,7 +109,7 @@ class MRSdata:
                 beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
         self.sampleperiod = int(self.parameters[beginidx:endidx])
         if(MRSdatadebug):
-            print('   setting sample period to ', self.sampleperiod, ' tenths of a microsecond')
+            print(f'   setting sample period to {self.sampleperiod} tenths of a microsecond', file=sys.stderr)
         # set number of slices
         beginidx = self.parameters.find('NO_SLICES')
         beginidx += self.parameters[beginidx:].find(',') + 1
@@ -117,9 +118,9 @@ class MRSdata:
         try:
             self.nslc = int(self.parameters[beginidx:endidx])
             if(MRSdatadebug):
-                print('   setting num slices to ', self.nslc)
+                print(f'   setting num slices to {self.nslc}', file=sys.stderr)
         except:
-            print('   nslc not specified')
+            print('   nslc not specified', file=sys.stderr)
         # set number of averages
         beginidx = self.parameters.find('NO_AVERAGES')
         beginidx += self.parameters[beginidx:].find(',') + 1
@@ -127,7 +128,7 @@ class MRSdata:
                 beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
         self.navg = int(self.parameters[beginidx:endidx])
         if(MRSdatadebug):
-            print('   setting num averages to ', self.navg)
+            print(f'   setting num averages to {self.navg}', file=sys.stderr)
         # set alpha
         beginidx = self.parameters.find('alpha')
         beginidx += self.parameters[beginidx:].find(',') + 1
@@ -136,9 +137,9 @@ class MRSdata:
         try:
             self.alpha = int(self.parameters[beginidx:endidx])
             if(MRSdatadebug):
-                print('   setting flip angle to ', self.alpha)
+                print(f'   setting flip angle to {self.alpha}', file=sys.stderr)
         except:
-            print('   alpha not specified')
+            print('   alpha not specified', file=sys.stderr)
         # set tr
         beginidx = self.parameters.find('tr,')
         beginidx += self.parameters[beginidx:].find(',') + 1
@@ -147,9 +148,9 @@ class MRSdata:
         try:
             self.tr = int(self.parameters[beginidx:endidx])
             if(MRSdatadebug):
-                print('   setting tr to ', self.tr)
+                print(f'   setting tr to {self.tr}', file=sys.stderr)
         except:
-            print('   tr not specified')
+            print('   tr not specified', file=sys.stderr)
         # set number of switches
         beginidx = self.parameters.find('no_switches')
         beginidx += self.parameters[beginidx:].find(',') + 1
@@ -158,9 +159,9 @@ class MRSdata:
         try:
             self.nswitch = int(self.parameters[beginidx:endidx])
             if(MRSdatadebug):
-                print('   setting number of switches ', self.nswitch)
+                print(f'   setting number of switches {self.nswitch}', file=sys.stderr) 
         except:
-            print('   nswitches not specified')
+            print('   nswitches not specified', file=sys.stderr)
         # set number of points per switch
         beginidx = self.parameters.find('no_pts_switch')
         beginidx += self.parameters[beginidx:].find(',') + 1
@@ -169,9 +170,9 @@ class MRSdata:
         try:
             self.nppswitch = int(self.parameters[beginidx:endidx])
             if(MRSdatadebug):
-                print('   setting flip angle to ', self.alpha)
+                print(f'   setting flip angle to {self.alpha}', file=sys.stderr)
         except:
-            print('   points per switch not specified')
+            print('   points per switch not specified', file=sys.stderr)
         # set FOV offsets
         beginidx = self.parameters.find('FOV_OFFSETS')
         beginidx += self.parameters[beginidx:].find(',') + 1
@@ -188,9 +189,9 @@ class MRSdata:
                     beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
             self.FOVoff[2] = float(self.parameters[beginidx:endidx]) / 1000.0
             if(MRSdatadebug):
-                print('   setting FOV offsets (m) to ', self.FOVoff[0], self.FOVoff[1], self.FOVoff[2])
+                print(f'   setting FOV offsets (m) to {self.FOVoff[0]}, {self.FOVoff[1]}, {self.FOVoff[2]}', file=sys.stderr)
         except:
-            print('   FOV offsets not specified')
+            print('   FOV offsets not specified', file=sys.stderr)
         # set FOV
         beginidx = self.parameters.find('FOV') + 3
         if(beginidx >  3):
@@ -199,9 +200,9 @@ class MRSdata:
             try:
                 self.FOV = float(self.parameters[beginidx:endidx]) / 1000.0
                 if(MRSdatadebug):
-                    print('   setting FOV (m)', self.FOV)
+                    print(f'   setting FOV (m){self.FOV})', file=sys.stderr) 
             except:
-                print('   FOV not specified')
+                print('   FOV not specified', file=sys.stderr)
         # set aspect ratio
         beginidx = self.parameters.find('aspect_ratio')
         beginidx += self.parameters[beginidx:].find(',') + 1
@@ -210,12 +211,12 @@ class MRSdata:
         try:
             self.FOVaspect = float(self.parameters[beginidx:endidx])
             if(MRSdatadebug):
-                print('   setting FOV aspect ratio to ', self.FOVaspect)
+                print(f'   setting FOV aspect ratio to {self.FOVaspect}', file=sys.stderr)
         except:
-            print('   FOV aspect not specified')
+            print('   FOV aspect not specified', file=sys.stderr)
         # set acquisition start time
         beginidx = self.parameters.find('AcquisitionStartTime') + len('AcquisitionStartTime')
         endidx =  beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1
         self.acqstarttime = int(self.parameters[beginidx:endidx])
         if(MRSdatadebug):
-            print('   setting acq start time to ', self.acqstarttime, ' since some time in units of 100ns')
+            print(f'   setting acq start time to {self.acqstarttime} since some time in units of 100ns', file=sys.stderr)

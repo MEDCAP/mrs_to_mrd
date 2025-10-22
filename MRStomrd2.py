@@ -26,89 +26,28 @@ def generate_acquisition(g, ide):
     pulsedt = 10.0E-6         # specify pulse in steps of 10us
     TE = 180E-6               # just an estimate for now, start acquiring 180us after beginning of 100us pulse
     if(g.pplfile.find('epsi') >= 0):
-        # pulseq format of pulses and gradients
-        # definition of rastertime
-        definitions = mrd.PulseqDefinitions()
-        definitions.gradient_raster_time = 10000  # 10us
-        definitions.radiofrequency_raster_time = 10000  # 10us RF timeid sets the dwell time in units of raster time
-        # definitions.adc_raster_time_ns = 0  # not used
-        definitions.block_duration_raster_ns = 10000 # 10us for blocks
-        definitions.name = "MRS epsi"
-        definitions.fov = g.FOV
-        definitions.custom['TE'] = TE
-        definitions.custom['TR'] = g.tr * 1.0E+6    # convert from ms to ns
-        definitions.custom['acq_start_time'] = g.acqstarttime * 100  # convert from 0.1us to ns
-        definitions.custom['pulse_length'] = pulse_len * 1.0E+9  # convert from s to ns
-        yield mrd.StreamItem.Definitions(definitions)
-
-        # define rf amp shape
-        rf_amp_shape = mrd.shape()
-        rf_amp_shape.id = 1
-        rf_amp_shape.num_samples = int(pulse_len / pulsedt)
-        # shape data is normalized to [-1, 1] and amplitude is set in RFPulseEvent field
-        rf_amp_shape.data = np.ones(rf_amp_shape.num_samples, dtype=np.float64)
-        # compressed format
-        # start_derivative = np.array([1, 0, 0])
-        # rf_amp_shape.data = np.concatenate(start_derivative, rf_amp_shape.num_samples-start_derivative.size())
-        yield mrd.StreamItem.Shape(rf_amp_shape)
-
-        # define rf phase shape
-        rf_phase_shape = mrd.shape()
-        rf_phase_shape.id = 2
-        rf_phase_shape.num_samples = int(pulse_len / pulsedt)
-        rf_phase_shape.data = np.zeros(rf_phase_shape.num_samples, dtype=np.float64)
-        yield mrd.StreamItem.Shape(rf_phase_shape)
-
-        # store rf amplitude shape
-        rf = mrd.RFPulseEvent()
-        rf.id = 1
-        rf.amp = 100    # (Hz) we don't know the pulse amplitude yet
-        rf.mag_id = rf_amp_shape.id
-        rf.phase_id = rf_phase_shape.id
-        rf.time_id = 0  # 0 to use radiofrequency_raster_time_ns
-        rf.center_ns = pulse_len / 2
-        rf.delay_ns = 0
-        rf.freq_ppm = 0
-        rf.phase_ppm = 0
-        rf.freq_offset = 0
-        rf.phase_offset = 0
-        rf.use = mrd.RFPulseUse.EXCITATION
-
-        yield mrd.StreamItem.RFPulseEvent(rf)
-
         nPE = g.rawdata.shape[1]  # number of acquisitions per image file (phase-encodes)
         for iacq in range(nPE):
-            # block
-            block = mrd.PulseqBlock()
-            block.id = iacq * 2 + 1   # id is unique and positive int
-            block.duration = pulse_len * 1.0E+9
-            block.rf = rf.id
-            # next block id to fill in zeros after rf pulse
-            block.id = iacq * 2 + 2
-            block.duration = int(pulse_len / pulsedt) * 10000  # fill to next raster time
-            yield mrd.StreamItem.PulseqBlock(block)
-
-            ########################################################
             # pulse and gradients specified based on original format
-            # p = mrd.Pulse()
-            # CO_freq = g.basefreq
-            # pulse_start = np.uint64(g.acqstarttime * 100) + np.uint64(iacq * g.tr * 1.0E+6)
-            # pulse_end = pulse_start + np.uint64(pulse_len * 1.0E+9)
-            # p.head.pulse_time_stamp_ns = pulse_start
-            # p.head.sample_time_ns = g.sampleperiod * 100  # convert to ns (sampleperiod is in units of 100ns)
-            # npulsepoints = int(pulse_len / pulsedt)
-            # p.amplitude = np.zeros((1, npulsepoints)).astype(np.float32)
-            # p.phase = np.zeros(npulsepoints).astype(np.float32)
-            # for idt in range(npulsepoints):
-            #     p.amplitude[0, idt] = 1.0    # we don't know the pulse amplitude or phase yet
-            #     p.phase[idt] = 0.0
-            # yield mrd.StreamItem.Pulse(p)
-            # # make the gradients
-            # gr = mrd.Gradient()
-            # gr.head.gradient_time_stamp_ns = pulse_start + np.uint64(TE * 1.0E+9)
-            # gr.head.gradient_sample_time_ns = 10000 # 10us
-            # # at some point we'll have to reproduce the whole flyback gradient waveform but not now
-            # yield mrd.StreamItem.Gradient(gr)
+            p = mrd.Pulse()
+            CO_freq = g.basefreq
+            pulse_start = np.uint64(g.acqstarttime * 100) + np.uint64(iacq * g.tr * 1.0E+6)
+            pulse_end = pulse_start + np.uint64(pulse_len * 1.0E+9)
+            p.head.pulse_time_stamp_ns = pulse_start
+            p.head.sample_time_ns = g.sampleperiod * 100  # convert to ns (sampleperiod is in units of 100ns)
+            npulsepoints = int(pulse_len / pulsedt)
+            p.amplitude = np.zeros((1, npulsepoints)).astype(np.float32)
+            p.phase = np.zeros(npulsepoints).astype(np.float32)
+            for idt in range(npulsepoints):
+                p.amplitude[0, idt] = 1.0    # we don't know the pulse amplitude or phase yet
+                p.phase[idt] = 0.0
+            yield mrd.StreamItem.Pulse(p)
+            # make the gradients
+            gr = mrd.Gradient()
+            gr.head.gradient_time_stamp_ns = pulse_start + np.uint64(TE * 1.0E+9)
+            gr.head.gradient_sample_time_ns = 10000 # 10us
+            # at some point we'll have to reproduce the whole flyback gradient waveform but not now
+            yield mrd.StreamItem.Gradient(gr)
             # make the acquisition
             a = mrd.Acquisition()
             if(iacq == 0):

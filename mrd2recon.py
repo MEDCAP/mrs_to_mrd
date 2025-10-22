@@ -19,7 +19,7 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
         lorngetpeakparams, lornputpeakparams
 
 debugphasing = False
-debuglorn = False
+debuglorn = True
 
 basedir = '.'
 fidpad = 4 
@@ -36,11 +36,6 @@ def findmrd2files(basedir, targetfiletype):
         return [basedir]
     for root, dirnames, filenames in os.walk(basedir):
         if 'raw.mrd2' in filenames or targetfiletype in filenames:
-            print('dirnames', Path(root).name)
-            # if 'recon.mrd2' in filenames:
-            #     print("Reconstruction completed", os.path.join(root, 'recon.mrd2'))
-            #     continue
-            # print("Reconstructing", os.path.join(root, 'raw.mrd2'))
             mrd2list.append(os.path.join(root, 'raw.mrd2'))
     return(mrd2list)
 
@@ -207,7 +202,9 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     globalspect += img[ide, j, k, :]
     # pre_correction_dir = "C:/Users/kento/dev/rawdata/mrsolutions/test_shur/pre_correction"
     pre_correction_dir = "C:/Users/MRS/Desktop/shurik/pre_correction"
-    np.save(os.path.join(pre_correction_dir, experiment_name, '_precorrect.npy'), img)
+    if os.path.exists(pre_correction_dir):
+        print(f"Saving precorrection npy files at: {pre_correction_dir}", )
+        np.save(os.path.join(pre_correction_dir, experiment_name, '_precorrect.npy'), img)
     # print('end phasing')
     BW = 1 / sampletime / totalppswitch
     xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
@@ -264,15 +261,13 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
     # save current figure as a PNG file
-    # create directory if it doesn't exist
-    lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
-    # lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
-    if not os.path.exists(lorn_fit_dir):
-        os.makedirs(lorn_fit_dir)
-    png_filepath = os.path.join(lorn_fit_dir, experiment_name + '_lorn_fit.png')
-    print("Save fitting plot at filepath", png_filepath)
-    plt.savefig(png_filepath)
-    
+    # lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
+    lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
+    if os.path.exists(lorn_fit_dir):
+        png_filepath = os.path.join(lorn_fit_dir, experiment_name + '_lorn_fit.png')
+        print("Save fitting plot at filepath", png_filepath)
+        plt.savefig(png_filepath)
+        
     append_auximage(auximages)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
@@ -534,12 +529,11 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             # ATTENTION: np save may not work in tyger stream 
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
             # if basedir/processed_npy doesn't exist create it
-            npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
-            # npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
-            if not os.path.exists(npy_dir):
-                os.makedirs(npy_dir)
-            npy_filepath = os.path.join(npy_dir, experiment_name + '_metabolites.npy')
-            np.save(npy_filepath, metabolites)
+            # npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
+            npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
+            if os.path.exists(npy_dir):
+                npy_filepath = os.path.join(npy_dir, experiment_name + '_metabolites.npy')
+                np.save(npy_filepath, metabolites)
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
             # read_data can be called only once to get Stream +Item
             # write_data can be rewritten by converting list of mrd objects to StreamItem
@@ -616,7 +610,10 @@ if __name__ == "__main__":
         for i, f in enumerate(fnames):
             output_path = f.replace('raw.mrd2', Path(f).parent.name + '_recon.mrd2')
             print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {output_path}', file=sys.stderr)
-            reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
+            try:
+                reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
+            except:
+                continue
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
         # reconstruct_mrs(sys.stdin.buffer, original_stdout_buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
