@@ -20,7 +20,7 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 
 debugphasing = False
 debuglorn = False
-debugfilesave = True
+debugfilesave = False
 
 basedir = '.'
 fidpad = 4 
