@@ -1,1 +1,15 @@
 __pycache__/
+*.pyc
+
+# Vim swap files
+*.swp
+*.swo
+*.swn
+*~
+
+# ignore binary files
+*.bin
+*.mrd2
+
+# ignore images
+*.png

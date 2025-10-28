@@ -7,6 +7,7 @@ from MRSreader import MRSdata
 from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
         lorngetpeakparams, lornputpeakparams
 import sys
+
 sys.path.insert(0, 'mrd-fork/python')
 import mrd
 
@@ -15,7 +16,7 @@ debuglorn = True
 
 g = MRSdata()
 
-basedir = "C:/Users/steph/Desktop/data/shurik_all_ischemia_data_081425"
+basedir = "C:/Users/steph/Desktop/data/dynamic spectra extra"
 #basedir = "C:/Users/steph/Desktop/data/cirrhrat data"
 fidpad = 4 
 lb = 42 # Hz
