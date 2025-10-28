@@ -54,7 +54,7 @@ fi
 echo "🔍 Searching for recon.mrd2 files..."
 
 # Find all recon.mrd2 files under the folder path
-mapfile -t mrd2_files < <(find "$folder_path" -name "recon.mrd2" -type f 2>/dev/null)
+mapfile -t mrd2_files < <(find "$folder_path" -name "*recon.mrd2" -type f 2>/dev/null)
 
 # Check if any files were found
 if [ ${#mrd2_files[@]} -eq 0 ]; then

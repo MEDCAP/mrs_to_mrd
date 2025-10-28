@@ -19,7 +19,8 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
         lorngetpeakparams, lornputpeakparams
 
 debugphasing = False
-debuglorn = True
+debuglorn = False
+debugfilesave = True
 
 basedir = '.'
 fidpad = 4 
@@ -29,7 +30,6 @@ experiment_name = ''
 def findmrd2files(basedir, targetfiletype):
     '''
     Search for raw.mrd2 or targetfiletype in the basedir directory and all its subdirectories
-    If recon.mrd2 already exists, don't look further in that directory
     '''
     mrd2list = []
     if os.path.isfile(basedir):
@@ -200,12 +200,13 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     plt.pause(.1)
                 if(ide > 1):
                     globalspect += img[ide, j, k, :]
-    # pre_correction_dir = "C:/Users/kento/dev/rawdata/mrsolutions/test_shur/pre_correction"
-    pre_correction_dir = "C:/Users/MRS/Desktop/shurik/pre_correction"
-    if os.path.exists(pre_correction_dir):
-        print(f"Saving precorrection npy files at: {pre_correction_dir}", )
-        np.save(os.path.join(pre_correction_dir, experiment_name, '_precorrect.npy'), img)
-    # print('end phasing')
+    # if debugfilesave:
+    #     pre_correction_dir = "C:/Users/kento/dev/rawdata/mrsolutions/test_shur/pre_correction"
+    # else:
+    #     pre_correction_dir = "C:/Users/MRS/Desktop/shurik/pre_correction"
+    # if os.path.exists(pre_correction_dir):
+    #     print(f"Saving precorrection npy files at: {pre_correction_dir}", )
+    #     np.save(os.path.join(pre_correction_dir, experiment_name, '_precorrect.npy'), img)
     BW = 1 / sampletime / totalppswitch
     xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
     globalspect /= np.max(np.abs(globalspect))
@@ -260,14 +261,18 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-    # save current figure as a PNG file
-    # lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
-    lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
+    if debugfilesave:
+        # save current figure as a PNG file
+        lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
+    else:
+        lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
     if os.path.exists(lorn_fit_dir):
         png_filepath = os.path.join(lorn_fit_dir, experiment_name + '_lorn_fit.png')
         print("Save fitting plot at filepath", png_filepath)
         plt.savefig(png_filepath)
-        
+    else:
+        raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
+
     append_auximage(auximages)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
@@ -526,14 +531,16 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
         if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
             experiment_name = str(Path(input).parents[0].name)
             [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
-            # ATTENTION: np save may not work in tyger stream 
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-            # if basedir/processed_npy doesn't exist create it
-            # npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
-            npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
+            if debugfilesave:
+                npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
+            else:
+                npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
             if os.path.exists(npy_dir):
                 npy_filepath = os.path.join(npy_dir, experiment_name + '_metabolites.npy')
                 np.save(npy_filepath, metabolites)
+            else:
+                raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
             # read_data can be called only once to get Stream +Item
             # write_data can be rewritten by converting list of mrd objects to StreamItem
@@ -616,7 +623,6 @@ if __name__ == "__main__":
                 continue
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
-        # reconstruct_mrs(sys.stdin.buffer, original_stdout_buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
 
 # now look for specification of metabolite peaks
 # BA's cirrhrat is -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
