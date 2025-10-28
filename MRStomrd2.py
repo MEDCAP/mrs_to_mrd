@@ -116,7 +116,7 @@ def groupMRDfiles_collect(rootdir):
             # mrs class is filled when reading navg
             mrs.mread3d(mrsdata_filepath)
             if mrs.navg > 1:
-                print(f'Skipping phantom {mrsdata_filepath} with {mrs.navg} avg as phantom data')
+                print(f'Skipping phantom data with {mrs.navg} avg as phantom data')
                 continue
             l.append(mrsdata_filepath)
     return(l)

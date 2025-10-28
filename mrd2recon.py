@@ -268,7 +268,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
     if os.path.exists(lorn_fit_dir):
         png_filepath = os.path.join(lorn_fit_dir, experiment_name + '_lorn_fit.png')
-        print("Save fitting plot at filepath", png_filepath)
+        print("Saving lorentzian fit plot at filepath", png_filepath)
         plt.savefig(png_filepath)
     else:
         raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
@@ -538,6 +538,7 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
                 npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
             if os.path.exists(npy_dir):
                 npy_filepath = os.path.join(npy_dir, experiment_name + '_metabolites.npy')
+                print(f"Saving metabolites npy file at {npy_filepath}")
                 np.save(npy_filepath, metabolites)
             else:
                 raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
