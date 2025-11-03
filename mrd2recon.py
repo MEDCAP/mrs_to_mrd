@@ -48,7 +48,6 @@ def generate_aux_images(imglist):
 def get_clarg(clarg, arg, ty):
     clargarr = clarg.split(' ')
     for iarg in range(len(clargarr) - 1):
-        # print(iarg, clargarr[iarg])
         if(clargarr[iarg] == arg): 
             return(ty(clargarr[iarg + 1]))
 
@@ -79,11 +78,6 @@ def kABfiteval(x):
 def kABfit(x):
     # x1 = minimize(kABfit, [.01, .03, 1]).x
     yp = kABfiteval(x)
-    # print('x=', x, 'sum((yp-y)^2)=', np.sum((yp - y)**2))
-    try:
-        np.sum((yp - y)**2)
-    except RuntimeWarning:
-        print('yp-y', yp - y)
     return(np.sum((yp - y)**2))
 
 def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.ndarray, peaknames: list):
@@ -154,7 +148,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0] * \
                     np.exp(-tk * lb)
             ia += 1
-    # print('doing fft')
+    print(f'Performing fft', file=sys.stderr)
     img = np.fft.fftshift(np.fft.fftn(kspace, axes = (1, 2, 3)), axes = (1, 2, 3))
     # print('finding biggest voxel')
     currmax = 0

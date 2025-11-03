@@ -66,9 +66,7 @@ def generate_acquisition(g, ide):
             yield mrd.StreamItem.Acquisition(a)
     elif(g.pplfile.find('1pul') >= 0):
         nrep = g.rawdata.shape[5]  # number of acquisitions per image file (phase-encodes)
-        print(nrep)
         for iacq in range(nrep):
-            print('converting measurement #: ', iacq)
             # make the pulse
             p = mrd.Pulse()
             CO_freq = g.basefreq
@@ -116,7 +114,7 @@ def groupMRDfiles_collect(rootdir):
             # mrs class is filled when reading navg
             mrs.mread3d(mrsdata_filepath)
             if mrs.navg > 1:
-                print(f'Skipping phantom data with {mrs.navg} avg as phantom data')
+                print(f'Skipping phantom data with {mrs.navg} avg as phantom data', file=sys.stderr)
                 continue
             l.append(mrsdata_filepath)
     return(l)
@@ -182,7 +180,7 @@ def convert_mrs_to_mrd(basedir, unifylevel):
         # get the measurement ID from the first file in the group
         measID = g[0].split('/')[-(unifylevel + 1)]
         basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
-        print('grouping', len(g), 'files into', basedir)
+        print(f'grouping {len(g)} files into {basedir}', file=sys.stderr)
         w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
         for ig in range(len(g)):
             # write the header once for the entire group after continue
@@ -203,6 +201,6 @@ if __name__ == "__main__":
     parser.add_argument('-u', '--unifylevel', type=int, required=False, default=1,
                         help='Directory levels to unify when grouping files (default: 1)')
     args = parser.parse_args()
-    print('running with base director =', args.folder)
-    print('unify level set to', args.unifylevel)
+    print(f'running with base director {args.folder}', file=sys.stderr)
+    print(f'unify level set to {args.unifylevel}', file=sys.stderr)
     convert_mrs_to_mrd(args.folder, args.unifylevel)

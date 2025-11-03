@@ -23,8 +23,10 @@ if [ -n "$win_path" ]; then
         # For Git Bash, you might need a different conversion or just use the Windows path.
         folder_path="$win_path"
     fi
-    echo "You selected: $folder_path"
 
+    echo "✅ You selected: $folder_path"
+    echo "--- Contents of the folder ---"
+    ls -la "$folder_path"
 else
     echo "❌ No folder was selected."
     echo "Press any key to exit..."
@@ -33,24 +35,23 @@ else
 fi
 
 # call python scripts
-echo "Converting MRS to MRD format..."
-if ! winpty python MRStomrd2.py -f "$folder_path" -u 3; then
-    echo "❌ MRS to MRD conversion failed!"
+echo "Converting to MRD2 format"
+if ! winpty python MRStomrd2.py -f "$folder_path" -u 1; then
+    echo "MRS to MRD file conversion failed"
     echo "Press any key to exit..."
     read -n 1
     exit 1
 fi
 
-echo "Running reconstruction code..."
-if ! winpty python mrd2recon.py -f "$folder_path" -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -poop_tm 15.9 -hyd_tm 18.1 -lac_m 21.8; then
-    echo "❌ Reconstruction failed!"
+echo "Running reconstruction code"
+if ! winpty python mrd2recon.py -f "$folder_path" -subst_s 0.0 -met_tm 2.77; then
+    echo "Reconstruction failed!"
     echo "Press any key to exit..."
     read -n 1
     exit 1
 fi
 
-echo "🔍 Searching for recon.mrd2 files..."
-
+echo "Searching for recon.mrd2 files..."
 # Find all recon.mrd2 files under the folder path
 mapfile -t mrd2_files < <(find "$folder_path" -name "*recon.mrd2" -type f 2>/dev/null)
 
