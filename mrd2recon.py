@@ -463,10 +463,9 @@ def spectra_recon(h: mrd.Header,
             # x[0]=kAB, x[1]=1/T1, x[2]=initial amount of metabolite
             bounds = [(None, None), (1/100, 1), (None, None)]
             x1 = minimize(kABfit, [.01, .03, 1], bounds=bounds).x
-            # x1 = minimize(kABfit, [.01, .03, 1]).x
             # sample plot
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
-                    label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/1/T1={:.2f}'.format(1/x1[1]) + \
+                    label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/T1inverse={:.2f}'.format(1/x1[1]) + \
                     '/AUC={:.2f}'.format(auc[ip]))
             # fitted line
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
