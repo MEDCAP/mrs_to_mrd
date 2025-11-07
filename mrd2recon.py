@@ -341,7 +341,6 @@ def spectra_recon(h: mrd.Header,
                   peaknames: list, 
                   wigglefactor: float):
     global P, y, t
-    global experiment_name
 
     auximages = []
     numspectra = len(raw_acquisition_list)
@@ -454,19 +453,18 @@ def spectra_recon(h: mrd.Header,
     legend = []
     plt.clf()
     colors=['r', 'b', 'g', 'c', 'k', 'r', 'b']
-    kAB_data = {}
+    auc_data = {}
     for ip in range(len(peakoffsets)):
         P = peakamplitudes[sourcepeak, :]   # peak amp of injected sample
         t = np.array(measurementtimes_ns) * 1.0E-9
         y = peakamplitudes[ip, :]           # peak amp of each metabolite
+        auc_data[peaknames[ip]] = auc[ip]
         if(ip in metabolitelist):
             # x[0]=kAB, x[1]=1/T1, x[2]=initial amount of metabolite
             bounds = [(None, None), (1/100, 1), (None, None)]
             x1 = minimize(kABfit, [.01, .03, 1], bounds=bounds).x
             # x1 = minimize(kABfit, [.01, .03, 1]).x
             # sample plot
-            kAB_data[peaknames[ip]] = {'kAB': x1[0]}
-            # save values as text file
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
                     label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/1/T1={:.2f}'.format(1/x1[1]) + \
                     '/AUC={:.2f}'.format(auc[ip]))
@@ -483,14 +481,6 @@ def spectra_recon(h: mrd.Header,
     plt.xlabel('time (s)')
     plt.yticks([])
     append_auximage(auximages)
-    # save as text file
-    import csv
-    csv_filepath = os.path.join('data', f'{experiment_name}_kAB.csv')
-    with open(csv_filepath, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Metabolite', 'kAB'])
-        for metabolite, values in kAB_data.items():
-            writer.writerow([metabolite, values['kAB']])
     # import csv
     # with open('aux.csv', 'w', newline='') as f:
     #     writer = csv.DictWriter(f, fieldnames=auc_data.keys())
