@@ -613,7 +613,8 @@ if __name__ == "__main__":
     if basedir != '.':
         fnames = findmrd2files(basedir, targetfiletype)
         for i, f in enumerate(fnames):
-            output_path = f.replace('raw.mrd2', Path(f).parent.name + '_recon.mrd2')
+            experiment_name = Path(f).parent.name
+            output_path = f.replace('raw.mrd2', experiment_name + '_recon.mrd2')
             print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {output_path}', file=sys.stderr)
             try:
                 reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
