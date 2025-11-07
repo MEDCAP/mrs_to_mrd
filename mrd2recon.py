@@ -453,12 +453,10 @@ def spectra_recon(h: mrd.Header,
     legend = []
     plt.clf()
     colors=['r', 'b', 'g', 'c', 'k', 'r', 'b']
-    auc_data = {}
     for ip in range(len(peakoffsets)):
         P = peakamplitudes[sourcepeak, :]   # peak amp of injected sample
         t = np.array(measurementtimes_ns) * 1.0E-9
         y = peakamplitudes[ip, :]           # peak amp of each metabolite
-        auc_data[peaknames[ip]] = auc[ip]
         if(ip in metabolitelist):
             # x[0]=kAB, x[1]=1/T1, x[2]=initial amount of metabolite
             bounds = [(None, None), (1/100, 1), (None, None)]
@@ -466,7 +464,7 @@ def spectra_recon(h: mrd.Header,
             # x1 = minimize(kABfit, [.01, .03, 1]).x
             # sample plot
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
-                    label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/1/T1={:.2f}'.format(1/x1[1]) + \
+                    label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/T1inverse={:.2f}'.format(1/x1[1]) + \
                     '/AUC={:.2f}'.format(auc[ip]))
             # fitted line
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
@@ -480,13 +478,6 @@ def spectra_recon(h: mrd.Header,
     plt.legend(title='')
     plt.xlabel('time (s)')
     plt.yticks([])
-    append_auximage(auximages)
-    # import csv
-    # with open('aux.csv', 'w', newline='') as f:
-    #     writer = csv.DictWriter(f, fieldnames=auc_data.keys())
-    #     writer.writeheader()
-    #     writer.writerow(auc_data)
-
     return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
             peakamplitudes, auximages)
 
