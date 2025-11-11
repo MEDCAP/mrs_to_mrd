@@ -14,7 +14,6 @@ import mrd
 # from watchdog.observers import Observer
 # from watchdog.events import FileSystemEventHandler
 from scipy.ndimage import zoom
-savekfitdata = False
 
 def plot_mrd(input: BinaryIO, filename: str):
     current_header = []
@@ -90,11 +89,6 @@ def plot_mrd(input: BinaryIO, filename: str):
                 plt.xticks([])
                 plt.yticks([])
                 plt.imshow(unpacked_bmp)
-                if savekfitdata and (not os.path.isdir('kfitdata')):
-                    os.makedirs('kfitdata')
-                    kfitpath = os.path.join('kfitdata', f'{filename}_kfit.png')
-                    fig2.savefig(kfitpath, dpi=300, bbox_inches='tight')
-                    print(f'S metabolic images to {filename}.png', file=sys.stderr)
             else:
                 # this is a metabolite image (for epsi)
                 nimg += 1
@@ -120,7 +114,7 @@ def plot_mrd(input: BinaryIO, filename: str):
                             width * zf)] = zoom(thisimg, zf, order=2) / themax
                     plotfig[imet * height * zf, :] = 1
             fig3 = plt.figure()
-            fig3.suptitle('metabolic images, File: ' + filename)
+            fig3.suptitle(f'metabolic images File: {filename}')
             plt.imshow(plotfig, cmap='gray')
             plt.xticks([])
             plt.yticks([])

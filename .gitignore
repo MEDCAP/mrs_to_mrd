@@ -13,3 +13,9 @@ __pycache__/
 
 # ignore images
 *.png
+
+# ignore csv exports
+*.csv
+
+# ignore test output files
+stream-test/
