@@ -28,9 +28,27 @@ else
 fi
 
 # call python scripts
-winpty python MRStomrd2.py -f "$folder_path" -u 1
-echo "Converting to MRD2 format"
-winpty python mrd2recon.py -f "$folder_path" -urea 0.0 -KIC_s 8.6 -leu_tm 13.0 -hyd_tm 18.1 -?_tm 21.8 -w 1.
+echo "Converting MRS to MRD format..."
+if ! winpty python MRStomrd2.py -f "$folder_path" -u 1; then
+    echo "❌ MRS to MRD conversion failed!"
+    echo "Press any key to exit..."
+    read -n 1
+    exit 1
+fi
+
+echo "Running reconstruction code..."
+if [[ "$folder_path" == *"KIC"* ]]; then
+    echo "This is a KIC injection folder"
+elif [[ "$folder_path" == *"PYR"* ]]; then
+    echo "This is a Pyruvate injection folder"
+fi
+
+if ! winpty python mrd2recon.py -f "$folder_path" -urea 0.0 -KIC_s 8.6 -leu_tm 13.0 -hyd_tm 18.1 -?_tm 21.8 -w 1.; then
+    echo "❌ Reconstruction failed!"
+    echo "Press any key to exit..."
+    read -n 1
+    exit 1
+fi
 
 echo "🔍 Searching for recon.mrd2 files..."
 

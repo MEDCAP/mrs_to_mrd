@@ -20,10 +20,12 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 
 debugphasing = False
 debuglorn = False
-debugfilesave = True
+saveSpectralLocal = False
+saveLornFitLocal = False
+saveMetaboliteLocal = False
 
 basedir = '.'
-fidpad = 4 
+fidpad = 1
 lb = 42 # Hz
 experiment_name = ''
 
@@ -52,14 +54,15 @@ def get_clarg(clarg, arg, ty):
         if(clargarr[iarg] == arg): 
             return(ty(clargarr[iarg + 1]))
 
-def append_auximage(a):
+def append_auximage(aux_images_list: list, echo_number: int):
     plt.gcf().canvas.draw()
     width, height = plt.gcf().canvas.get_width_height()
     bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
     bmp = bmp.astype(np.uint32)
     encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
-    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*256 + bmp[:,:,3]
-    a.append(encodedbmp)
+    # number of spectral pts=fidpadding * 64 acquired pts
+    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*echo_number*fidpad* + bmp[:,:,3]
+    aux_images_list.append(encodedbmp)
 
 def kABfiteval(x):
     # uses P, t, y
@@ -149,12 +152,13 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         for ipe in range(kspace.shape[1]):
             a = raw_acquisition_list[ia]
             for iecho in range(a.head.idx.contrast):
+                # line broadening
                 tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
                 kspace[iimg, ipe, :, iecho] = a.data[(iecho * totalppswitch + \
                     a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0] * \
                     np.exp(-tk * lb)
             ia += 1
-    # print('doing fft')
+    print('doing fft', file=sys.stderr)
     img = np.fft.fftshift(np.fft.fftn(kspace, axes = (1, 2, 3)), axes = (1, 2, 3))
     # print('finding biggest voxel')
     currmax = 0
@@ -173,16 +177,16 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     maxspect = img[maxide,maxj,maxk,:].copy()
     globalspect = np.zeros((a.head.idx.contrast * fidpad), dtype = 'complex')
     for ide in range(numimages):
-        # print('phasing img', ide)
         # go through all the voxels and minimize the phase difference
         for j in range(npe):
             for k in range(nro):
                 thisspect = img[ide, j, k, :]
+                # discard spectral data signal less than 3XNoise
                 if(np.max(np.abs(thisspect)) < noise * 3):
                     continue
                 bestoverlap = 0
                 for r in range(-15,16):
-                    thisrollspect = np.roll(thisspect,r)
+                    thisrollspect = np.roll(thisspect,r)    # array flatten before shifting and then shape restored
                     S0 = np.sum(np.real(thisrollspect * np.conj(maxspect)))
                     Spi2 = np.sum(np.real(thisrollspect * 1j * np.conj(maxspect)))
                     overlap = S0**2 + Spi2**2
@@ -195,18 +199,21 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     plt.clf()
                     plt.plot(np.real(img[ide,j,k,:]))
                     plt.plot(np.real(maxspect))
-                    plt.plot([0, 256], [100*bestr, 100*bestr], 'k')
+                    # number of acq pts = fidpad * acq pts
+                    plt.plot([0, a.head.idx.contrast * fidpad], [100*bestr, 100*bestr], 'k')
                     plt.draw()
                     plt.pause(.1)
                 if(ide > 1):
                     globalspect += img[ide, j, k, :]
-    # if debugfilesave:
-    #     pre_correction_dir = "C:/Users/kento/dev/rawdata/mrsolutions/test_shur/pre_correction"
-    # else:
-    #     pre_correction_dir = "C:/Users/MRS/Desktop/shurik/pre_correction"
-    # if os.path.exists(pre_correction_dir):
-    #     print(f"Saving precorrection npy files at: {pre_correction_dir}", )
-    #     np.save(os.path.join(pre_correction_dir, experiment_name, '_precorrect.npy'), img)
+    if saveSpectralLocal:
+        epsi_images_dir = "C:/Users/kento/dev/rawdata/mrsolutions/test_shur/epsi_images"
+    else:
+        epsi_images_dir = "C:/Users/MRS/Desktop/shurik/epsi_images"
+    if os.path.exists(epsi_images_dir):
+        print(f"Saving epsi images npy files at: {epsi_images_dir}", )
+        np.save(os.path.join(epsi_images_dir, experiment_name, '_epsi.npy'), img)
+    else:
+        raise FileNotFoundError(f"Directory {epsi_images_dir} does not exist.")
     BW = 1 / sampletime / totalppswitch
     xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
     globalspect /= np.max(np.abs(globalspect))
@@ -261,7 +268,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-    if debugfilesave:
+    if saveLornFitLocal:
         # save current figure as a PNG file
         lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
     else:
@@ -273,7 +280,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     else:
         raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
 
-    append_auximage(auximages)
+    append_auximage(auximages, echo_number=a.head.idx.contrast)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
     metabolites = np.zeros((npeaks, numimages, npe, nro))
@@ -383,9 +390,6 @@ def spectra_recon(h: mrd.Header,
     # global spectrum across +-25ppm of highest peak
     globalspect = np.zeros(hipt - lowpt, dtype = 'complex')
     xscale = np.array(range(len(globalspect))) / len(globalspect) * newBW / centerfreq * 1E+6
-    # TODO: measure noise auc of source KIC and leucine at meas 35-40 and 30-40
-    #
-    #
     for ispect in range(numspectra):
         if(np.max(np.abs(spectra[ispect, :])) > noise * 5):
             globalspect += spectra[ispect, :]
@@ -433,7 +437,7 @@ def spectra_recon(h: mrd.Header,
     for ip in range(0, len(peakoffsets)):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-    append_auximage(auximages)
+    append_auximage(auximages, echo_number=a.head.idx.contrast)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
     peakamplitudes = np.zeros((len(peakoffsets), numspectra))
@@ -467,7 +471,10 @@ def spectra_recon(h: mrd.Header,
         auc_data[peaknames[ip]] = auc[ip]
         if(ip in metabolitelist):
             # x[0]=kAB, x[1]=1/T1, x[2]=initial amount of metabolite
-            bounds = [(None, None), (1/100, 1), (None, None)]
+            if peaknames[ip] == 'lac' or peaknames[ip] == 'ala':
+                bounds = [(None, None), (1/24.5, 1/20), (None, None)]
+            else:
+                bounds = [(None, None), (1/100, 1), (None, None)]
             x1 = minimize(kABfit, [.01, .03, 1], bounds=bounds).x
             # x1 = minimize(kABfit, [.01, .03, 1]).x
             # sample plot
@@ -486,7 +493,7 @@ def spectra_recon(h: mrd.Header,
     plt.legend(title='')
     plt.xlabel('time (s)')
     plt.yticks([])
-    append_auximage(auximages)
+    append_auximage(auximages, echo_number=a.head.idx.contrast)
     # import csv
     # with open('aux.csv', 'w', newline='') as f:
     #     writer = csv.DictWriter(f, fieldnames=auc_data.keys())
@@ -532,7 +539,7 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             experiment_name = str(Path(input).parents[0].name)
             [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-            if debugfilesave:
+            if saveMetaboliteLocal:
                 npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
             else:
                 npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
