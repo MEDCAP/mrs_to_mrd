@@ -20,10 +20,10 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 
 debugphasing = False
 debuglorn = False
-saveSpectralLocal = True
-saveLornFitLocal = True
-saveMetaboliteLocal = True
-savekABLocal = False
+savePhasedEPSILocal = False
+saveLornFitLocal = False
+saveMetaboliteLocal = False
+kfitdata_local = True
 
 basedir = '.'
 fidpad = 1
@@ -72,7 +72,7 @@ def kABfiteval(x):
     # x[.01, .03, 1] for initial guess
     yp = np.zeros(len(y), dtype=np.float64)
     yp[0] = x[2]
-    # numerically integrate, x[0] is kAB, k[1] is 1/T1, x[2] is the amount of B at the beginning of acquisition
+    # numerically integrate, x[0] is kAB, x[1] is 1/T1, x[2] is the amount of B at the beginning of acquisition
     for j in range(1, len(t)):
         dt = t[j] - t[j-1]
         Pbar = (P[j-1] + P[j]) / 2
@@ -200,10 +200,10 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     plt.pause(.1)
                 if(ide > 1):
                     globalspect += img[ide, j, k, :]
-    if saveSpectralLocal:
+    if savePhasedEPSILocal:
         epsi_images_dir = "C:/Users/kento/dev/rawdata/mrsolutions/test_shur/epsi_images"
     else:
-        epsi_images_dir = "C:/Users/MRS/Desktop/shurik/epsi_images"
+        epsi_images_dir = "C:/Users/MRS/Desktop/shurik/phased_epsi_npyfiles"
     if os.path.exists(epsi_images_dir):
         try:
             epsi_images_path = os.path.join(epsi_images_dir, f'{experiment_name}_epsi.npy')
@@ -466,7 +466,7 @@ def spectra_recon(h: mrd.Header,
     legend = []
     plt.clf()
     colors=['r', 'b', 'g', 'c', 'k', 'r', 'b']
-    kAB_data = {}
+    kAB_auc_data = {}
     for ip in range(len(peakoffsets)):
         P = peakamplitudes[sourcepeak, :]   # peak amp of injected sample
         t = np.array(measurementtimes_ns) * 1.0E-9
@@ -478,8 +478,9 @@ def spectra_recon(h: mrd.Header,
             else:
                 bounds = [(None, None), (1/100, 1), (None, None)]
             x1 = minimize(kABfit, [.01, .03, 1], bounds=bounds).x
-            kAB_data[peaknames[ip]] = {'kAB': x1[0],
-                                       '1/T1': 1/x1[1]}
+            kAB_auc_data[peaknames[ip]] = {'kAB': x1[0],
+                                           '1/T1': 1/x1[1],
+                                           'AUC': auc[ip]}
             # save values as text file
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
                     label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/T1inverse={:.2f}'.format(1/x1[1]) + \
@@ -487,6 +488,7 @@ def spectra_recon(h: mrd.Header,
             # fitted line
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
         else:
+            kAB_auc_data[peaknames[ip]] = {'AUC': auc[ip]}
             if(ip == sourcepeak):
                 plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'-', label=peaknames[ip] + \
                     '/AUC={:.2f}'.format(auc[ip]))
@@ -497,20 +499,35 @@ def spectra_recon(h: mrd.Header,
     plt.xlabel('time (s)')
     plt.yticks([])
     append_auximage(auximages, echo_number=a.head.idx.contrast)
-    if savekABLocal:
+    if kfitdata_local:
         kfitdata_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/mrs_to_mrd/kfitdata'
     else:
         kfitdata_dir = 'C:/Users/MRS/Desktop/mrs_to_mrd/kfitdata'
+    
     if os.path.exists(kfitdata_dir):
         import csv
         try:
             csv_filepath = os.path.join(kfitdata_dir, f'{experiment_name}_kAB.csv')
             with open(csv_filepath, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Metabolite', 'kAB', '1/T1'])
-                for metabolite, values in kAB_data.items():
-                    writer.writerow([metabolite, values['kAB'], values['1/T1']])
-                print(f"Saved kAB fit data at {csv_filepath}", file=sys.stderr)
+                headers = [experiment_name]
+                for metabolite_name in kAB_auc_data.keys():
+                    headers.append(f'kAB_{metabolite_name}')
+                    headers.append(f'1/T1_{metabolite_name}')
+                    headers.append(f'AUC_{metabolite_name}')
+                writer.writerow(headers)
+                rows = [experiment_name]
+                for metabolite_name, values in kAB_auc_data.items():
+                    if 'kAB' in values:
+                        rows.append(values['kAB'])
+                        rows.append(values['1/T1'])
+                        rows.append(values['AUC'])
+                    elif 'kAB' not in values and 'AUC' in values:
+                        rows.append(np.nan)
+                        rows.append(np.nan)
+                        rows.append(values['AUC'])
+                writer.writerow(rows)
+            print(f"Saved kAB fit data at {csv_filepath}", file=sys.stderr)
         except Exception as e:
             print(f"Error saving kAB fit data: {e}", file=sys.stderr)
     return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
@@ -591,10 +608,6 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
 
 
 if __name__ == "__main__":
-    # Save original stdout buffer before redirecting print statements to stderr
-    # original_stdout_buffer = sys.stdout.buffer
-    # sys.stdout = sys.stderr
-    
     # read command line arguments
     wigglefactor = 1.0
     peakoffsets = []
@@ -641,11 +654,8 @@ if __name__ == "__main__":
         for i, f in enumerate(fnames):
             experiment_name = Path(f).parent.name
             output_path = f.replace('raw.mrd2', experiment_name + '_recon.mrd2')
-            print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {output_path}', file=sys.stderr)
-            try:
-                reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
-            except:
-                continue
+            print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {output_path}', file=sys.stderr, flush=True)
+            reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
 
