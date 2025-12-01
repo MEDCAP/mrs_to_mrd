@@ -2,3 +2,4 @@
 	path = mrd-fork
 	url = https://github.com/MEDCAP/mrd-fork.git
 	update = checkout
+	branch=dev
