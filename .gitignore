@@ -18,4 +18,8 @@ __pycache__/
 *.csv
 
 # ignore test output files
+<<<<<<< HEAD
 stream-test/
+=======
+stream-test/
+>>>>>>> add_pulseq

@@ -1,5 +1,7 @@
 import sys
 import numpy as np
+import matplotlib
+
 import matplotlib.pyplot as plt
 import os
 from pathlib import Path
@@ -12,10 +14,7 @@ import mrd
 # from watchdog.observers import Observer
 # from watchdog.events import FileSystemEventHandler
 from scipy.ndimage import zoom
-<<<<<<< Updated upstream
-=======
 savekfitdata = True
->>>>>>> Stashed changes
 
 def plot_mrd(input: BinaryIO, filename: str):
     current_header = []

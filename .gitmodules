@@ -1,5 +1,4 @@
 [submodule "mrd-fork"]
 	path = mrd-fork
 	url = https://github.com/MEDCAP/mrd-fork.git
-	sparsecheckout = true
-	branch = dev
+	update = checkout

@@ -12,7 +12,7 @@ import argparse
 import re
 
 # path to mrd python package is 'root/mrd-fork/python' 
-sys.path.append(os.path.join(Path(__file__).parent, 'mrd-fork','python'))
+sys.path.insert(0, 'mrd-fork/python')
 import mrd
 from MRSreader import MRSdata
 from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
@@ -20,9 +20,10 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 
 debugphasing = False
 debuglorn = False
-saveSpectralLocal = False
+savePhasedEPSILocal = False
 saveLornFitLocal = False
 saveMetaboliteLocal = False
+kfitdata_local = False
 
 basedir = '.'
 fidpad = 1
@@ -50,7 +51,6 @@ def generate_aux_images(imglist):
 def get_clarg(clarg, arg, ty):
     clargarr = clarg.split(' ')
     for iarg in range(len(clargarr) - 1):
-        # print(iarg, clargarr[iarg])
         if(clargarr[iarg] == arg): 
             return(ty(clargarr[iarg + 1]))
 
@@ -72,7 +72,7 @@ def kABfiteval(x):
     # x[.01, .03, 1] for initial guess
     yp = np.zeros(len(y), dtype=np.float64)
     yp[0] = x[2]
-    # numerically integrate, x[0] is kAB, k[1] is 1/T1, x[2] is the amount of B at the beginning of acquisition
+    # numerically integrate, x[0] is kAB, x[1] is 1/T1, x[2] is the amount of B at the beginning of acquisition
     for j in range(1, len(t)):
         dt = t[j] - t[j-1]
         Pbar = (P[j-1] + P[j]) / 2
@@ -82,11 +82,6 @@ def kABfiteval(x):
 def kABfit(x):
     # x1 = minimize(kABfit, [.01, .03, 1]).x
     yp = kABfiteval(x)
-    # print('x=', x, 'sum((yp-y)^2)=', np.sum((yp - y)**2))
-    try:
-        np.sum((yp - y)**2)
-    except RuntimeWarning:
-        print('yp-y', yp - y)
     return(np.sum((yp - y)**2))
 
 def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.ndarray, peaknames: list):
@@ -123,7 +118,6 @@ def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.
         imghead.set = 0      # or this
         imghead.acquisition_time_stamp_ns = ide * time_between_images * 1000000000
         imghead.physiology_time_stamp_ns = []
-        imghead.image_type = mrd.ImageType.SPIN_DENSITY_MAP
         imghead.image_index = ide
         imghead.image_series_index = ide
         imghead.user_int = []
@@ -158,7 +152,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0] * \
                     np.exp(-tk * lb)
             ia += 1
-    print('doing fft', file=sys.stderr)
+    print(f'Performing fft', file=sys.stderr)
     img = np.fft.fftshift(np.fft.fftn(kspace, axes = (1, 2, 3)), axes = (1, 2, 3))
     # print('finding biggest voxel')
     currmax = 0
@@ -205,15 +199,19 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     plt.pause(.1)
                 if(ide > 1):
                     globalspect += img[ide, j, k, :]
-    if saveSpectralLocal:
+    if savePhasedEPSILocal:
         epsi_images_dir = "C:/Users/kento/dev/rawdata/mrsolutions/test_shur/epsi_images"
     else:
-        epsi_images_dir = "C:/Users/MRS/Desktop/shurik/epsi_images"
+        epsi_images_dir = "C:/Users/MRS/Desktop/shurik/phased_epsi_npyfiles"
     if os.path.exists(epsi_images_dir):
-        print(f"Saving epsi images npy files at: {epsi_images_dir}", )
-        np.save(os.path.join(epsi_images_dir, experiment_name, '_epsi.npy'), img)
+        try:
+            epsi_images_path = os.path.join(epsi_images_dir, f'{experiment_name}_epsi.npy')
+            np.save(epsi_images_path, img)
+            print(f"Saving epsi images npy files at: {epsi_images_path}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error saving epsi images npy files: {e}", file=sys.stderr)
     else:
-        raise FileNotFoundError(f"Directory {epsi_images_dir} does not exist.")
+        raise FileNotFoundError(f"Directory {epsi_images_path} does not exist.")
     BW = 1 / sampletime / totalppswitch
     xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
     globalspect /= np.max(np.abs(globalspect))
@@ -274,9 +272,12 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     else:
         lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
     if os.path.exists(lorn_fit_dir):
-        png_filepath = os.path.join(lorn_fit_dir, experiment_name + '_lorn_fit.png')
-        print("Save fitting plot at filepath", png_filepath)
-        plt.savefig(png_filepath)
+        lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
+        try:
+            plt.savefig(lorn_fit_path)
+            print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
+        except Exception as e:
+            print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
     else:
         raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
 
@@ -354,6 +355,7 @@ def spectra_recon(h: mrd.Header,
                   peaknames: list, 
                   wigglefactor: float):
     global P, y, t
+    global experiment_name
 
     auximages = []
     numspectra = len(raw_acquisition_list)
@@ -463,12 +465,11 @@ def spectra_recon(h: mrd.Header,
     legend = []
     plt.clf()
     colors=['r', 'b', 'g', 'c', 'k', 'r', 'b']
-    auc_data = {}
+    kAB_auc_data = {}
     for ip in range(len(peakoffsets)):
         P = peakamplitudes[sourcepeak, :]   # peak amp of injected sample
         t = np.array(measurementtimes_ns) * 1.0E-9
         y = peakamplitudes[ip, :]           # peak amp of each metabolite
-        auc_data[peaknames[ip]] = auc[ip]
         if(ip in metabolitelist):
             # x[0]=kAB, x[1]=1/T1, x[2]=initial amount of metabolite
             if peaknames[ip] == 'lac' or peaknames[ip] == 'ala':
@@ -476,30 +477,53 @@ def spectra_recon(h: mrd.Header,
             else:
                 bounds = [(None, None), (1/100, 1), (None, None)]
             x1 = minimize(kABfit, [.01, .03, 1], bounds=bounds).x
-            # x1 = minimize(kABfit, [.01, .03, 1]).x
-            # sample plot
+            kAB_auc_data[peaknames[ip]] = {'kAB': x1[0],
+                                           '1/T1': 1/x1[1],
+                                           'AUC': auc[ip]}
+            # save values as text file
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
-                    label = peaknames[ip]+'/{:.5f}'.format(x1[0])+'/{:.2f}'.format(1/x1[1]) + \
-                    '/{:.2f}'.format(auc[ip]))
+                    label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/T1inverse={:.2f}'.format(1/x1[1]) + \
+                    '/AUC={:.2f}'.format(auc[ip]))
             # fitted line
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
         else:
+            kAB_auc_data[peaknames[ip]] = {'AUC': auc[ip]}
             if(ip == sourcepeak):
                 plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'-', label=peaknames[ip] + \
-                    '/{:.2f}'.format(auc[ip]))
+                    '/AUC={:.2f}'.format(auc[ip]))
             else:
                 plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'--', label=peaknames[ip] + \
-                    '/{:.2f}'.format(auc[ip]))
+                    '/AUC={:.2f}'.format(auc[ip]))
     plt.legend(title='')
     plt.xlabel('time (s)')
     plt.yticks([])
     append_auximage(auximages, echo_number=a.head.idx.contrast)
-    # import csv
-    # with open('aux.csv', 'w', newline='') as f:
-    #     writer = csv.DictWriter(f, fieldnames=auc_data.keys())
-    #     writer.writeheader()
-    #     writer.writerow(auc_data)
-
+    if kfitdata_local:
+        kfitdata_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/mrs_to_mrd/kfitdata'
+        print('Saving kAB fit data to C:/Users/kento/dev/rawdata/mrsolutions/mrs_to_mrd/kfitdata')
+    else:
+        kfitdata_dir = 'C:/Users/MRS/Desktop/mrs_to_mrd/kfitdata'
+    
+    if os.path.exists(kfitdata_dir):
+        import csv
+        try:
+            csv_filepath = os.path.join(kfitdata_dir, f'{experiment_name}_kAB.csv')
+            with open(csv_filepath, 'w', newline='') as f:
+                writer = csv.writer(f)
+                headers = [experiment_name]
+                for metabolite_name in kAB_auc_data.keys():
+                    headers.append(f'kAB_{metabolite_name}')
+                    headers.append(f'1/T1_{metabolite_name}')
+                    headers.append(f'AUC_{metabolite_name}')
+                writer.writerow(headers)
+                for metabolite_name, values in kAB_auc_data.items():
+                    if 'kAB' in values:
+                        writer.writerow([experiment_name, values['kAB'], values['1/T1'], values['AUC']])
+                    elif 'kAB' not in values and 'AUC' in values:
+                        writer.writerow([experiment_name, np.nan, np.nan, values['AUC']])
+                print(f"Saved kAB fit data at {csv_filepath}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error saving kAB fit data: {e}", file=sys.stderr)
     return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
             peakamplitudes, auximages)
 
@@ -544,8 +568,12 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             else:
                 npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
             if os.path.exists(npy_dir):
-                npy_filepath = os.path.join(npy_dir, experiment_name + '_metabolites.npy')
-                np.save(npy_filepath, metabolites)
+                try:
+                    npy_filepath = os.path.join(npy_dir, f'{experiment_name}_metabolites.npy')
+                    np.save(npy_filepath, metabolites)
+                    print(f"Saving metabolites npy file at {npy_filepath}")
+                except Exception as e:
+                    print(f"Error saving metabolites npy file: {e}", file=sys.stderr)
             else:
                 raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
@@ -574,10 +602,6 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
 
 
 if __name__ == "__main__":
-    # Save original stdout buffer before redirecting print statements to stderr
-    # original_stdout_buffer = sys.stdout.buffer
-    # sys.stdout = sys.stderr
-    
     # read command line arguments
     wigglefactor = 1.0
     peakoffsets = []
@@ -622,12 +646,10 @@ if __name__ == "__main__":
     if basedir != '.':
         fnames = findmrd2files(basedir, targetfiletype)
         for i, f in enumerate(fnames):
-            output_path = f.replace('raw.mrd2', Path(f).parent.name + '_recon.mrd2')
-            print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {output_path}', file=sys.stderr)
-            try:
-                reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
-            except:
-                continue
+            experiment_name = Path(f).parent.name
+            output_path = f.replace('raw.mrd2', experiment_name + '_recon.mrd2')
+            print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {output_path}', file=sys.stderr, flush=True)
+            reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
 

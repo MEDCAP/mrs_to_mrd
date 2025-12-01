@@ -8,6 +8,9 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
         lorngetpeakparams, lornputpeakparams
 import sys
 
+sys.path.insert(0, 'mrd-fork/python')
+import mrd
+
 debugphasing = False
 debuglorn = True
 
