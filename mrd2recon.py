@@ -12,18 +12,28 @@ import argparse
 import re
 
 # path to mrd python package is 'root/mrd-fork/python' 
-sys.path.insert(0, 'mrd-fork/python')
 import mrd
 from MRSreader import MRSdata
 from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
         lorngetpeakparams, lornputpeakparams
 
-debugphasing = False
-debuglorn = False
-savePhasedEPSILocal = False
-saveLornFitLocal = False
-saveMetaboliteLocal = False
-kfitdata_local = False
+LOCAL_TEST = True
+if LOCAL_TEST:
+    debugphasing = False
+    debuglorn = False
+    savePhasedEPSILocal = True
+    saveLornFitLocal = True
+    saveMetaboliteLocal = True
+    kfitdata_local = True
+    DATA_DIR = '~/kento/dev/data'
+else:
+    debugphasing = False
+    debuglorn = False
+    savePhasedEPSILocal = False
+    saveLornFitLocal = False
+    saveMetaboliteLocal = False
+    kfitdata_local = False
+    DATA_DIR = 'C:/Users/MRS/Desktop'
 
 basedir = '.'
 fidpad = 1
@@ -44,7 +54,7 @@ def findmrd2files(basedir, targetfiletype):
 
 def generate_aux_images(imglist):
     for iimg in range(len(imglist)):
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.BITMAP)
+        imghead = mrd.ImageHeader(image_type=mrd.ImageType.RGBA)
         img = mrd.Image(head=imghead, data=np.expand_dims(imglist[iimg], (2, 3, 4)))
         yield(mrd.StreamItem.ImageUint32(img))
 
@@ -102,8 +112,8 @@ def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.
         elif(ide == nimg - 1):
             imghead.flags = mrd.ImageFlags.LAST_IN_SET
         imghead.measurement_uid = ide
-        imghead.measurement_freq = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
-        imghead.measurement_freq_label = np.array(peaknames, dtype=np.dtype(np.object_))
+        imghead.measurement_frequency = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
+        imghead.measurement_frequency_label = np.array(peaknames, dtype=np.dtype(np.object_))
         imghead.field_of_view = fov
         imghead.position = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
         imghead.col_dir = np.zeros((3,), dtype=np.dtype(np.float32))
@@ -123,8 +133,7 @@ def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.
         imghead.user_int = []
         imghead.user_float = []
         # rotate counterclock-wise 90deg and flip leftright
-        # metabolite shape = (freq, meas, rows, cols)
-        # mrd2 image shape = (channels, slices, rows, cols, freqs)
+        # metabolite shape(freq, meas, rows, cols) -> mrd2 image shape(channels, slices, rows, cols, freqs)
         imgdata = np.expand_dims(np.moveaxis(metabolite[:, ide, :, :], 0, 2), (0, 1))
         img = mrd.Image(head=imghead, data=imgdata)
         yield(mrd.StreamItem.ImageDouble(img))
@@ -200,9 +209,9 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                 if(ide > 1):
                     globalspect += img[ide, j, k, :]
     if savePhasedEPSILocal:
-        epsi_images_dir = "C:/Users/kento/dev/rawdata/mrsolutions/test_shur/epsi_images"
+        epsi_images_dir = os.path.join(DATA_DIR, 'epsi_kidney_data', 'phased_npyfiles')
     else:
-        epsi_images_dir = "C:/Users/MRS/Desktop/shurik/phased_epsi_npyfiles"
+        epsi_images_dir = os.path.join(DATA_DIR, 'shurik', 'phased_epsi_npyfiles')
     if os.path.exists(epsi_images_dir):
         try:
             epsi_images_path = os.path.join(epsi_images_dir, f'{experiment_name}_epsi.npy')
@@ -263,14 +272,29 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     plt.plot(xscale, np.imag(globalspect), 'g')
     plt.plot(xscale, np.real(specteval), 'k')
     plt.plot(xscale, np.imag(specteval), 'k')
+
+    #### save as lorn fit as NDArray
+    # global spectral as 1d generay complex double array stream
+    global_spect_arr_header = mrd.NDArrayHeader(dimension_labels=[mrd.ArrayDimension.Frequency],
+                                                array_type=mrd.ArrayType.USER_MAP,
+                                                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("global spect")],
+                                                                    "xscale": [mrd.ArrayMetaValue.Double(xscale)]}))
+    yield mrd.StreamItem.NDArrayComplexDouble(mrd.NDArray(head=global_spect_arr_header, data=globalspect))
+    # lorn fit array as 1d general complex double array stream
+    lorn_fit_arr_header = mrd.NDArrayHeader(dimension_labels=[mrd.ArrayDimension.Frequency],
+                                            array_type=mrd.ArrayType.USER_MAP,
+                                            meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("lorn fit")],
+                                                                "xscale": [mrd.ArrayMetaValue.Double(xscale)]}))
+    yield mrd.StreamItem.NDArrayComplexDouble(mrd.NDArray(head=lorn_fit_arr_header, data=specteval))
+
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
     if saveLornFitLocal:
         # save current figure as a PNG file
-        lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
+        lorn_fit_dir = os.path.join(DATA_DIR, 'epsi_kidney_data', 'lorn_fit')
     else:
-        lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
+        lorn_fit_dir = os.path.join(DATA_DIR, 'shurik', 'lorn_fit')
     if os.path.exists(lorn_fit_dir):
         lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
         try:
@@ -499,10 +523,11 @@ def spectra_recon(h: mrd.Header,
     plt.yticks([])
     append_auximage(auximages, echo_number=a.head.idx.contrast)
     if kfitdata_local:
-        kfitdata_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/mrs_to_mrd/kfitdata'
-        print('Saving kAB fit data to C:/Users/kento/dev/rawdata/mrsolutions/mrs_to_mrd/kfitdata')
+        kfitdata_dir = os.path.join(DATA_DIR, 'epsi_kidney_data', 'kfitdata')
+        print(f'Saving kAB fit data to {kfitdata_dir}')
     else:
-        kfitdata_dir = 'C:/Users/MRS/Desktop/mrs_to_mrd/kfitdata'
+        kfitdata_dir = os.path.join(DATA_DIR, 'shurik', 'kfitdata')
+        print(f'Saving kAB fit data to {kfitdata_dir}')
     
     if os.path.exists(kfitdata_dir):
         import csv
@@ -564,9 +589,9 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
             if saveMetaboliteLocal:
-                npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
+                npy_dir = os.path.join(DATA_DIR, 'epsi_kidney_data', 'processed_npyfiles')
             else:
-                npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
+                npy_dir = os.path.join(DATA_DIR, 'shurik', 'processed_npyfiles')
             if os.path.exists(npy_dir):
                 try:
                     npy_filepath = os.path.join(npy_dir, f'{experiment_name}_metabolites.npy')
