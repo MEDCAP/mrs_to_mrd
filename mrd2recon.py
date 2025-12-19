@@ -212,7 +212,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         except Exception as e:
             print(f"Error saving epsi images npy files: {e}", file=sys.stderr)
     else:
-        raise FileNotFoundError(f"Directory {epsi_images_path} does not exist.")
+        raise FileNotFoundError(f"Directory {epsi_images_dir} does not exist.")
     BW = 1 / sampletime / totalppswitch
     xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
     globalspect /= np.max(np.abs(globalspect))
