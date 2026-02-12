@@ -25,7 +25,7 @@ if LOCAL_TEST:
     saveLornFitLocal = True
     saveMetaboliteLocal = True
     kfitdata_local = True
-    DATA_DIR = '~/kento/dev/data'
+    DATA_DIR = os.path.expanduser('~/dev/data')
 else:
     debugphasing = False
     debuglorn = False
@@ -94,7 +94,10 @@ def kABfit(x):
     yp = kABfiteval(x)
     return(np.sum((yp - y)**2))
 
-def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.ndarray, peaknames: list):
+def generate_epsi_images(h: mrd.Header,
+                        metabolite: np.ndarray,
+                        peakoffsets: np.ndarray,
+                        peaknames: list):
     # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
     time_between_images = 3   # approximately 3s between images
     nmet = metabolite.shape[0]
@@ -178,7 +181,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     noise = np.mean(np.abs(img[-1, :, :, :]))
     # print('noise =', noise)
     maxspect = img[maxide,maxj,maxk,:].copy()
-    globalspect = np.zeros((a.head.idx.contrast * fidpad), dtype = 'complex')
+    globalspect = np.zeros((a.head.idx.contrast * fidpad), dtype=np.complex64)
     for ide in range(numimages):
         # go through all the voxels and minimize the phase difference
         for j in range(npe):
@@ -220,7 +223,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         except Exception as e:
             print(f"Error saving epsi images npy files: {e}", file=sys.stderr)
     else:
-        raise FileNotFoundError(f"Directory {epsi_images_path} does not exist.")
+        raise FileNotFoundError(f"Directory {epsi_images_dir} does not exist.")
     BW = 1 / sampletime / totalppswitch
     xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
     globalspect /= np.max(np.abs(globalspect))
@@ -274,18 +277,24 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     plt.plot(xscale, np.imag(specteval), 'k')
 
     #### save as lorn fit as NDArray
-    # global spectral as 1d generay complex double array stream
-    global_spect_arr_header = mrd.NDArrayHeader(dimension_labels=[mrd.ArrayDimension.Frequency],
+    # global spectral as 1d generay complex64 array stream
+    ndarray_list = []
+    global_spect_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY],
                                                 array_type=mrd.ArrayType.USER_MAP,
-                                                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("global spect")],
-                                                                    "xscale": [mrd.ArrayMetaValue.Double(xscale)]}))
-    yield mrd.StreamItem.NDArrayComplexDouble(mrd.NDArray(head=global_spect_arr_header, data=globalspect))
+                                                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("global_spect")],
+                                                                    "xscale": [mrd.ArrayMetaValue.Float64(xscale[i]) for i in range(len(xscale))],  # xscale as list of single entries
+                                                                    "BW": [mrd.ArrayMetaValue.Float64(BW)],
+                                                                    "centerfreq": [mrd.ArrayMetaValue.Float64(centerfreq)]}))
+    ndarray_list.append(mrd.NdArray[np.complex64](head=global_spect_arr_header, data=globalspect))
     # lorn fit array as 1d general complex double array stream
-    lorn_fit_arr_header = mrd.NDArrayHeader(dimension_labels=[mrd.ArrayDimension.Frequency],
+    lorn_fit_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY],
                                             array_type=mrd.ArrayType.USER_MAP,
-                                            meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("lorn fit")],
-                                                                "xscale": [mrd.ArrayMetaValue.Double(xscale)]}))
-    yield mrd.StreamItem.NDArrayComplexDouble(mrd.NDArray(head=lorn_fit_arr_header, data=specteval))
+                                            meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("lorn_fit")],
+                                                                "xscale": [mrd.ArrayMetaValue.Float64(xscale[i]) for i in range(len(xscale))],  # xscale as list of single entries
+                                                                "BW": [mrd.ArrayMetaValue.Float64(BW)],
+                                                                "centerfreq": [mrd.ArrayMetaValue.Float64(centerfreq)],
+                                                                "centers": [mrd.ArrayMetaValue.Float64(centers)]}))
+    ndarray_list.append(mrd.NdArray[np.complex64](head=lorn_fit_arr_header, data=specteval))
 
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
@@ -305,11 +314,11 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     else:
         raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
 
+    # aux image to save plot figure as rgba image while using nd array to send the raw array
     append_auximage(auximages, echo_number=a.head.idx.contrast)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
     metabolites = np.zeros((npeaks, numimages, npe, nro))
-    # shorten the list for quick debugging
     for ide in range(numimages):
         # print('voxel fit img', ide, flush=True)
         for j in range(npe):
@@ -329,7 +338,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                 metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
     # rotate by 90deg
     metabolites = np.rot90(metabolites, k=1, axes=(2,3))
-    return([metabolites, auximages])
+    return([metabolites, auximages, ndarray_list])
 
 def generate_spectra(h: mrd.Header,
                      measurementtimes_ns: float,
@@ -389,7 +398,7 @@ def spectra_recon(h: mrd.Header,
     sampletime = a.head.sample_time_ns / 1.0E+9
     npts = len(a.data)
     # kspace shape=(spectra, measurements)
-    kspace = np.zeros((numspectra, len(a.data)), dtype = 'complex')
+    kspace = np.zeros((numspectra, len(a.data)), dtype=np.complex64)
     ia = 0
     for ispect in range(kspace.shape[0]):
         kspace[ispect, :] = raw_acquisition_list[ispect].data[:, 0]
@@ -414,7 +423,7 @@ def spectra_recon(h: mrd.Header,
     newBW = BW * (hipt - lowpt) / npts
     spectra = spectra[:, lowpt:hipt]
     # global spectrum across +-25ppm of highest peak
-    globalspect = np.zeros(hipt - lowpt, dtype = 'complex')
+    globalspect = np.zeros(hipt - lowpt, dtype=np.complex64)
     xscale = np.array(range(len(globalspect))) / len(globalspect) * newBW / centerfreq * 1E+6
     for ispect in range(numspectra):
         if(np.max(np.abs(spectra[ispect, :])) > noise * 5):
@@ -463,6 +472,23 @@ def spectra_recon(h: mrd.Header,
     for ip in range(0, len(peakoffsets)):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
+
+    # stream global spect as ndarray with xscale, bw, and globalspect array
+    ndarray_list = []
+    global_spect_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY],
+                                                array_type=mrd.ArrayType.USER_MAP,
+                                                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("global spect")],
+                                                                    "xscale": [mrd.ArrayMetaValue.Float64(xscale[i]) for i in range(len(xscale))],  # xscale as list of single entries
+                                                                    "BW": [mrd.ArrayMetaValue.Float64(newBW)]}))
+    ndarray_list.append(mrd.NdArray[np.complex64](head=global_spect_arr_header, data=globalspect))
+    # stream lorn fit as ndarray with xscale, bw, and specteval array
+    lorn_fit_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY],
+                                            array_type=mrd.ArrayType.USER_MAP,
+                                            meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("lorn fit")],
+                                                                "xscale": [mrd.ArrayMetaValue.Float64(xscale[i]) for i in range(len(xscale))],  # xscale as list of single entries
+                                                                "BW": [mrd.ArrayMetaValue.Float64(newBW)]}))
+    ndarray_list.append(mrd.NdArray[np.complex64](head=lorn_fit_arr_header, data=specteval))
+    # aux image to add plot figure as auximages list 
     append_auximage(auximages, echo_number=a.head.idx.contrast)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
@@ -490,10 +516,14 @@ def spectra_recon(h: mrd.Header,
     plt.clf()
     colors=['r', 'b', 'g', 'c', 'k', 'r', 'b']
     kAB_auc_data = {}
+    kAB_list = []
+    auc_list = []
+    t1_list = []
     for ip in range(len(peakoffsets)):
         P = peakamplitudes[sourcepeak, :]   # peak amp of injected sample
         t = np.array(measurementtimes_ns) * 1.0E-9
         y = peakamplitudes[ip, :]           # peak amp of each metabolite
+
         if(ip in metabolitelist):
             # x[0]=kAB, x[1]=1/T1, x[2]=initial amount of metabolite
             if peaknames[ip] == 'lac' or peaknames[ip] == 'ala':
@@ -504,14 +534,23 @@ def spectra_recon(h: mrd.Header,
             kAB_auc_data[peaknames[ip]] = {'kAB': x1[0],
                                            '1/T1': 1/x1[1],
                                            'AUC': auc[ip]}
+            # append parameters as ndarray metavalue header 
+            kAB_list.append(x1[0])
+            t1_list.append(1/x1[1])
+            auc_list.append(auc[ip])
             # save values as text file
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
                     label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/T1inverse={:.2f}'.format(1/x1[1]) + \
                     '/AUC={:.2f}'.format(auc[ip]))
             # fitted line
             plt.plot(np.array(measurementtimes_ns) * 1.0E-9, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
+            
         else:
             kAB_auc_data[peaknames[ip]] = {'AUC': auc[ip]}
+            # append parameters as ndarray metavalue header 
+            kAB_list.append(np.nan)
+            t1_list.append(np.nan)
+            auc_list.append(auc[ip])
             if(ip == sourcepeak):
                 plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'-', label=peaknames[ip] + \
                     '/AUC={:.2f}'.format(auc[ip]))
@@ -521,13 +560,33 @@ def spectra_recon(h: mrd.Header,
     plt.legend(title='')
     plt.xlabel('time (s)')
     plt.yticks([])
+    # save kAB plot figure as rgba image while using nd array to send the raw array
     append_auximage(auximages, echo_number=a.head.idx.contrast)
+
+    # stream sample points of time-course spectral
+    sample_points_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY, mrd.ArrayDimension.TIME],
+                                                array_type=mrd.ArrayType.USER_MAP,
+                                                meta=mrd.ArrayMeta({
+                                                    "description": [mrd.ArrayMetaValue.String("sample points of time-course spectral")],
+                                                    "time_axis": [mrd.ArrayMetaValue.Float64(t[i]) for i in range(len(t))],  # time_axis as list of single entries
+                                                    "peaknames": [mrd.ArrayMetaValue.String(peaknames[i]) for i in range(len(peaknames))]
+                                                }))
+    ndarray_list.append(mrd.NdArray[np.float64](head=sample_points_arr_header, data=y))
+    # stream fitted line with kAB, T1, and AUC parameters
+    kAB_fit_data_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY, mrd.ArrayDimension.TIME],
+                                                array_type=mrd.ArrayType.USER_MAP,
+                                                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("fitted line with kAB, T1, and AUC parameters")],
+                                                                    "kAB": [mrd.ArrayMetaValue.Float64(kAB_list[i]) for i in range(len(kAB_list))],  # kAB as list of single entries
+                                                                    "1/T1": [mrd.ArrayMetaValue.Float64(t1_list[i]) for i in range(len(t1_list))],  # 1/T1 as list of single entries
+                                                                    "AUC": [mrd.ArrayMetaValue.Float64(auc_list[i]) for i in range(len(auc_list))],  # AUC as list of single entries
+                                                                }))
+    ndarray_list.append(mrd.NdArray[np.float64](head=kAB_fit_data_arr_header, data=kABfiteval(x1)))
+
+    # save parameters as csv file
     if kfitdata_local:
-        kfitdata_dir = os.path.join(DATA_DIR, 'epsi_kidney_data', 'kfitdata')
-        print(f'Saving kAB fit data to {kfitdata_dir}')
+        kfitdata_dir = os.path.join(DATA_DIR, 'kfitdata')
     else:
-        kfitdata_dir = os.path.join(DATA_DIR, 'shurik', 'kfitdata')
-        print(f'Saving kAB fit data to {kfitdata_dir}')
+        kfitdata_dir = os.path.join(DATA_DIR, 'kfitdata')
     
     if os.path.exists(kfitdata_dir):
         import csv
@@ -550,7 +609,7 @@ def spectra_recon(h: mrd.Header,
         except Exception as e:
             print(f"Error saving kAB fit data: {e}", file=sys.stderr)
     return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
-            peakamplitudes, auximages)
+            peakamplitudes, auximages, ndarray_list)
 
 # Take single file as input and reconstruct output
 def reconstruct_mrs(input: Union[str, BinaryIO],
@@ -562,69 +621,98 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
                     peaknames: list,
                     wigglefactor: float):
     global experiment_name
+    # convert mrd objects from list to mrd stream
     def generate_stream(input: list):
         for item in input:
-            if isinstance(item, mrd.Pulse):
-                yield mrd.StreamItem.Pulse(item)
-            if isinstance(item, mrd.Gradient):
-                yield mrd.StreamItem.Gradient(item)
             if isinstance(item, mrd.Acquisition):
                 yield mrd.StreamItem.Acquisition(item)
+            elif isinstance(item, mrd.PulseqDefinitions):
+                yield mrd.StreamItem.PulseqDefinitions(item)
+            elif isinstance(item, mrd.Block):
+                yield mrd.StreamItem.Blocks(item)
+            elif isinstance(item, mrd.RFEvent):
+                yield mrd.StreamItem.Rf(item)
+            elif isinstance(item, mrd.ArbitraryGradient):
+                yield mrd.StreamItem.ArbitraryGradient(item)
+            elif isinstance(item, mrd.TrapezoidalGradient):
+                yield mrd.StreamItem.TrapezoidalGradient(item)
+            elif isinstance(item, mrd.ADCEvent):
+                yield mrd.StreamItem.Adc(item)
+            elif isinstance(item, mrd.Shape):
+                yield mrd.StreamItem.Shape(item)
+            elif isinstance(item, mrd.NdArray):
+                if item.data.dtype == np.float32:
+                    yield mrd.StreamItem.NdArrayFloat(item)
+                elif item.data.dtype == np.complex64:  # complexfloat32 is np.complex64 
+                    print(f"Streaming NdArrayComplexFloat with shape {item.data.shape, item.data.dtype}")
+                    yield mrd.StreamItem.NdArrayComplexFloat(item)
+            else:
+                pass
+
+    # read header, acquisition, pulseq field from MRS->mrd2 converted file
     with mrd.BinaryMrdReader(input) as reader:
-        raw_header = reader.read_header()
-        raw_streamables_list = list(reader.read_data())
-        raw_pulse_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Pulse]
-        raw_pulse_list.sort(key = lambda x: x.head.pulse_time_stamp_ns)
-        raw_gradient_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Gradient]
-        raw_gradient_list.sort(key = lambda x: x.head.gradient_time_stamp_ns)
-        raw_acquisition_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Acquisition]
-        raw_acquisition_list.sort(key = lambda x: x.head.acquisition_time_stamp_ns)
-        img_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Image]
+        with mrd.BinaryMrdWriter(output) as writer:
+            # write the same header from input mrd file
+            raw_header = reader.read_header()
+            writer.write_header(raw_header)
+            # read stream data as list which takes up memory as it converts all objects into list
+            raw_streamables_list = list(reader.read_data())
+            raw_acquisition_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Acquisition]
+            raw_acquisition_list.sort(key = lambda x: x.head.acquisition_time_stamp_ns)
+            raw_pulseq_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.PulseqDefinitions]
+            raw_blocks_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Block]
+            raw_rf_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.RFEvent]
+            raw_arbitrary_gradient_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.ArbitraryGradient]
+            raw_trapezoidal_gradient_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.TrapezoidalGradient]
+            raw_adc_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.ADCEvent]
+            raw_shape_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Shape]
 
-    with mrd.BinaryMrdWriter(output) as writer:
-        # write the same header from input mrd file
-        writer.write_header(raw_header)
-        if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
-            experiment_name = str(Path(input).parents[0].name)
-            [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
-            # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-            if saveMetaboliteLocal:
-                npy_dir = os.path.join(DATA_DIR, 'epsi_kidney_data', 'processed_npyfiles')
-            else:
-                npy_dir = os.path.join(DATA_DIR, 'shurik', 'processed_npyfiles')
-            if os.path.exists(npy_dir):
-                try:
-                    npy_filepath = os.path.join(npy_dir, f'{experiment_name}_metabolites.npy')
-                    np.save(npy_filepath, metabolites)
-                    print(f"Saving metabolites npy file at {npy_filepath}")
-                except Exception as e:
-                    print(f"Error saving metabolites npy file: {e}", file=sys.stderr)
-            else:
-                raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
-            writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
-            # read_data can be called only once to get Stream +Item
-            # write_data can be rewritten by converting list of mrd objects to StreamItem
-            writer.write_data(generate_stream(raw_pulse_list))
-            writer.write_data(generate_stream(raw_gradient_list))
+            # write_data can be called multiple times whereas read-data is once
             writer.write_data(generate_stream(raw_acquisition_list))
-        elif(raw_header.measurement_information.sequence_name.find('1pul') > -1):
-            [measurementtimes_ns, spectra, peakfrequencies, peakamplitudes, auximages] = spectra_recon(
-                h=raw_header,
-                raw_acquisition_list=raw_acquisition_list,
-                sourcepeak=sourcepeak,
-                metabolitelist=metabolitelist,
-                biggestpeakidx=biggestpeakidx,
-                peakoffsets=peakoffsets,
-                peaknames=peaknames,
-                wigglefactor=wigglefactor)
-            writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakamplitudes, peakoffsets, spectra))
-            # fill in pulse, gradient, acq data
-            writer.write_data(generate_stream(raw_pulse_list))
-            writer.write_data(generate_stream(raw_gradient_list))
-            writer.write_data(generate_stream(raw_acquisition_list))
-        if(len(auximages) > 0):
-            writer.write_data(generate_aux_images(auximages))
+            writer.write_data(generate_stream(raw_pulseq_list))
+            writer.write_data(generate_stream(raw_blocks_list))
+            writer.write_data(generate_stream(raw_rf_list))
+            writer.write_data(generate_stream(raw_arbitrary_gradient_list))
+            writer.write_data(generate_stream(raw_trapezoidal_gradient_list))
+            writer.write_data(generate_stream(raw_adc_list))
+            writer.write_data(generate_stream(raw_shape_list))
 
+            #############
+            # update later to iterate over StreamItem not converted into list
+            if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
+                experiment_name = str(Path(input).parents[0].name)
+                [metabolites, auximages, ndarray_list] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
+                # epsi ndarray=lorn fit with original sample
+                writer.write_data(generate_stream(ndarray_list))
+                # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
+                if saveMetaboliteLocal:
+                    npy_dir = os.path.join(DATA_DIR, 'epsi_kidney_data', 'processed_npyfiles')
+                else:
+                    npy_dir = os.path.join(DATA_DIR, 'shurik', 'processed_npyfiles')
+                if os.path.exists(npy_dir):
+                    try:
+                        npy_filepath = os.path.join(npy_dir, f'{experiment_name}_metabolites.npy')
+                        np.save(npy_filepath, metabolites)
+                        print(f"Saving metabolites npy file at {npy_filepath}")
+                    except Exception as e:
+                        print(f"Error saving metabolites npy file: {e}", file=sys.stderr)
+                else:
+                    raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
+                writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
+            elif(raw_header.measurement_information.sequence_name.find('1pul') > -1):
+                [measurementtimes_ns, spectra, peakfrequencies, peakamplitudes, auximages, ndarray_list] = spectra_recon(
+                    h=raw_header,
+                    raw_acquisition_list=raw_acquisition_list,
+                    sourcepeak=sourcepeak,
+                    metabolitelist=metabolitelist,
+                    biggestpeakidx=biggestpeakidx,
+                    peakoffsets=peakoffsets,
+                    peaknames=peaknames,
+                    wigglefactor=wigglefactor)
+                writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakamplitudes, peakoffsets, spectra))
+                writer.write_data(generate_stream(ndarray_list))
+            if(len(auximages) > 0):
+                writer.write_data(generate_aux_images(auximages))
 
 if __name__ == "__main__":
     # read command line arguments

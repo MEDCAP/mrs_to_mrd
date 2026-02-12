@@ -59,6 +59,7 @@ def lornputspect(x, g, w, wf, debug):
     global xscale
     global BW
     global widths
+    global wigglefactor
     if(debug):
         print('putting spect')
     xscale = x

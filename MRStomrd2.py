@@ -1,25 +1,91 @@
 """
-python script to convert MRS folder to MRD files in place
+Convert a list of MRS files to MRD2 format
+EPSI:
+- raw folder can be one experiment folder with multiple scans or one parent folder with multiple experiment folders
+- skip scans with more than one measurement as phantom data
+- upload raw folder to s3 bucket with filtered files by the frontend script based on file names > list of files or list of list of files
+- based on file list count, dynamically create a tyger codespec with n inputs and 1 output
+- codespec python script can have optional length of list as argument input
+- upload buffer outputs to s3 bucket
+- [FRONT] show completion on mrd
+
+Spectral:
+- raw folder can be one experiment folder or parent folder with multiple experiments
+- upload raw folder to s3 bucket
+- use the same codespec yml file for conversion
+
+Dockerfile
+- bash script to take command line arguments
+- Dockerfile is all I need for mrd fork
+- convers
 """
 
-import numpy as np
-import sys
-import os
+from __future__ import annotations
+
 import argparse
-from statistics import mode
+import sys
+from pathlib import Path
+from typing import Iterable, List, Sequence, BinaryIO, Type
+
+import numpy as np
 
 # mrd python package
 # https://github.com/MEDCAP/mrd-fork/tree/dev# is added at root of this repository as a git submodule
-# path to mrd python package is 'root/mrd-fork/python' 
+# path to mrd python package is 'root/mrd-fork/python'
+MRD_PYTHON_PATH = Path(__file__).resolve().parent / "mrd-fork" / "python"
+sys.path.insert(0, str(MRD_PYTHON_PATH))
 import mrd
 from MRSreader import MRSdata
 
-mrs = MRSdata()
+MRSCONVERT_DEBUG = True
 
-def generate_pulseq_acquisition(mrs, ide):
-    '''
-    Define pulseq fields and extract acquisition from MRSdata structure g 
-    '''
+def append_pulseq(mrs: MRSData, pulseq_mrd_file: binaryIO):
+    """
+    Append mrs pulse amplitude and phase shape on mrd dataset as a separate file
+    TODO: Add modification of pulseq file depending on parameters on MRSData
+    @param
+        - mrs: instance of class MRSData that extracts parameters from raw MRS file
+        - amp_file: npy file containing pulse shape in 
+        - phase_file: npy file containing pulse phase in radians
+    @return
+        - 
+    """
+    with mrd.BinaryMrdReader(pulseq_mrd_file) as reader:
+        head = reader.header()  # ignore header
+        for item in reader.read_data():
+            if isinstance(item, mrd.StreamItem.PulseqDefinitions):
+                # add fov from MRSData
+                
+                yield mrd.StreamItem.PulseqDefinitions(item)
+            if isinstance(item, mrd.StreamItem.Blocks): # StreamItem.Blocks is a vector of mrd.Block
+                yield mrd.StreamItem.Blocks(item)   
+            if isinstance(item, mrd.StreamItem.Rf): # StreamItem.Rf is a mrd.RFEvent
+                yield mrd.StreamItem.Rf(item)
+            if isinstance(item, mrd.StreamItem.ArbitraryGradient): # StreamItem.ArbitraryGradient is a mrd.ArbitraryGradient
+                yield mrd.StreamItem.ArbitraryGradient(item)
+            if isinstance(item, mrd.StreamItem.TrapezoidalGradient): # StreamItem.TrapezoidalGradient is a mrd.TrapezoidalGradient
+                yield mrd.StreamItem.TrapezoidalGradient(item)
+            if isinstance(item, mrd.StreamItem.Adc): # StreamItem.Adc is a mrd.ADCEvent
+                yield mrd.StreamItem.Adc(item)
+            if isinstance(item, mrd.StreamItem.Shape):
+                yield mrd.StreamItem.Shape(item)
+
+  
+    definitions = mrd.PulseqDefinitions()  
+    # epsi base pulseq is wip and need to adapt based on slice selection parameters gz
+    if mrs.pplfile.find("epsi") >= 0:
+        definitions.gradient_raster_time_ns = 1e5
+        definitions.radiofrequency_raster_time_ns = mrs.sampleperiod * 100
+        definitions.adc_raster_time_ns = 1e5
+        definitions.block_duration_raster_ns = 1e5
+        definitions.name = "MRS epsi"
+        definitions.fov = mrd.ThreeDimensionalFloat(x=mrs.FOV, y=mrs.FOV, )
+
+
+def generate_pulseq_acquisition(mrs: MRSdata, measurement_index: int) -> Iterable[mrd.StreamItem]:
+    """
+    Define pulseq fields and extract acquisition from MRSdata structure.
+    """
     # define pulseq definitions with pseudo rf pulses
     # all time units are aligned to be in ns
     pulse_length = np.uint64(1.0E+5)   # 100us in ns: guess pulelength to 100us
@@ -74,9 +140,8 @@ def generate_pulseq_acquisition(mrs, ide):
     yield mrd.StreamItem.Rf(rf)
 
     # encode pulse events and acquisition in a time-series for EPSI sequence
-    if(mrs.pplfile.find('epsi') >= 0):
-        import pdb; pdb.set_trace()
-        [npts, nPE] = mrs.rawdata.shape   # number of points per acquisition and phase-encoding
+    if mrs.pplfile.find("epsi") >= 0:
+        nPE = mrs.rawdata.shape[1]  # number of phase encoding
         blocks = []
         for iacq in range(nPE):
             # encode pulse events and acquisition in a time-series for each phase-encoding
@@ -130,7 +195,7 @@ def generate_pulseq_acquisition(mrs, ide):
             yield mrd.StreamItem.Acquisition(acq)
 
     # MRS->mrd conversion for spectral sequence
-    elif(mrs.pplfile.find('1pul') >= 0):
+    elif mrs.pplfile.find("1pul") >= 0:
         nrep = mrs.rawdata.shape[5]  # number of acquisitions per image file (phase-encodes)
         blocks = []
         for iacq in range(nrep):
@@ -177,69 +242,14 @@ def generate_pulseq_acquisition(mrs, ide):
             acq.phase = np.zeros((mrs.rawdata.shape[0]), dtype=np.float32)    # acquisition phase array set to zeros
             yield mrd.StreamItem.Acquisition(acq)
 
-def groupMRDfiles_collect(rootdir):
-    '''
-    Find all .MRD files in this directory and subdirectories. Skip files with more than 1 average as they are phantom data.
-    Args:
-        rootdir: path to the root directory as a string specified by -f command line argument
-    Returns
-        List of paths of .MRD files as strings with / as path separator
-    '''
-    l = []
-    d = os.listdir(rootdir)
-    for f in d:
-        if(os.path.isdir(rootdir + '/' + f)):
-            l.extend(groupMRDfiles_collect(rootdir + '/' + f))
-        elif(f.find('.MRD') > 0):
-            mrsdata_filepath = rootdir + '/' + f
-            # mrs class is filled when reading navg
-            mrs.mread3d(mrsdata_filepath)
-            if mrs.navg > 1:
-                print(f'Skipping phantom data with {mrs.navg} avg as phantom data', file=sys.stderr)
-                continue
-            l.append(mrsdata_filepath)
-    return(l)
-
-def groupMRDfiles(rootdir, unifylevel):
-    '''
-    Group .MRD files into groups of files that have the same path up to the unifylevel
-    Args:
-        rootdir: path to the root directory as a string specified by -f command line argument
-        unifylevel: 3 to concatenate each image file into single MRD file
-                    1 to keep each image file as a separate MRD file
-                    as an integer specified by -u command line argument
-    Returns
-        List of paths of .MRD files to be grouped together
-    '''
-    if(not os.path.isdir(rootdir)):
-        return([])
-    l = groupMRDfiles_collect(rootdir)
-    groups = []
-    # for each .MRD files in the list,
-    for f in l:
-        fs = f.split('/')
-        addedtogroup = False
-        for g in groups:
-            gs = g[0].split('/')
-            if(len(fs) == len(gs)):
-                issame = True
-                for i in range(len(fs) - unifylevel):
-                    issame = issame and (fs[i] == gs[i])
-                if(issame):
-                    g.append(f)
-                    addedtogroup = True
-        if(not addedtogroup):
-            groups.append([f])
-    return(groups)
-
-def make_header(mrs, measID):
+def make_header(mrs: MRSdata, meas_id: str) -> mrd.Header:
     # make mrd2 header. For now only filling in sequence name but some day should do more
     h = mrd.Header()
     meas = mrd.MeasurementInformationType()
     meas.sequence_name = mrs.pplfile
     # this may be a misuse of the relative table position but I couldn't find FOV offset anywhere
     meas.relative_table_position = mrd.ThreeDimensionalFloat(x=mrs.FOVoff[0], y=mrs.FOVoff[1], z=mrs.FOVoff[2])
-    meas.measurement_id = measID
+    meas.measurement_id = meas_id
     h.measurement_information = meas
     # This is definitely a misuse of h1 resonance frequency for non-1H acquisitions also saved as acq center freq
     exp = mrd.ExperimentalConditionsType()
@@ -252,36 +262,108 @@ def make_header(mrs, measID):
     h.encoding.append(e)    # encoding as a list
     return(h)
 
-# check to see if a directory is specified
-def convert_mrs_to_mrd(basedir, unifylevel):
-    # assemble groups of MRD files
-    groups = groupMRDfiles(basedir, unifylevel)
-    # groups are lists of MRS files to be grouped together in a single .MRD2 file format
-    for g in groups:
-        # get the measurement ID from the first file in the group
-        measID = g[0].split('/')[-(unifylevel + 1)]
-        basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
-        print(f'grouping {len(g)} files into {basedir}', file=sys.stderr)
-        w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
-        for ig in range(len(g)):
+def collect_mrd_files(rootdir: Path, mrs: MRSdata) -> List[Path]:
+    """
+    Find all .MRD files in the root directory and its subdirectories.
+    Assumption: Skip .MRD file with more than 1 average as it is considered as phantom data.
+    Args:
+        rootdir: Path object to the root directory
+        mrs: MRSdata object
+    Returns:
+        List of Path objects
+    """
+    mrd_filepath_list: List[Path] = []
+    # recursively find all file paths with .MRD extension in the rootdir
+    for entry in rootdir.iterdir():
+        if entry.is_dir():
+            mrd_filepath_list.extend(collect_mrd_files(entry, mrs))
+            continue
+        if ".MRD" in entry.name:
+            mrs.mread3d(str(entry)) # extract MRS data from .MRD file into mrs object to read number of averages
+            print(f"Filepath {entry} with {mrs.navg} avg", file=sys.stderr)
+            # skip the file with more than 1 average as phantom data
+            if mrs.navg > 1:
+                print(f"Skipping {entry} with {mrs.navg} avg as phantom data", file=sys.stderr)
+                continue
+            mrd_filepath_list.append(entry)
+        else:
+            # if the entry is not a .MRD file, continue
+            continue
+    return mrd_filepath_list
+
+def group_mrd_files(rootdir: Path, unifylevel: int, mrs: MRSdata) -> List[List[Path]]:
+    """
+    In the rootdir, make a list of MRD files that have the same parental paths by unify level.
+    For example, if unifylevel is 1, and the rootdir is /A/B/C/protocolA/, the list of lists will be:
+    rootdir: epsi_kidney_data
+    If unify level is 3, 
+    condition: 3 dir above ischemia_27_1
+    If unify level is 1, 1 dir above is 8262
+    Args:
+        rootdir: Path object to the root directory
+        unifylevel: integer specifying the number of levels to unify
+        mrs: MRSdata object
+    Returns:
+        List of lists of Path objects
+    """
+    if not rootdir.is_dir():
+        raise ValueError(f"Root directory {rootdir} is not a directory")
+    mrd_filepath_list = collect_mrd_files(rootdir, mrs)
+    mrd_file_groups: List[List[Path]] = []
+    for path in mrd_filepath_list:
+        parts = path.parts
+        added_to_group = False
+        # add same folder name filepath into the same group
+        for group in mrd_file_groups:
+            group_parts = group[0].parts
+            if all(parts[i] == group_parts[i] for i in range(len(parts) - unifylevel)):
+                group.append(path)
+                added_to_group = True
+                break
+        # if new folder name is found, append a new group
+        if not added_to_group:
+            mrd_file_groups.append([path])
+    return mrd_file_groups
+
+def convert_mrs_folder_to_mrd(basedir: Path, unifylevel: int) -> None:
+    """
+    Frontend typescript organizes the files into groups of same protocol
+    Presigned URL sent to upload a folder of MRD files combined together into same protocol
+    S3 bucket 
+    """
+    mrs = MRSdata()
+    mrd_file_groups = group_mrd_files(basedir, unifylevel, mrs)
+    for group in mrd_file_groups:
+        meas_id = group[0].parts[-(unifylevel + 1)] # protocol folder name e.g.) ischemia_27_1
+        output_dir = Path(*group[0].parts[: -unifylevel])
+        print(f"grouping {len(group)} files into {output_dir}", file=sys.stderr)
+        writer = mrd.BinaryMrdWriter(str(output_dir / "raw.mrd2"))
+        for index, file_path in enumerate(group):
             # write the header once for the entire group after continue
             # re-read the data to set the correct header for each group
-            mrs.mread3d(g[ig])
-            if ig == 0:
-                h = make_header(mrs, measID)
-                w.write_header(h)
-            w.write_data(generate_pulseq_acquisition(mrs, ig))
-        w.close()
+            mrs.mread3d(str(file_path))
+            if index == 0:
+                header = make_header(mrs, meas_id)
+                writer.write_header(header)
+            writer.write_data(generate_pulseq_acquisition(mrs, index))
+        writer.close()
 
-# -u 3 consolidates the files as appropriate for EPSI. 
-# spectral data like Bukola's and David's uses -u 1
-if __name__ == "__main__":
+
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Convert MRS data folder to MRD2 format')
-    parser.add_argument('-f', '--folder', type=str, required=True,
+    # required directory path with MRS data files as Path type
+    parser.add_argument('-f', '--folder', type=Path, required=False,
                         help='Base directory containing MRS data files')
     parser.add_argument('-u', '--unifylevel', type=int, required=False, default=1,
                         help='Directory levels to unify when grouping files (default: 1)')
     args = parser.parse_args()
-    print(f'running with base director {args.folder}', file=sys.stderr)
-    print(f'unify level set to {args.unifylevel}', file=sys.stderr)
+    # if folder is passed, collect files. Otherwise, take single file input
+    print(f"running with base director {args.folder}", file=sys.stderr)
+    print(f"unify level set to {args.unifylevel}", file=sys.stderr)
     convert_mrs_to_mrd(args.folder, args.unifylevel)
+    return 0
+
+# -u 3 consolidates the files as appropriate for EPSI. 
+# spectral data like Bukola's and David's uses -u 1
+if __name__ == "__main__":
+    raise SystemExit(main())

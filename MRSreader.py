@@ -1,10 +1,10 @@
 import numpy as np
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 import os
-from scipy.optimize import minimize
+# from scipy.optimize import minimize
 import sys
 
-MRSdatadebug = True
+MRSdatadebug = False
 
 class MRSdata:
     def __init__(self):
