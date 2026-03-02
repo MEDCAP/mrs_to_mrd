@@ -30,10 +30,6 @@ from typing import Iterable, List, Sequence, BinaryIO, Type
 import numpy as np
 
 # mrd python package
-# https://github.com/MEDCAP/mrd-fork/tree/dev# is added at root of this repository as a git submodule
-# path to mrd python package is 'root/mrd-fork/python'
-MRD_PYTHON_PATH = Path(__file__).resolve().parent / "mrd-fork" / "python"
-sys.path.insert(0, str(MRD_PYTHON_PATH))
 import mrd
 from MRSreader import MRSdata
 
@@ -360,7 +356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # if folder is passed, collect files. Otherwise, take single file input
     print(f"running with base director {args.folder}", file=sys.stderr)
     print(f"unify level set to {args.unifylevel}", file=sys.stderr)
-    convert_mrs_to_mrd(args.folder, args.unifylevel)
+    convert_mrs_folder_to_mrd(args.folder, args.unifylevel)
     return 0
 
 # -u 3 consolidates the files as appropriate for EPSI. 
