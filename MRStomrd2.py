@@ -41,8 +41,7 @@ def append_pulseq(mrs: MRSData, pulseq_mrd_file: binaryIO):
     TODO: Add modification of pulseq file depending on parameters on MRSData
     @param
         - mrs: instance of class MRSData that extracts parameters from raw MRS file
-        - amp_file: npy file containing pulse shape in 
-        - phase_file: npy file containing pulse phase in radians
+        - pulseq_mrd_file: mrd file that contain pulseq 
     @return
         - 
     """
@@ -51,7 +50,6 @@ def append_pulseq(mrs: MRSData, pulseq_mrd_file: binaryIO):
         for item in reader.read_data():
             if isinstance(item, mrd.StreamItem.PulseqDefinitions):
                 # add fov from MRSData
-                
                 yield mrd.StreamItem.PulseqDefinitions(item)
             if isinstance(item, mrd.StreamItem.Blocks): # StreamItem.Blocks is a vector of mrd.Block
                 yield mrd.StreamItem.Blocks(item)   
@@ -75,18 +73,14 @@ def append_pulseq(mrs: MRSData, pulseq_mrd_file: binaryIO):
         definitions.adc_raster_time_ns = 1e5
         definitions.block_duration_raster_ns = 1e5
         definitions.name = "MRS epsi"
-        definitions.fov = mrd.ThreeDimensionalFloat(x=mrs.FOV, y=mrs.FOV, )
+        definitions.fov = mrd.ThreeDimensionalFloat(x=mrs.FOV, y=mrs.FOV, z=mrs.FOV)    # 3d share the same FOV
+    return
 
-
-def generate_pulseq_acquisition(mrs: MRSdata, measurement_index: int) -> Iterable[mrd.StreamItem]:
-    """
-    Define pulseq fields and extract acquisition from MRSdata structure.
-    """
-    # define pulseq definitions with pseudo rf pulses
-    # all time units are aligned to be in ns
+def generate_pulseq(mrs: MRSdata) -> Iterable[mrd.StreamItem]:
     pulse_length = np.uint64(1.0E+5)   # 100us in ns: guess pulelength to 100us
     TE = np.uint64(1.8E+5)         # 180us in ns: just an estimate for now, start acquiring 180us after 100us pulse start
     TR = np.uint64(mrs.tr * 1.0E+6)  # mrs.tr from ms to ns
+
     definitions = mrd.PulseqDefinitions()
     # start, end, and duration are measured in multiples of raster times
     definitions.gradient_raster_time_ns = 1                             # typical pulseq value is 1e-05s=10us
@@ -135,52 +129,35 @@ def generate_pulseq_acquisition(mrs: MRSdata, measurement_index: int) -> Iterabl
     rf.use = mrd.RFPulseUse.EXCITATION
     yield mrd.StreamItem.Rf(rf)
 
+def generate_acquisition(mrs: MRSdata) -> Iterable[mrd.StreamItem]:
+    """
+    Extract acquisition from MRSdata file
+    Args:
+        - mrs: MRSdata object containing rawdata and parameters extracted from .MRD file
+    Returns:
+        - Iterable of mrd.StreamItem.Acquisition containing acquisition data and parameters for each acquisition
+    """
+    TE = np.uint64(1.8E+5)         # in ns: just an estimate for now, start acquiring 180us after pulse
+    TR = np.uint64(mrs.tr * 1.0E+6)  # convert mrs.tr from ms to ns
     # encode pulse events and acquisition in a time-series for EPSI sequence
     if mrs.pplfile.find("epsi") >= 0:
-        nPE = mrs.rawdata.shape[1]  # number of phase encoding
-        blocks = []
+        nPE = mrs.rawdata.shape[1]  # phase encoding lines
         for iacq in range(nPE):
-            # encode pulse events and acquisition in a time-series for each phase-encoding
-            block1 = mrd.Block()
-            block1.id = iacq*2 + 1      # id is non-zero unique values, starting at 1 for rf pulse, 2 for adc period, 3 for next pulse
-            block1.duration = pulse_length  # pulse length in units of definitions.block_duration_raster_ns
-            block1.rf = 1                # rf pulse id
-            block1.gx = 0                # no gradients for now
-            block1.gy = 0
-            block1.gz = 0
-            block1.adc = 0
-            block1.ext = 0               # extension to save LABEL for counters and flags, TRIGGERS
-            blocks.append(block1)
-            
-            # to next rf pulse
-            block2 = mrd.Block()
-            block2.id = iacq*2 + 2               # increment id from the previous value
-            block2.duration = TR - pulse_length
-            block2.rf = 0
-            block2.gx = 0
-            block2.gy = 0
-            block2.gz = 0
-            block2.adc = 0
-            block2.ext = 0
-            blocks.append(block2)
-        
-        # Yield all blocks at once
-        yield mrd.StreamItem.Blocks(blocks)
-        
-        # Now yield acquisitions
-        for iacq in range(nPE):
-            # encode acquisition field
             acq = mrd.Acquisition()
             if(iacq == 0):
                 acq.head.flags = mrd.AcquisitionFlags.FIRST_IN_PHASE
             if(iacq == mrs.rawdata.shape[1] - 1):
                 acq.head.flags = mrd.AcquisitionFlags.LAST_IN_PHASE
-            acq.data = np.transpose(np.expand_dims(mrs.rawdata[:, iacq, 0, 0, 0, 0], (0)))
+            # mrs.rawdata shape=(samples, views, sliceviews, slices, echoes, nex)
+            if mrs.rawdata.shape[2:] != (1, 1, 1, 1):
+                raise ValueError(f"Expected rawdata shape (samples, views, 1, 1, 1, 1) but got {mrs.rawdata.shape}")
+            elif mrs.rawdata.shape[0] == 1 or mrs.rawdata.shape[1] == 1:
+                raise ValueError(f"Expected rawdata shape (samples, views, 1, 1, 1, 1) but got {mrs.rawdata.shape}")
+            sample_rawdata = np.squeeze(mrs.rawdata)  # shape=(samples, views)
+            acq.data = np.expand_dims(sample_rawdata[:, iacq], axis=0)  # shape=(coils=1, samples)
             acq.head.acquisition_center_frequency = mrs.basefreq
             acq.head.idx.phase = iacq
-            # pulseq only defines duration
-            # timestamp of each pulse start is recalculated here
-            pulse_start = np.uint64(definitions.custom['acq_start_time_ns']) + np.uint64(iacq * TR)
+            pulse_start = np.uint64(mrs.acqstarttime * 100) + np.uint64(iacq * TR) # mrs.acqstarttime in units of 100ns converted to ns
             acq.head.acquisition_time_stamp_ns = pulse_start + TE
             acq.head.idx.contrast = mrs.nswitch
             totalppswitch = int(mrs.rawdata.shape[0] / mrs.nswitch + 0.7)
@@ -191,44 +168,16 @@ def generate_pulseq_acquisition(mrs: MRSdata, measurement_index: int) -> Iterabl
             yield mrd.StreamItem.Acquisition(acq)
 
     # MRS->mrd conversion for spectral sequence
-    elif mrs.pplfile.find("1pul") >= 0:
+    elif mrs.pplfile.find("1pul") >= 0 or mrs.pplfile.find("fid_spsp") >= 0: # spectral sequence ppl file have two names for EVO1 and EVO2
         nrep = mrs.rawdata.shape[5]  # number of acquisitions per image file (phase-encodes)
         blocks = []
-        for iacq in range(nrep):
-            # encode pulse events and acquisition in a time-series for 1pul sequence
-            block1 = mrd.Block()
-            block1.id = iacq*2 + 1      # id is non-zero unique values, starting at 1 for rf pulse, 2 for adc period, 3 for next pulse
-            block1.duration = pulse_length  # pulse length in units of definitions.block_duration_raster_ns
-            block1.rf = 1                # rf pulse id
-            block1.gx = 0                # no gradients for now
-            block1.gy = 0
-            block1.gz = 0
-            block1.adc = 0
-            block1.ext = 0               # extension to save LABEL for counters and flags, TRIGGERS
-            blocks.append(block1)
-            
-            # to next rf pulse
-            block2 = mrd.Block()
-            block2.id = iacq*2 + 2               # increment id from the previous value
-            block2.duration = TR - pulse_length
-            block2.rf = 0
-            block2.gx = 0
-            block2.gy = 0
-            block2.gz = 0
-            block2.adc = 0
-            block2.ext = 0
-            blocks.append(block2)
-        
-        # Blocks stream is a list of mrd.Block() 
-        yield mrd.StreamItem.Blocks(blocks)
-        
         # Now yield acquisitions
         for iacq in range(nrep):
             # encode acquisition field
             acq = mrd.Acquisition()
             acq.data = np.transpose(np.expand_dims(mrs.rawdata[:, 0, 0, 0, 0, iacq], (0)))
             acq.head.acquisition_center_frequency = mrs.basefreq
-            pulse_start = np.uint64(definitions.custom['acq_start_time_ns']) + np.uint64(iacq * TR)
+            pulse_start = np.uint64(mrs.acqstarttime * 100) + np.uint64(iacq * TR) # mrs.acqstarttime in units of 100ns converted to ns
             acq.head.idx.repetition = iacq
             acq.head.acquisition_time_stamp_ns = pulse_start + TE
             acq.head.idx.contrast = 1
@@ -269,6 +218,7 @@ def collect_mrd_files(rootdir: Path, mrs: MRSdata) -> List[Path]:
         List of Path objects
     """
     mrd_filepath_list: List[Path] = []
+    phantom_filepath_list: List[Path] = []
     # recursively find all file paths with .MRD extension in the rootdir
     for entry in rootdir.iterdir():
         if entry.is_dir():
@@ -276,49 +226,48 @@ def collect_mrd_files(rootdir: Path, mrs: MRSdata) -> List[Path]:
             continue
         if ".MRD" in entry.name:
             mrs.mread3d(str(entry)) # extract MRS data from .MRD file into mrs object to read number of averages
-            print(f"Filepath {entry} with {mrs.navg} avg", file=sys.stderr)
             # skip the file with more than 1 average as phantom data
-            if mrs.navg > 1:
-                print(f"Skipping {entry} with {mrs.navg} avg as phantom data", file=sys.stderr)
-                continue
-            mrd_filepath_list.append(entry)
+            if mrs.navg == 1:
+                print(f"Filepath {entry} with {mrs.navg} avg", file=sys.stderr)
+                mrd_filepath_list.append(entry)
+            else:
+                print(f"Phantom file {entry} with {mrs.navg} avg", file=sys.stderr)
+                phantom_filepath_list.append(entry)
         else:
             # if the entry is not a .MRD file, continue
             continue
-    return mrd_filepath_list
+    return mrd_filepath_list, phantom_filepath_list
 
-def group_mrd_files(rootdir: Path, unifylevel: int, mrs: MRSdata) -> List[List[Path]]:
+def group_mrd_files(input_folder: Path, unifylevel: int, mrs: MRSdata) -> List[List[Path]]:
     """
-    In the rootdir, make a list of MRD files that have the same parental paths by unify level.
-    For example, if unifylevel is 1, and the rootdir is /A/B/C/protocolA/, the list of lists will be:
-    rootdir: epsi_kidney_data
+    In the input_folder, make a list of MRD files that have the same parental paths by unify level.
+    For example, if unifylevel is 1, and the input_folder is /A/B/C/protocolA/, the list of lists will be:
+    input_folder: epsi_kidney_data
     If unify level is 3, 
     condition: 3 dir above ischemia_27_1
     If unify level is 1, 1 dir above is 8262
     Args:
-        rootdir: Path object to the root directory
+        input_folder: Path object to the input folder
         unifylevel: integer specifying the number of levels to unify
         mrs: MRSdata object
     Returns:
         List of lists of Path objects
     """
-    if not rootdir.is_dir():
-        raise ValueError(f"Root directory {rootdir} is not a directory")
-    mrd_filepath_list = collect_mrd_files(rootdir, mrs)
+    if not input_folder.is_dir():
+        raise ValueError(f"Input folder {input_folder} is not a directory")
+    mrd_filepath_list, phantom_filepath_list = collect_mrd_files(input_folder, mrs)
     mrd_file_groups: List[List[Path]] = []
-    for path in mrd_filepath_list:
-        parts = path.parts
+    for file in mrd_filepath_list:
         added_to_group = False
         # add same folder name filepath into the same group
-        for group in mrd_file_groups:
-            group_parts = group[0].parts
-            if all(parts[i] == group_parts[i] for i in range(len(parts) - unifylevel)):
-                group.append(path)
-                added_to_group = True
-                break
-        # if new folder name is found, append a new group
+        for item in mrd_file_groups:
+            if len(item[0].split('/')) == len(file.split('/')):
+                for i in range(len(file.split('/') - unifylevel)):
+                    if file.split('/')[i] == item[0].split('/')[i]:
+                        item.append(file)
+                        added_to_group = True
         if not added_to_group:
-            mrd_file_groups.append([path])
+            mrd_file_groups.append([file])
     return mrd_file_groups
 
 def convert_mrs_folder_to_mrd(basedir: Path, unifylevel: int) -> None:
@@ -341,22 +290,42 @@ def convert_mrs_folder_to_mrd(basedir: Path, unifylevel: int) -> None:
             if index == 0:
                 header = make_header(mrs, meas_id)
                 writer.write_header(header)
-            writer.write_data(generate_pulseq_acquisition(mrs, index))
+            writer.write_data(generate_acquisition(mrs))
         writer.close()
 
+def convert_mrs_file_to_mrd(input_file: Path) -> None:
+    return
 
-def main(argv: Sequence[str] | None = None) -> int:
+
+def main() -> int:
+    '''
+    Command line interface for reconstructing MRS folder
+    - f/--folder: base directory containing MRS data files
+    - u/--unifylevel: directory levels to unify when grouping files (default: 1)
+    - i/--input: single MRS .MRD file input for conversion to MRD2 format, if folder is not passed
+    '''
+
     parser = argparse.ArgumentParser(description='Convert MRS data folder to MRD2 format')
-    # required directory path with MRS data files as Path type
     parser.add_argument('-f', '--folder', type=Path, required=False,
                         help='Base directory containing MRS data files')
     parser.add_argument('-u', '--unifylevel', type=int, required=False, default=1,
                         help='Directory levels to unify when grouping files (default: 1)')
+    parser.add_argument('-i', '--input', type=Path, required=False,
+                        help='Single MRS .MRD file input for conversion to MRD2 format')
     args = parser.parse_args()
-    # if folder is passed, collect files. Otherwise, take single file input
-    print(f"running with base director {args.folder}", file=sys.stderr)
-    print(f"unify level set to {args.unifylevel}", file=sys.stderr)
-    convert_mrs_folder_to_mrd(args.folder, args.unifylevel)
+    # if folder is passed, collect files. Otherwise, convert take MRS file input
+    if args.folder:
+        if args.input:
+            raise ValueError("Cannot specify both --folder and --input")
+        if not args.folder.is_dir():
+            raise ValueError(f"Folder {args.folder} is not a directory")
+        print(f"Convert folder {args.folder} with unify level {args.unifylevel}", file=sys.stderr)
+        convert_mrs_folder_to_mrd(args.folder, args.unifylevel)
+    elif args.input:
+        print(f"Convert single input file {args.input}", file=sys.stderr)
+        convert_mrs_file_to_mrd(args.input)
+    else:
+        raise ValueError("Either --folder or --input must be specified")
     return 0
 
 # -u 3 consolidates the files as appropriate for EPSI. 
