@@ -11,7 +11,7 @@ from statistics import mode
 # mrd python package
 # https://github.com/MEDCAP/mrd-fork/tree/dev# is added at root of this repository as a git submodule
 # path to mrd python package is 'root/mrd-fork/python' 
-sys.path.insert(0, 'mrd-fork/python')
+# sys.path.insert(0, 'mrd-fork/python')
 import mrd
 from MRSreader import MRSdata
 
@@ -113,10 +113,12 @@ def groupMRDfiles_collect(rootdir):
             mrsdata_filepath = rootdir + '/' + f
             # mrs class is filled when reading navg
             mrs.mread3d(mrsdata_filepath)
-            if mrs.navg > 1:
+            if mrs.navg == 1:
+                print(f'Add file {mrsdata_filepath} with {mrs.navg} avg')
+                l.append(mrsdata_filepath)
+            else:
                 print(f'Skipping phantom data with {mrs.navg} avg as phantom data', file=sys.stderr)
                 continue
-            l.append(mrsdata_filepath)
     return(l)
 
 def groupMRDfiles(rootdir, unifylevel):
@@ -164,12 +166,16 @@ def make_header(mrs, measID):
     # This is definitely a misuse of h1 resonance frequency for non-1H acquisitions
     h.experimental_conditions.h1_resonance_frequency_hz = mrs.basefreq
     h.measurement_information.measurement_id = measID
-    et = mrd.EncodingType()
-    et.encoded_space.field_of_view_mm.x = mrs.FOV
-    et.encoded_space.field_of_view_mm.y = mrs.FOV
-    et.encoded_space.field_of_view_mm.z = mrs.FOV
-    h.encoding = [et]
-    return(h)
+
+    limits_avg = mrd.LimitType()
+    limits_avg.minimum = 0
+    limits_avg.maximum = mrs.navg - 1
+    limits = mrd.EncodingLimitsType()
+    limits.average = limits_avg
+    enc = mrd.EncodingType()
+    enc.encoding_limits = limits
+    h.encoding.append(enc)
+    return  h
 
 # check to see if a directory is specified
 def convert_mrs_to_mrd(basedir, unifylevel):

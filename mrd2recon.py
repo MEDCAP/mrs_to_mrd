@@ -1,6 +1,4 @@
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend for headless Docker environments
 import matplotlib.pyplot as plt
 from statistics import mode
 import os
@@ -20,7 +18,7 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 
 debugphasing = False
 debuglorn = False
-savePhasedEPSILocal = False
+savePhasedEPSILocal = True
 saveLornFitLocal = False
 saveMetaboliteLocal = False
 kfitdata_local = True
@@ -44,7 +42,7 @@ def findmrd2files(basedir, targetfiletype):
 
 def generate_aux_images(imglist):
     for iimg in range(len(imglist)):
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.BITMAP)
+        imghead = mrd.ImageHeader(image_type=mrd.ImageType.COMPLEX)
         img = mrd.Image(head=imghead, data=np.expand_dims(imglist[iimg], (2, 3, 4)))
         yield(mrd.StreamItem.ImageUint32(img))
 
@@ -118,7 +116,7 @@ def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.
         imghead.set = 0      # or this
         imghead.acquisition_time_stamp_ns = ide * time_between_images * 1000000000
         imghead.physiology_time_stamp_ns = []
-        imghead.image_type = mrd.ImageType.SPIN_DENSITY_MAP
+        # imghead.image_type = mrd.ImageType.COMPLEX
         imghead.image_index = ide
         imghead.image_series_index = ide
         imghead.user_int = []
@@ -201,7 +199,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                 if(ide > 1):
                     globalspect += img[ide, j, k, :]
     if savePhasedEPSILocal:
-        epsi_images_dir = "C:/Users/kento/dev/rawdata/mrsolutions/test_shur/epsi_images"
+        epsi_images_dir = f"/Users/kento/dev/data/cirrhrat_data/{experiment_name}"
     else:
         epsi_images_dir = "C:/Users/MRS/Desktop/shurik/phased_epsi_npyfiles"
     if os.path.exists(epsi_images_dir):
@@ -267,22 +265,22 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-    if saveLornFitLocal:
-        # save current figure as a PNG file
-        lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
-    else:
-        lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
-    if os.path.exists(lorn_fit_dir):
-        lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
-        try:
-            plt.savefig(lorn_fit_path)
-            print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
-        except Exception as e:
-            print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
-    else:
-        raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
+    # if saveLornFitLocal:
+    #     # save current figure as a PNG file
+    #     lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
+    # else:
+    #     lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
+    # if os.path.exists(lorn_fit_dir):
+    #     lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
+    #     try:
+    #         plt.savefig(lorn_fit_path)
+    #         print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
+    #     except Exception as e:
+    #         print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
+    # else:
+    #     raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
 
-    append_auximage(auximages, echo_number=a.head.idx.contrast)
+    # append_auximage(auximages, echo_number=a.head.idx.contrast)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
     metabolites = np.zeros((npeaks, numimages, npe, nro))
@@ -304,8 +302,8 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                         np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
                 x1 = minimize(lor1fit, x0, bounds=bounds)
                 metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
-    # rotate by 90deg
-    metabolites = np.rot90(metabolites, k=1, axes=(2,3))
+    # # rotate by 90deg
+    # metabolites = np.rot90(metabolites, k=1, axes=(2,3))
     return([metabolites, auximages])
 
 def generate_spectra(h: mrd.Header,
@@ -569,25 +567,25 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             experiment_name = str(Path(input).parents[0].name)
             [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-            if saveMetaboliteLocal:
-                npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
-            else:
-                npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
-            if os.path.exists(npy_dir):
-                try:
-                    npy_filepath = os.path.join(npy_dir, f'{experiment_name}_metabolites.npy')
-                    np.save(npy_filepath, metabolites)
-                    print(f"Saving metabolites npy file at {npy_filepath}")
-                except Exception as e:
-                    print(f"Error saving metabolites npy file: {e}", file=sys.stderr)
-            else:
-                raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
+            # if saveMetaboliteLocal:
+            #     npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
+            # else:
+            #     npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
+            # if os.path.exists(npy_dir):
+            #     try:
+            #         npy_filepath = os.path.join(npy_dir, f'{experiment_name}_metabolites.npy')
+            #         np.save(npy_filepath, metabolites)
+            #         print(f"Saving metabolites npy file at {npy_filepath}")
+            #     except Exception as e:
+            #         print(f"Error saving metabolites npy file: {e}", file=sys.stderr)
+            # else:
+            #     raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
             # read_data can be called only once to get Stream +Item
             # write_data can be rewritten by converting list of mrd objects to StreamItem
-            writer.write_data(generate_stream(raw_pulse_list))
-            writer.write_data(generate_stream(raw_gradient_list))
-            writer.write_data(generate_stream(raw_acquisition_list))
+            # writer.write_data(generate_stream(raw_pulse_list))
+            # writer.write_data(generate_stream(raw_gradient_list))
+            # writer.write_data(generate_stream(raw_acquisition_list))
         elif(raw_header.measurement_information.sequence_name.find('1pul') > -1):
             [measurementtimes_ns, spectra, peakfrequencies, peakamplitudes, auximages] = spectra_recon(
                 h=raw_header,
