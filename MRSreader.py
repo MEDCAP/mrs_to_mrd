@@ -1,3 +1,6 @@
+from pathlib import Path
+from sqlite3 import paramstyle
+from matplotlib import container
 import numpy as np
 # import matplotlib.pyplot as plt
 import os
@@ -31,23 +34,22 @@ class MRSdata:
     def mread3d(self, f):
         if(MRSdatadebug):
             print(f'reading MRS file {f}', file=sys.stderr)
-        containingfolder = '/'.join(f.split('/')[:-1])
-        d = os.listdir(containingfolder)
         # first get base frequency from SPR file
-        for auxf in d:
-            if(auxf.find('.SPR') > 0):
-                fd = open(containingfolder + '/' + auxf, 'rb')
-                fdstr = str(fd.read())
-                freqidx = fdstr.find('FREQ')
-                if(freqidx > 0):
-                    self.basefreq = int(float(fdstr[(freqidx + 5):(freqidx + 19)]) * 1.0E+6 + 0.5)
-                    if(MRSdatadebug):
-                        print(f'   setting base frequency to {self.basefreq}Hz', file=sys.stderr)
-            if self.basefreq == 0:
-                self.basefreq = 74941736
+        for auxfile in f.parent.iterdir():
+            if auxfile.is_file() and auxfile.suffix == '.SPR':
+                with open(auxfile, 'rb') as file:
+                    content = str(file.read())
+                    freqidx = content.find('FREQ')                 # frequency stored in SPR file
+                    if freqidx > 0:
+                        self.basefreq = int(float(content[(freqidx + 5):(freqidx + 19)]) * 1.0E+6 + 0.5)
+                        if MRSdatadebug:
+                            print(f'   setting base frequency to {self.basefreq}Hz', file=sys.stderr)
+        # if no .SPR file included in the folder, set basefrequency manually
+        if self.basefreq == 0:
+            self.basefreq = 74941736        # urea centered frequency
         # now read MRS file
-        fd = open(f, 'rb')
-        fdbytes = fd.read()
+        file = open(f, 'rb')
+        fdbytes = file.read()
         self.samples = np.frombuffer(fdbytes[0:4], dtype = 'int32')[0]
         self.views = np.frombuffer(fdbytes[4:8], dtype = 'int32')[0]
         self.sliceviews = np.frombuffer(fdbytes[8:12], dtype = 'int32')[0]
@@ -62,28 +64,28 @@ class MRSdata:
             rawdata = np.frombuffer(fdbytes[dstart:dend], dtype = 'int16')
         elif self.type == 16:
             dend = dstart + totalpts * 2
-            d = np.frombuffer(fdbytes[dstart:dend], dtype = 'uint8')
-            rawdata = d[::2] + 1j * d[1::2]
+            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'uint8')
+            rawdata = dir[::2] + 1j * dir[1::2]
         elif self.type == 17:
             dend = dstart + totalpts * 2
-            d = np.frombuffer(fdbytes[dstart:dend], dtype = 'int8')
-            rawdata = d[::2] + 1j * d[1::2]
+            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'int8')
+            rawdata = dir[::2] + 1j * dir[1::2]
         elif self.type == 18 or self.type == 19:
             dend = dstart + totalpts * 4
-            d = np.frombuffer(fdbytes[dstart:dend], dtype = 'int16')
-            rawdata = d[::2] + 1j * d[1::2]
+            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'int16')
+            rawdata = dir[::2] + 1j * dir[1::2]
         elif self.type == 20:
             dend = dstart + totalpts * 8
-            rawdata = d[::2] + 1j * d[1::2]
-            d = np.frombuffer(fdbytes[dstart:dend], dtype = 'int32')
+            rawdata = dir[::2] + 1j * dir[1::2]
+            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'int32')
         elif self.type == 21:
             dend = dstart + totalpts * 8
-            d = np.frombuffer(fdbytes[dstart:dend], dtype = 'float32')
-            rawdata = d[::2] + 1j * d[1::2]
+            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'float32')
+            rawdata = dir[::2] + 1j * dir[1::2]
         elif self.type == 22:
             dend = dstart + totalpts * 16
-            d = np.frombuffer(fdbytes[dstart:dend], dtype = 'float64')
-            rawdata = d[::2] + 1j * d[1::2]
+            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'float64')
+            rawdata = dir[::2] + 1j * dir[1::2]
         else:
             print('unknown data format', file=sys.stderr)
             return
@@ -225,7 +227,7 @@ class MRSdata:
 if __name__ == '__main__':
     MRSdatadebug = True
     argparse = argparse.ArgumentParser(description='Convert MRS .MRD file to .MRD file with acquisition data in MRD format')
-    argparse.add_argument('-i', '--input', type=str, help='path to input .MRD file containing MRS data in Siemens format')
+    argparse.add_argument('-i', '--input', type=Path, help='path to input .MRD file containing MRS data in Siemens format')
     args = argparse.parse_args()
     m = MRSdata()
     m.mread3d(args.input)

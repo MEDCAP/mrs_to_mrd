@@ -1,773 +1,272 @@
+"""
+As new file comes in, convert to mrd2 file 
+
+tyger args:
+    - python mrd2recon.py
+    - -i
+    - $(INPUT_PIPE)
+    - -o
+    - $(OUTPUT_PIPE)
+
+Across multiple raw.mrd2 files to reconstruct, have multiple jobs
+"""
+
+import argparse
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend for headless Docker environments
 import matplotlib.pyplot as plt
 from statistics import mode
 import os
 from scipy.optimize import minimize, Bounds
 import sys
 from pathlib import Path
-from typing import BinaryIO, Union
-import argparse
-import re
+from typing import Any, BinaryIO, Iterable, List, Union
 
-# path to mrd python package is 'root/mrd-fork/python' 
 import mrd
-from MRSreader import MRSdata
-from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
-        lorngetpeakparams, lornputpeakparams
 
-LOCAL_TEST = True
-if LOCAL_TEST:
-    debugphasing = False
-    debuglorn = False
-    savePhasedEPSILocal = True
-    saveLornFitLocal = True
-    saveMetaboliteLocal = True
-    kfitdata_local = True
-    DATA_DIR = os.path.expanduser('~/dev/data')
-else:
-    debugphasing = False
-    debuglorn = False
-    savePhasedEPSILocal = False
-    saveLornFitLocal = False
-    saveMetaboliteLocal = False
-    kfitdata_local = False
-    DATA_DIR = 'C:/Users/MRS/Desktop'
+def apply_line_broadening(acq: mrd.Acquisition, line_broadening: float) -> np.ndarray:
+    """
+    Apply line broadening apodization A(t) = exp(-pi * LB * t) to each echo in an acquisition.
+    Args:
+        - acq: mrd.Acquisition object
+        - line_broadening: float, line broadening factor in Hz
+    Returns:
+        - np.ndarray of shape (nsamples, nechoes) with apodization applied
+    """
+    nechoes = acq.head.idx.contrast
+    totalppswitch = round(acq.samples() / nechoes)
+    nsamples = totalppswitch - acq.head.discard_pre - acq.head.discard_post
+    result = np.zeros((nsamples, nechoes), dtype='complex')
+    for iecho in range(nechoes):
+        tk = iecho * acq.head.sample_time_ns * totalppswitch / 1.0e+9
+        extracted_samples = acq.data[0, (iecho * totalppswitch + acq.head.discard_pre):(iecho * totalppswitch + acq.head.discard_post + nsamples)]
+        result[:, iecho] = extracted_samples * np.exp(-tk * line_broadening)
+    return result
 
-basedir = '.'
-fidpad = 1
-lb = 42 # Hz
-experiment_name = ''
+def reconstruct_epsi(head: mrd.Header, input: Iterable[mrd.Acquisition], line_broadening: float) -> Iterable[mrd.NdArrayDouble]:
+    """
+    Generator to reconstruct from acquisition for epsi without spectral fitting
+    Args:
+        - head: mrd.Header object
+        - input: Iterable[mrd.Acquisition] object
+        - line_broadening: float, line broadening factor in Hz
+    Returns:
+        - Iterable[mrd.NdArrayDouble] object
+    acquisitio rawdata=[samples=1280, views=8, slcview=1, slice=1, echoes=1, nex=1], avg=1
+    """
+    def kspace_to_ndarray(kspace: np.ndarray, ref_acq: mrd.Acquisition) -> Iterable[Union[mrd.NdArrayDouble, mrd.NdArrayComplexDouble]]:
+        """
+        Reconstruct kspace(nviews, nsamples, nechoes) to ndarray(nviews, nsamples, nechoes) as an intermediate array
+        Args:
+            - kspace: kspace array in the shape of (views, samples, echoes)
+            - ref_acq: 
+        """
+        nonlocal current_max, max_spect
+        print(f"Reconstructing kspace for repetition={ref_acq.head.idx.repetition}", file=sys.stderr)
+        dim = range(kspace.ndim)
+        img = np.fft.fftshift(np.fft.fftn(kspace, axes=dim), axes=dim)
+        print(head)
+        for iview in range(kspace.shape[0]):
+            for isample in range(kspace.shape[1]):
+                # find the max abs across multi-echoes
+                this_max = np.max(np.abs(img[iview, isample, :]))
+                if this_max > current_max:
+                    current_max = this_max
+                    max_spect = np.copy(img[iview, isample, :])
 
-def findmrd2files(basedir, targetfiletype):
-    '''
-    Search for raw.mrd2 or targetfiletype in the basedir directory and all its subdirectories
-    '''
-    mrd2list = []
-    if os.path.isfile(basedir):
-        return [basedir]
-    for root, dirnames, filenames in os.walk(basedir):
-        if 'raw.mrd2' in filenames or targetfiletype in filenames:
-            mrd2list.append(os.path.join(root, 'raw.mrd2'))
-    return(mrd2list)
+        # at the last repetition, store max, global variable
+        if ref_acq.head.idx.repetition == head.encoding[0].encoding_limits.repetition.maximum:
+            # store max spectral
+            yield mrd.NdArrayComplexDouble(
+                head=mrd.NdArrayHeader(
+                    dimension_labels=[mrd.ArrayDimension.CONTRAST],
+                    array_type=mrd.ArrayType.USER_MAP
+                ),
+                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("max spectral")]}),
+                data=max_spect
+            )
 
-def generate_aux_images(imglist):
-    for iimg in range(len(imglist)):
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.RGBA)
-        img = mrd.Image(head=imghead, data=np.expand_dims(imglist[iimg], (2, 3, 4)))
-        yield(mrd.StreamItem.ImageUint32(img))
+            # store last repetition as noise data
+            yield mrd.NdArrayDouble(
+                head=mrd.NdArrayHeader(
+                    array_type=mrd.ArrayType.NOISE
+                ),
+                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("noise")]}),
+                data=np.mean(np.abs(img))
+            )
 
-def get_clarg(clarg, arg, ty):
-    clargarr = clarg.split(' ')
-    for iarg in range(len(clargarr) - 1):
-        if(clargarr[iarg] == arg): 
-            return(ty(clargarr[iarg + 1]))
-
-def append_auximage(aux_images_list: list, echo_number: int):
-    plt.gcf().canvas.draw()
-    width, height = plt.gcf().canvas.get_width_height()
-    bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
-    bmp = bmp.astype(np.uint32)
-    encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
-    # number of spectral pts=fidpadding * 64 acquired pts
-    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*echo_number*fidpad* + bmp[:,:,3]
-    aux_images_list.append(encodedbmp)
-
-def kABfiteval(x):
-    # uses P, t, y
-    # P=peak amplitudes of the source metabolite
-    # t=time points of the acquisitions
-    # y=peak amplitudes of the metabolite to be fitted
-    # x[.01, .03, 1] for initial guess
-    yp = np.zeros(len(y), dtype=np.float64)
-    yp[0] = x[2]
-    # numerically integrate, x[0] is kAB, x[1] is 1/T1, x[2] is the amount of B at the beginning of acquisition
-    for j in range(1, len(t)):
-        dt = t[j] - t[j-1]
-        Pbar = (P[j-1] + P[j]) / 2
-        yp[j] = yp[j-1] * np.exp(-x[1] * dt) + x[0] * Pbar * np.exp(-x[1] * dt / 2)
-    return(yp)
-
-def kABfit(x):
-    # x1 = minimize(kABfit, [.01, .03, 1]).x
-    yp = kABfiteval(x)
-    return(np.sum((yp - y)**2))
-
-def generate_epsi_images(h: mrd.Header,
-                        metabolite: np.ndarray,
-                        peakoffsets: np.ndarray,
-                        peaknames: list):
-    # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
-    time_between_images = 3   # approximately 3s between images
-    nmet = metabolite.shape[0]
-    nimg = metabolite.shape[1]
-    measfreq = h.experimental_conditions.h1resonance_frequency_hz
-    fov = np.array([h.encoding[0].encoded_space.field_of_view_mm.x, \
-            h.encoding[0].encoded_space.field_of_view_mm.y, \
-            h.encoding[0].encoded_space.field_of_view_mm.z], dtype=np.float32)
-    pos = h.measurement_information.relative_table_position
-    
-    for ide in range(nimg):
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.MAGNITUDE)
-        if(ide == 0):
-            imghead.flags = mrd.ImageFlags.FIRST_IN_SET
-        elif(ide == nimg - 1):
-            imghead.flags = mrd.ImageFlags.LAST_IN_SET
-        imghead.measurement_uid = ide
-        imghead.measurement_frequency = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
-        imghead.measurement_frequency_label = np.array(peaknames, dtype=np.dtype(np.object_))
-        imghead.field_of_view = fov
-        imghead.position = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
-        imghead.col_dir = np.zeros((3,), dtype=np.dtype(np.float32))
-        imghead.line_dir = np.zeros((3,), dtype=np.dtype(np.float32))
-        imghead.slice_dir = np.zeros((3,), dtype=np.dtype(np.float32))
-        imghead.patient_table_position = np.zeros((3,), dtype=np.dtype(np.float32))
-        imghead.average = 0
-        imghead.slice = 0    # only one slice
-        imghead.contrast = 0 # not sure what to do with this yet
-        imghead.phase = 0    # or this
-        imghead.repetition = ide
-        imghead.set = 0      # or this
-        imghead.acquisition_time_stamp_ns = ide * time_between_images * 1000000000
-        imghead.physiology_time_stamp_ns = []
-        imghead.image_index = ide
-        imghead.image_series_index = ide
-        imghead.user_int = []
-        imghead.user_float = []
-        # rotate counterclock-wise 90deg and flip leftright
-        # metabolite shape(freq, meas, rows, cols) -> mrd2 image shape(channels, slices, rows, cols, freqs)
-        imgdata = np.expand_dims(np.moveaxis(metabolite[:, ide, :, :], 0, 2), (0, 1))
-        img = mrd.Image(head=imghead, data=imgdata)
-        yield(mrd.StreamItem.ImageDouble(img))
-
-def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: np.ndarray):#
-    global experiment_name
-    auximages = []
-    numimages = sum([a.head.flags & mrd.AcquisitionFlags.LAST_IN_PHASE == \
-            mrd.AcquisitionFlags.LAST_IN_PHASE for a in raw_acquisition_list])
-    a = raw_acquisition_list[0]
-    sampletime = a.head.sample_time_ns / 1.0E+9
-    centerfreq = a.head.acquisition_center_frequency
-    totalppswitch = int(a.data.shape[0] / a.head.idx.contrast + 0.1)
-    nro = totalppswitch - a.head.discard_pre - a.head.discard_post
-    npe = int(len(raw_acquisition_list) / numimages + 0.1)
-    kspace = np.zeros((numimages, npe, nro, a.head.idx.contrast * fidpad), dtype = 'complex')
-    ia = 0
-    for iimg in range(kspace.shape[0]):
-        for ipe in range(kspace.shape[1]):
-            a = raw_acquisition_list[ia]
-            for iecho in range(a.head.idx.contrast):
-                # line broadening
-                tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
-                kspace[iimg, ipe, :, iecho] = a.data[(iecho * totalppswitch + \
-                    a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0] * \
-                    np.exp(-tk * lb)
-            ia += 1
-    print(f'Performing fft', file=sys.stderr)
-    img = np.fft.fftshift(np.fft.fftn(kspace, axes = (1, 2, 3)), axes = (1, 2, 3))
-    # print('finding biggest voxel')
-    currmax = 0
-    for ide in range(numimages):
-        for j in range(npe):
-            for k in range(nro):
-                thismax = np.max(np.abs(img[ide, j, k, :]))
-                if(thismax > currmax):
-                    currmax = thismax
-                    maxj = j
-                    maxk = k
-                    maxide = ide
-    # estimate noise level by looking at the last image in the series
-    noise = np.mean(np.abs(img[-1, :, :, :]))
-    # print('noise =', noise)
-    maxspect = img[maxide,maxj,maxk,:].copy()
-    globalspect = np.zeros((a.head.idx.contrast * fidpad), dtype=np.complex64)
-    for ide in range(numimages):
-        # go through all the voxels and minimize the phase difference
-        for j in range(npe):
-            for k in range(nro):
-                thisspect = img[ide, j, k, :]
-                # discard spectral data signal less than 3XNoise
-                if(np.max(np.abs(thisspect)) < noise * 3):
-                    continue
-                bestoverlap = 0
-                for r in range(-15,16):
-                    thisrollspect = np.roll(thisspect,r)    # array flatten before shifting and then shape restored
-                    S0 = np.sum(np.real(thisrollspect * np.conj(maxspect)))
-                    Spi2 = np.sum(np.real(thisrollspect * 1j * np.conj(maxspect)))
-                    overlap = S0**2 + Spi2**2
-                    if(overlap > bestoverlap):
-                        bestr = r
-                        bestoverlap = overlap
-                        th0 = np.pi / 2 - np.arctan2(S0, Spi2)
-                img[ide,j,k,:] = np.roll(img[ide,j,k,:], bestr) * np.exp(1j * th0)
-                if(debugphasing):
-                    plt.clf()
-                    plt.plot(np.real(img[ide,j,k,:]))
-                    plt.plot(np.real(maxspect))
-                    # number of acq pts = fidpad * acq pts
-                    plt.plot([0, a.head.idx.contrast * fidpad], [100*bestr, 100*bestr], 'k')
-                    plt.draw()
-                    plt.pause(.1)
-                if(ide > 1):
-                    globalspect += img[ide, j, k, :]
-    if savePhasedEPSILocal:
-        epsi_images_dir = os.path.join(DATA_DIR, 'epsi_kidney_data', 'phased_npyfiles')
-    else:
-        epsi_images_dir = os.path.join(DATA_DIR, 'shurik', 'phased_epsi_npyfiles')
-    if os.path.exists(epsi_images_dir):
-        try:
-            epsi_images_path = os.path.join(epsi_images_dir, f'{experiment_name}_epsi.npy')
-            np.save(epsi_images_path, img)
-            print(f"Saving epsi images npy files at: {epsi_images_path}", file=sys.stderr)
-        except Exception as e:
-            print(f"Error saving epsi images npy files: {e}", file=sys.stderr)
-    else:
-        raise FileNotFoundError(f"Directory {epsi_images_dir} does not exist.")
-    BW = 1 / sampletime / totalppswitch
-    xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
-    globalspect /= np.max(np.abs(globalspect))
-    # estimate peak widths using the FWHM of the largest peak
-    maxpeakidx = np.argmax(np.abs(globalspect))
-    leftidx = -1
-    rightidx = -1
-    for isp in range(len(globalspect)):
-        if(np.abs(globalspect[(maxpeakidx - isp) % len(globalspect)]) < 0.5 and leftidx == -1):
-            leftidx = -isp
-        if(np.abs(globalspect[(maxpeakidx + isp) % len(globalspect)]) < 0.5 and rightidx == -1):
-            rightidx = isp
-    widthguess = (rightidx - leftidx) * (xscale[1] - xscale[0]) / 2
-    lornputspect(xscale, globalspect, widthguess, 1.0, debuglorn)
-    # fit global spectrum to 6 lorentzians. Biggest peak has got to be either pyruvate or urea. 
-    # Maybe some day this will fail if it's lactate
-    npeaks = len(peakoffsets)
-    x0 = np.zeros(((4 * npeaks) + 2))
-    x1 = np.zeros((len(biggestpeaklist), len(x0)))
-    diff = np.zeros((len(biggestpeaklist)))
-    for icg in range(len(biggestpeaklist)):
-        centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
-                peakoffsets[biggestpeaklist[icg]])) % (BW / centerfreq * 1E+6)
-        for ip in range(npeaks):
-            x0[3 * npeaks + ip] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
-            x0[2 * npeaks + ip] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
-        lornputpeakparams(centers, np.ones((npeaks)) * widthguess, x0[(2 * npeaks):(3 * npeaks)], debuglorn)
-        # print('begin minimize', icg, flush=True)
-        x1[icg, :] = minimize(lornfit, x0).x
-        for ip in range(npeaks):
-            if(x1[icg, 3 * npeaks + ip] < 0):
-                x1[icg, 3 * npeaks + ip] *= -1
-                x1[icg, 2 * npeaks + ip] += np.pi
-        diff[icg] = np.sum(np.abs(globalspect - lorneval(x1[icg, :])))
-#        plt.plot(xscale, np.real(globalspect), 'r')
-#        plt.plot(xscale, np.imag(globalspect), 'g')
-#        plt.plot(xscale, np.real(lorneval(x1[icg, :])), 'k')
-#        plt.plot(xscale, np.imag(lorneval(x1[icg, :])), 'k')
-#        plt.draw()
-#        plt.pause(.1)
-        # print("icg ", icg, "diff = ", diff[icg], flush=True)
-    centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
-            peakoffsets[biggestpeaklist[np.argmin(diff)]])) % (BW / centerfreq * 1E+6)
-    lornputpeakparams(centers, np.ones((npeaks)) * widthguess, x0[(2 * npeaks):(3 * npeaks)], debuglorn)
-    centers, widths, phases, amplitudes, baseline = lornunpackx0(x1[np.argmin(diff)], debuglorn)
-    specteval = lorneval(x1[np.argmin(diff)])
-    plt.clf()
-    plt.plot(xscale, np.real(globalspect), 'r')
-    plt.plot(xscale, np.imag(globalspect), 'g')
-    plt.plot(xscale, np.real(specteval), 'k')
-    plt.plot(xscale, np.imag(specteval), 'k')
-
-    #### save as lorn fit as NDArray
-    # global spectral as 1d generay complex64 array stream
-    ndarray_list = []
-    global_spect_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY],
-                                                array_type=mrd.ArrayType.USER_MAP,
-                                                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("global_spect")],
-                                                                    "xscale": [mrd.ArrayMetaValue.Float64(xscale[i]) for i in range(len(xscale))],  # xscale as list of single entries
-                                                                    "BW": [mrd.ArrayMetaValue.Float64(BW)],
-                                                                    "centerfreq": [mrd.ArrayMetaValue.Float64(centerfreq)]}))
-    ndarray_list.append(mrd.NdArray[np.complex64](head=global_spect_arr_header, data=globalspect))
-    # lorn fit array as 1d general complex double array stream
-    lorn_fit_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY],
-                                            array_type=mrd.ArrayType.USER_MAP,
-                                            meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("lorn_fit")],
-                                                                "xscale": [mrd.ArrayMetaValue.Float64(xscale[i]) for i in range(len(xscale))],  # xscale as list of single entries
-                                                                "BW": [mrd.ArrayMetaValue.Float64(BW)],
-                                                                "centerfreq": [mrd.ArrayMetaValue.Float64(centerfreq)],
-                                                                "centers": [mrd.ArrayMetaValue.Float64(centers)]}))
-    ndarray_list.append(mrd.NdArray[np.complex64](head=lorn_fit_arr_header, data=specteval))
-
-    for ip in range(0, npeaks):
-        plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
-        plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-    if saveLornFitLocal:
-        # save current figure as a PNG file
-        lorn_fit_dir = os.path.join(DATA_DIR, 'epsi_kidney_data', 'lorn_fit')
-    else:
-        lorn_fit_dir = os.path.join(DATA_DIR, 'shurik', 'lorn_fit')
-    if os.path.exists(lorn_fit_dir):
-        lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
-        try:
-            plt.savefig(lorn_fit_path)
-            print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
-        except Exception as e:
-            print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
-    else:
-        raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
-
-    # aux image to save plot figure as rgba image while using nd array to send the raw array
-    append_auximage(auximages, echo_number=a.head.idx.contrast)
-    # now do voxel fits
-    lornputpeakparams(centers, widths, phases, debuglorn)
-    metabolites = np.zeros((npeaks, numimages, npe, nro))
-    for ide in range(numimages):
-        # print('voxel fit img', ide, flush=True)
-        for j in range(npe):
-            for k in range(nro):
-                thisspect = img[ide,j,k,:]
-                scaling = np.max(np.abs(thisspect))
-                if(np.max(np.abs(thisspect)) < noise * 3):
-                    continue
-                thisspect /= scaling
-                lornputspect(xscale, thisspect, widths, 1.0, False)
-                x0 = np.zeros((npeaks + 2))
-                for ip in range(npeaks):
-                    x0[ip] = np.abs(thisspect[np.argmin(np.abs(xscale - centers[ip]))])
-                bounds = Bounds(np.concatenate((np.zeros((npeaks)), [-.1, -.1])), \
-                        np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
-                x1 = minimize(lor1fit, x0, bounds=bounds)
-                metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
-    # rotate by 90deg
-    metabolites = np.rot90(metabolites, k=1, axes=(2,3))
-    return([metabolites, auximages, ndarray_list])
-
-def generate_spectra(h: mrd.Header,
-                     measurementtimes_ns: float,
-                     peakamplitudes: np.ndarray,
-                     peakoffsets: np.ndarray,
-                     spectra):
-    # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
-    nspect = spectra.shape[0]
-    ntimepoints = spectra.shape[1]
-    measfreq = h.experimental_conditions.h1resonance_frequency_hz
-    for ispect in range(nspect):
-        # 'image' that is the measured spectrum at this time point
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.COMPLEX)
-        if(ispect == 0):
-            imghead.flags = mrd.ImageFlags.FIRST_IN_SET
-        elif(ispect == nspect - 1):
-            imghead.flags = mrd.ImageFlags.LAST_IN_SET
-        imghead.measurement_uid = ispect
-        imghead.repetition = ispect
-        imghead.acquisition_time_stamp_ns = measurementtimes_ns[ispect]
-        imghead.image_index = ispect
-        imghead.image_series_index = ispect
-        spect = mrd.Image(head=imghead, data=np.expand_dims(np.transpose(spectra[ispect, :]), (0, 1, 2, 3)))
-        yield(mrd.StreamItem.ImageComplexDouble(spect))
-        # 'image' quantifying the amplitudes for this time point
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.MAGNITUDE)
-        if(ispect == 0):
-            imghead.flags = mrd.ImageFlags.FIRST_IN_SET
-        elif(ispect == ntimepoints - 1):
-            imghead.flags = mrd.ImageFlags.LAST_IN_SET
-        imghead.measurement_uid = ispect
-        imghead.measurement_freq = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
-        imghead.measurement_freq_label = np.array(peaknames, dtype=np.dtype(np.object_))
-        imghead.repetition = ispect
-        imghead.acquisition_time_stamp_ns = measurementtimes_ns[ispect]
-        imghead.image_index = ispect
-        imghead.image_series_index = ispect
-        spect = mrd.Image(head=imghead, data=np.expand_dims(np.transpose(peakamplitudes[:, ispect]), (0, 1, 2, 3)))
-        yield(mrd.StreamItem.ImageDouble(spect))
-
-def spectra_recon(h: mrd.Header, 
-                  raw_acquisition_list: list, 
-                  sourcepeak: int, 
-                  metabolitelist: list, 
-                  biggestpeakidx: list,
-                  peakoffsets: np.ndarray,
-                  peaknames: list, 
-                  wigglefactor: float):
-    global P, y, t
-    global experiment_name
-
-    auximages = []
-    numspectra = len(raw_acquisition_list)
-    a = raw_acquisition_list[0]
-    sampletime = a.head.sample_time_ns / 1.0E+9
-    centerfreq = a.head.acquisition_center_frequency
-    sampletime = a.head.sample_time_ns / 1.0E+9
-    npts = len(a.data)
-    # kspace shape=(spectra, measurements)
-    kspace = np.zeros((numspectra, len(a.data)), dtype=np.complex64)
-    ia = 0
-    for ispect in range(kspace.shape[0]):
-        kspace[ispect, :] = raw_acquisition_list[ispect].data[:, 0]
-        for ipt in range(kspace.shape[1]):
-             tk = ipt * sampletime
-             kspace[ispect, ipt] *= np.exp(-tk * lb)
-    spectra = np.fft.fftshift(np.fft.fft(kspace, axis = (1)), axes = (1))
-    currmax = 0
-    for ispect in range(numspectra):
-        thismax = np.max(np.abs(spectra[ispect, :]))
-        if(thismax > currmax):
-            currmax = thismax
-            maxispect = ispect
-    # estimate noise level by looking at the last image in the series
-    noise = np.mean(np.abs(spectra[-1, :]))
-    maxspect = spectra[maxispect,:].copy()
-    maxpt = np.argmax(np.abs(maxspect))
-    BW = 1 / sampletime
-    # take points within 25 ppm of highest signal
-    lowpt = int(maxpt - 25E-6 / (BW / centerfreq) * npts)
-    hipt = int(maxpt + 25E-6 / (BW / centerfreq) * npts)
-    newBW = BW * (hipt - lowpt) / npts
-    spectra = spectra[:, lowpt:hipt]
-    # global spectrum across +-25ppm of highest peak
-    globalspect = np.zeros(hipt - lowpt, dtype=np.complex64)
-    xscale = np.array(range(len(globalspect))) / len(globalspect) * newBW / centerfreq * 1E+6
-    for ispect in range(numspectra):
-        if(np.max(np.abs(spectra[ispect, :])) > noise * 5):
-            globalspect += spectra[ispect, :]
-    globalspect /= np.max(np.abs(globalspect))
-    # estimate peak widths using the FWHM of the largest peak
-    maxpeakidx = np.argmax(np.abs(globalspect))
-    leftidx = -1
-    rightidx = -1
-    for isp in range(len(globalspect)):
-        if(np.abs(globalspect[(maxpeakidx - isp) % len(globalspect)]) < 0.5 and leftidx == -1):
-             leftidx = maxpeakidx - isp
-        if(np.abs(globalspect[(maxpeakidx + isp) % len(globalspect)]) < 0.5 and rightidx == -1):
-             rightidx = maxpeakidx + isp
-    widthguess = (rightidx - leftidx) * (xscale[1] - xscale[0]) / 4
-    lornputspect(xscale, globalspect, widthguess, wigglefactor, debuglorn)
-    # fit global spectrum to npeaks lorentzians.
-    x0 = np.zeros(((4 * len(peakoffsets)) + 2))
-    x1 = np.zeros((len(biggestpeakidx), len(x0)))
-    diff = np.zeros((len(biggestpeakidx)))
-    for icg in range(len(biggestpeakidx)):
-        centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
-                peakoffsets[biggestpeakidx[icg]])) % (BW / centerfreq * 1E+6)
-        for ip in range(len(peakoffsets)):
-             x0[3 * len(peakoffsets) + ip] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
-             x0[2 * len(peakoffsets) + ip] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
-        lornputpeakparams(centers, np.ones((len(peakoffsets))) * widthguess, x0[(2 * len(peakoffsets)):(3 * len(peakoffsets))], debuglorn)
-        # print('begin minimize', icg, flush=True)
-        x1[icg, :] = minimize(lornfit, x0).x
-        for ip in range(len(peakoffsets)):
-             if(x1[icg, 3 * len(peakoffsets) + ip] < 0):
-                 x1[icg, 3 * len(peakoffsets) + ip] *= -1
-                 x1[icg, 2 * len(peakoffsets) + ip] += np.pi
-        diff[icg] = np.sum(np.abs(globalspect - lorneval(x1[icg, :])))
-    centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
-                peakoffsets[biggestpeakidx[np.argmin(diff)]])) % (BW / centerfreq * 1E+6)
-    lornputpeakparams(centers, np.ones((len(peakoffsets))) * widthguess, x0[(2 * len(peakoffsets)):(3 * len(peakoffsets))], debuglorn)
-    thex1 = x1[np.argmin(diff)]
-    centers, widths, phases, amplitudes, baseline = lornunpackx0(thex1, debuglorn)
-    specteval = lorneval(thex1)
-    plt.clf()
-    plt.plot(xscale, np.real(globalspect), 'r')
-    plt.plot(xscale, np.imag(globalspect), 'g')
-    plt.plot(xscale, np.real(specteval), 'k')
-    plt.plot(xscale, np.imag(specteval), 'k')
-    for ip in range(0, len(peakoffsets)):
-        plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
-        plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-
-    # stream global spect as ndarray with xscale, bw, and globalspect array
-    ndarray_list = []
-    global_spect_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY],
-                                                array_type=mrd.ArrayType.USER_MAP,
-                                                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("global spect")],
-                                                                    "xscale": [mrd.ArrayMetaValue.Float64(xscale[i]) for i in range(len(xscale))],  # xscale as list of single entries
-                                                                    "BW": [mrd.ArrayMetaValue.Float64(newBW)]}))
-    ndarray_list.append(mrd.NdArray[np.complex64](head=global_spect_arr_header, data=globalspect))
-    # stream lorn fit as ndarray with xscale, bw, and specteval array
-    lorn_fit_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY],
-                                            array_type=mrd.ArrayType.USER_MAP,
-                                            meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("lorn fit")],
-                                                                "xscale": [mrd.ArrayMetaValue.Float64(xscale[i]) for i in range(len(xscale))],  # xscale as list of single entries
-                                                                "BW": [mrd.ArrayMetaValue.Float64(newBW)]}))
-    ndarray_list.append(mrd.NdArray[np.complex64](head=lorn_fit_arr_header, data=specteval))
-    # aux image to add plot figure as auximages list 
-    append_auximage(auximages, echo_number=a.head.idx.contrast)
-    # now do voxel fits
-    lornputpeakparams(centers, widths, phases, debuglorn)
-    peakamplitudes = np.zeros((len(peakoffsets), numspectra))
-    measurementtimes_ns = [a.head.acquisition_time_stamp_ns - \
-            raw_acquisition_list[0].head.acquisition_time_stamp_ns for a in raw_acquisition_list]
-    for ispect in range(numspectra):
-        # print('voxel fit img', ispect, flush=True)
-        thisspect = spectra[ispect,:]
-        scaling = np.max(np.abs(thisspect))
-        thisspect /= scaling
-        lornputspect(xscale, thisspect, widths, wigglefactor, False)
-        x0 = np.zeros((len(peakoffsets) + 2))
-        for ip in range(len(peakoffsets)):
-            x0[ip] = np.abs(thisspect[np.argmin(np.abs(xscale - centers[ip]))])
-        bounds = Bounds(np.concatenate((np.zeros((len(peakoffsets))), [-.1, -.1])), np.concatenate((x0[:len(peakoffsets)] * 1.5, [.1, .1])))
-        x1 = minimize(lor1fit, x0, bounds=bounds)
-        peakamplitudes[:, ispect] = x1.x[:len(peakoffsets)] * scaling
-    auc = np.sum(peakamplitudes, axis=(1))
-    auc /= max(auc)
-    auc *= 100
-    peakamplitudes /= np.max(peakamplitudes)
-    # now do model fit
-    legend = []
-    plt.clf()
-    colors=['r', 'b', 'g', 'c', 'k', 'r', 'b']
-    kAB_auc_data = {}
-    kAB_list = []
-    auc_list = []
-    t1_list = []
-    for ip in range(len(peakoffsets)):
-        P = peakamplitudes[sourcepeak, :]   # peak amp of injected sample
-        t = np.array(measurementtimes_ns) * 1.0E-9
-        y = peakamplitudes[ip, :]           # peak amp of each metabolite
-
-        if(ip in metabolitelist):
-            # x[0]=kAB, x[1]=1/T1, x[2]=initial amount of metabolite
-            if peaknames[ip] == 'lac' or peaknames[ip] == 'ala':
-                bounds = [(None, None), (1/24.5, 1/20), (None, None)]
-            else:
-                bounds = [(None, None), (1/100, 1), (None, None)]
-            x1 = minimize(kABfit, [.01, .03, 1], bounds=bounds).x
-            kAB_auc_data[peaknames[ip]] = {'kAB': x1[0],
-                                           '1/T1': 1/x1[1],
-                                           'AUC': auc[ip]}
-            # append parameters as ndarray metavalue header 
-            kAB_list.append(x1[0])
-            t1_list.append(1/x1[1])
-            auc_list.append(auc[ip])
-            # save values as text file
-            plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
-                    label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/T1inverse={:.2f}'.format(1/x1[1]) + \
-                    '/AUC={:.2f}'.format(auc[ip]))
-            # fitted line
-            plt.plot(np.array(measurementtimes_ns) * 1.0E-9, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
-            
+        # flag IS_NAVIGATION_DATA is a phantom acquisition
+        if ref_acq.head.flags & mrd.AcquisitionFlags.IS_NAVIGATION_DATA:
+            print(f"Phantom data found at repetition={ref_acq.head.idx.repetition}", file=sys.stderr)
+            yield mrd.NdArrayComplexDouble(
+                head=mrd.NdArrayHeader(
+                    dimension_labels=[mrd.ArrayDimension.Y, mrd.ArrayDimension.X, mrd.ArrayDimension.CONTRAST],
+                    array_type=mrd.ArrayType.PHANTOM
+                ),
+                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("urea phantoms")]}),
+                data=img
+            )
+        # store acquisition including last repetition with receiver bandwidth as meta value
         else:
-            kAB_auc_data[peaknames[ip]] = {'AUC': auc[ip]}
-            # append parameters as ndarray metavalue header 
-            kAB_list.append(np.nan)
-            t1_list.append(np.nan)
-            auc_list.append(auc[ip])
-            if(ip == sourcepeak):
-                plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'-', label=peaknames[ip] + \
-                    '/AUC={:.2f}'.format(auc[ip]))
-            else:
-                plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'--', label=peaknames[ip] + \
-                    '/AUC={:.2f}'.format(auc[ip]))
-    plt.legend(title='')
-    plt.xlabel('time (s)')
-    plt.yticks([])
-    # save kAB plot figure as rgba image while using nd array to send the raw array
-    append_auximage(auximages, echo_number=a.head.idx.contrast)
-
-    # stream sample points of time-course spectral
-    sample_points_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY, mrd.ArrayDimension.TIME],
-                                                array_type=mrd.ArrayType.USER_MAP,
-                                                meta=mrd.ArrayMeta({
-                                                    "description": [mrd.ArrayMetaValue.String("sample points of time-course spectral")],
-                                                    "time_axis": [mrd.ArrayMetaValue.Float64(t[i]) for i in range(len(t))],  # time_axis as list of single entries
-                                                    "peaknames": [mrd.ArrayMetaValue.String(peaknames[i]) for i in range(len(peaknames))]
-                                                }))
-    ndarray_list.append(mrd.NdArray[np.float64](head=sample_points_arr_header, data=y))
-    # stream fitted line with kAB, T1, and AUC parameters
-    kAB_fit_data_arr_header = mrd.NdArrayHeader(dimension_labels=[mrd.ArrayDimension.FREQUENCY, mrd.ArrayDimension.TIME],
-                                                array_type=mrd.ArrayType.USER_MAP,
-                                                meta=mrd.ArrayMeta({"description": [mrd.ArrayMetaValue.String("fitted line with kAB, T1, and AUC parameters")],
-                                                                    "kAB": [mrd.ArrayMetaValue.Float64(kAB_list[i]) for i in range(len(kAB_list))],  # kAB as list of single entries
-                                                                    "1/T1": [mrd.ArrayMetaValue.Float64(t1_list[i]) for i in range(len(t1_list))],  # 1/T1 as list of single entries
-                                                                    "AUC": [mrd.ArrayMetaValue.Float64(auc_list[i]) for i in range(len(auc_list))],  # AUC as list of single entries
-                                                                }))
-    ndarray_list.append(mrd.NdArray[np.float64](head=kAB_fit_data_arr_header, data=kABfiteval(x1)))
-
-    # save parameters as csv file
-    if kfitdata_local:
-        kfitdata_dir = os.path.join(DATA_DIR, 'kfitdata')
-    else:
-        kfitdata_dir = os.path.join(DATA_DIR, 'kfitdata')
+            dwell_time_ns = ref_acq.head.sample_time_ns / ref_acq.samples()
+            receiver_bandwidth = 1 / (dwell_time_ns / 1e+9)
+            yield mrd.NdArrayComplexDouble(
+                head=mrd.NdArrayHeader(
+                    dimension_labels=[mrd.ArrayDimension.Y, mrd.ArrayDimension.X, mrd.ArrayDimension.CONTRAST],
+                    image_type=mrd.ArrayImageType.COMPLEX,
+                    measurement_uid = ref_acq.head.measurement_uid,
+                    average = ref_acq.head.idx.average,
+                    repetition = ref_acq.head.idx.repetition,
+                    acquisition_time_stamp_ns = ref_acq.head.acquisition_time_stamp_ns,
+                ),
+                meta=mrd.ArrayMeta(
+                    {"receiver bandwidth(Hz)": [mrd.ArrayMetaValue.Float64(receiver_bandwidth)],
+                     "line broadening(Hz)": [mrd.ArrayMetaValue.Float64(line_broadening)]}),
+                data=img
+            )
+            # keep acquisition data in streamitem
+    # store item.data for each kspace shape
+    current_rep = -1
+    kspace = None
+    reference_acq = None
+    enc = head.encoding[0]
+    FIDPAD = 1
+    current_max = -np.inf
+    max_spect = None
     
-    if os.path.exists(kfitdata_dir):
-        import csv
-        try:
-            csv_filepath = os.path.join(kfitdata_dir, f'{experiment_name}_kAB.csv')
-            with open(csv_filepath, 'w', newline='') as f:
-                writer = csv.writer(f)
-                headers = [experiment_name]
-                for metabolite_name in kAB_auc_data.keys():
-                    headers.append(f'kAB_{metabolite_name}')
-                    headers.append(f'1/T1_{metabolite_name}')
-                    headers.append(f'AUC_{metabolite_name}')
-                writer.writerow(headers)
-                for metabolite_name, values in kAB_auc_data.items():
-                    if 'kAB' in values:
-                        writer.writerow([experiment_name, values['kAB'], values['1/T1'], values['AUC']])
-                    elif 'kAB' not in values and 'AUC' in values:
-                        writer.writerow([experiment_name, np.nan, np.nan, values['AUC']])
-                print(f"Saved kAB fit data at {csv_filepath}", file=sys.stderr)
-        except Exception as e:
-            print(f"Error saving kAB fit data: {e}", file=sys.stderr)
-    return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
-            peakamplitudes, auximages, ndarray_list)
+    if enc.encoding_limits.phase != None:
+        nviews = enc.encoding_limits.phase.maximum + 1
+    if enc.encoding_limits.repetition != None:
+        nreps = enc.encoding_limits.repetition.maximum + 1
 
-# Take single file as input and reconstruct output
-def reconstruct_mrs(input: Union[str, BinaryIO],
-                    output: Union[str, BinaryIO],
-                    sourcepeak: int,
-                    metabolitelist: list,
-                    biggestpeakidx: list,
-                    peakoffsets: np.ndarray,
-                    peaknames: list,
-                    wigglefactor: float):
-    global experiment_name
-    # convert mrd objects from list to mrd stream
-    def generate_stream(input: list):
-        for item in input:
-            if isinstance(item, mrd.Acquisition):
-                yield mrd.StreamItem.Acquisition(item)
-            elif isinstance(item, mrd.PulseqDefinitions):
-                yield mrd.StreamItem.PulseqDefinitions(item)
-            elif isinstance(item, mrd.Block):
-                yield mrd.StreamItem.Blocks(item)
-            elif isinstance(item, mrd.RFEvent):
-                yield mrd.StreamItem.Rf(item)
-            elif isinstance(item, mrd.ArbitraryGradient):
-                yield mrd.StreamItem.ArbitraryGradient(item)
-            elif isinstance(item, mrd.TrapezoidalGradient):
-                yield mrd.StreamItem.TrapezoidalGradient(item)
-            elif isinstance(item, mrd.ADCEvent):
-                yield mrd.StreamItem.Adc(item)
-            elif isinstance(item, mrd.Shape):
-                yield mrd.StreamItem.Shape(item)
-            elif isinstance(item, mrd.NdArray):
-                if item.data.dtype == np.float32:
-                    yield mrd.StreamItem.NdArrayFloat(item)
-                elif item.data.dtype == np.complex64:  # complexfloat32 is np.complex64 
-                    print(f"Streaming NdArrayComplexFloat with shape {item.data.shape, item.data.dtype}")
-                    yield mrd.StreamItem.NdArrayComplexFloat(item)
-            else:
-                pass
+    for acq in input:
+        nechoes = acq.head.idx.contrast
+        totalppswitch = round(acq.samples() / nechoes)
+        nsamples = totalppswitch - acq.head.discard_pre - acq.head.discard_post     # samples = (npts_per_echo + 2 * discard) * (contrast=nechoes)
+        # first acq of new repetition
+        if acq.head.idx.repetition != current_rep:
+            if kspace is not None and reference_acq is not None:
+                yield from kspace_to_ndarray(kspace, reference_acq)
+            kspace = np.zeros((nviews, nsamples, nechoes * FIDPAD), dtype='complex')
+            kspace_apodized = np.zeros((nviews, nsamples, nechoes * FIDPAD), dtype='complex')
+            reference_acq = acq
+            current_rep = acq.head.idx.repetition
+        # while idx.repetition=current_rep incrementally fill in kspace for each line
+        if kspace is not None:
+            view = acq.head.idx.kspace_encode_step_1 if acq.head.idx.kspace_encode_step_1 is not None else 0
+            kspace[view, :, :] = apply_line_broadening(acq, line_broadening)
+        # keep acquisition data in streamitem
+        yield mrd.StreamItem.Acquisition(acq)
+    if kspace is not None and reference_acq is not None:
+        yield from kspace_to_ndarray(kspace, reference_acq)
+        kspace = None
+        reference_acq = None
 
-    # read header, acquisition, pulseq field from MRS->mrd2 converted file
+
+
+def reconstruct_spectral():
+    pass
+
+def _ndarray_to_stream_item(arr: mrd.NdArray) -> mrd.StreamItem:
+    """Map NdArray payload to StreamItem; dtype selects union arm (not the generic alias)."""
+    dt = arr.data.dtype
+    if dt == np.uint16:
+        return mrd.StreamItem.NdArrayUint16(arr)
+    if dt == np.int16:
+        return mrd.StreamItem.NdArrayInt16(arr)
+    if dt == np.uint32:
+        return mrd.StreamItem.NdArrayUint32(arr)
+    if dt == np.int32:
+        return mrd.StreamItem.NdArrayInt32(arr)
+    if dt == np.float32:
+        return mrd.StreamItem.NdArrayFloat(arr)
+    if dt == np.float64:
+        return mrd.StreamItem.NdArrayDouble(arr)
+    if dt == np.complex64:
+        return mrd.StreamItem.NdArrayComplexFloat(arr)
+    if dt == np.complex128:
+        return mrd.StreamItem.NdArrayComplexDouble(arr)
+    raise TypeError(f"Unsupported NdArray dtype for stream: {dt}")
+
+
+# convert iterable mrd objects to mrd stream
+def generate_stream(input: Iterable[Any]) -> Iterable[mrd.StreamItem]:
+    for item in input:
+        if isinstance(item, mrd.Acquisition):
+            yield mrd.StreamItem.Acquisition(item)
+        elif isinstance(item, mrd.NdArray):
+            yield _ndarray_to_stream_item(item)
+        else:
+            continue
+
+def acquisition_reader(input: Iterable[mrd.StreamItem]) -> Iterable[mrd.Acquisition]:
+    """
+    Generator to yield acquisition as iterable
+    Assign NOISE_MEASUREMENT flag to avg > 1 as phantom data
+    """
+    for item in input:
+        if not isinstance(item, mrd.StreamItem.Acquisition):
+            continue
+        # to ignore phantom acquisition with navg>1, uncomment below
+        # if item.value.head.flags & mrd.AcqusitionFlags.IS_NAVIGATION_DATA:
+        #     continue
+        yield item.value
+
+def append_header(header: mrd.Header, line_broadening: float):
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDouble(name="line_broadening_factor", value=line_broadening)
+    )
+    return header
+
+def reconstruct_mrs(input: BinaryIO, output: BinaryIO, line_broadening: float):
     with mrd.BinaryMrdReader(input) as reader:
         with mrd.BinaryMrdWriter(output) as writer:
-            # write the same header from input mrd file
-            raw_header = reader.read_header()
-            writer.write_header(raw_header)
-            # read stream data as list which takes up memory as it converts all objects into list
-            raw_streamables_list = list(reader.read_data())
-            raw_acquisition_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Acquisition]
-            raw_acquisition_list.sort(key = lambda x: x.head.acquisition_time_stamp_ns)
-            raw_pulseq_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.PulseqDefinitions]
-            raw_blocks_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Block]
-            raw_rf_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.RFEvent]
-            raw_arbitrary_gradient_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.ArbitraryGradient]
-            raw_trapezoidal_gradient_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.TrapezoidalGradient]
-            raw_adc_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.ADCEvent]
-            raw_shape_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Shape]
-
-            # write_data can be called multiple times whereas read-data is once
-            writer.write_data(generate_stream(raw_acquisition_list))
-            writer.write_data(generate_stream(raw_pulseq_list))
-            writer.write_data(generate_stream(raw_blocks_list))
-            writer.write_data(generate_stream(raw_rf_list))
-            writer.write_data(generate_stream(raw_arbitrary_gradient_list))
-            writer.write_data(generate_stream(raw_trapezoidal_gradient_list))
-            writer.write_data(generate_stream(raw_adc_list))
-            writer.write_data(generate_stream(raw_shape_list))
-
-            #############
-            # update later to iterate over StreamItem not converted into list
-            if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
-                experiment_name = str(Path(input).parents[0].name)
-                [metabolites, auximages, ndarray_list] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
-                # epsi ndarray=lorn fit with original sample
-                writer.write_data(generate_stream(ndarray_list))
-                # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-                if saveMetaboliteLocal:
-                    npy_dir = os.path.join(DATA_DIR, 'epsi_kidney_data', 'processed_npyfiles')
-                else:
-                    npy_dir = os.path.join(DATA_DIR, 'shurik', 'processed_npyfiles')
-                if os.path.exists(npy_dir):
-                    try:
-                        npy_filepath = os.path.join(npy_dir, f'{experiment_name}_metabolites.npy')
-                        np.save(npy_filepath, metabolites)
-                        print(f"Saving metabolites npy file at {npy_filepath}")
-                    except Exception as e:
-                        print(f"Error saving metabolites npy file: {e}", file=sys.stderr)
-                else:
-                    raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
-                writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
-            elif(raw_header.measurement_information.sequence_name.find('1pul') > -1):
-                [measurementtimes_ns, spectra, peakfrequencies, peakamplitudes, auximages, ndarray_list] = spectra_recon(
-                    h=raw_header,
-                    raw_acquisition_list=raw_acquisition_list,
-                    sourcepeak=sourcepeak,
-                    metabolitelist=metabolitelist,
-                    biggestpeakidx=biggestpeakidx,
-                    peakoffsets=peakoffsets,
-                    peaknames=peaknames,
-                    wigglefactor=wigglefactor)
-                writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakamplitudes, peakoffsets, spectra))
-                writer.write_data(generate_stream(ndarray_list))
-            if(len(auximages) > 0):
-                writer.write_data(generate_aux_images(auximages))
+            header = reader.read_header()
+            append_header(header, line_broadening)
+            writer.write_header(header)
+            writer.write_data(
+                generate_stream(
+                    reconstruct_epsi(header,
+                        acquisition_reader(reader.read_data())
+                    )
+                )
+            )
 
 if __name__ == "__main__":
-    # read command line arguments
-    wigglefactor = 1.0
-    peakoffsets = []
-    peaknames = []
-    biggestpeaklist = []
-    metabolitelist = []
-    targetfiletype = ''
-    sourcepeak = 0
-    get_npy = True
-    for iarg in range(len(sys.argv) - 1):
-        try:
-            floatarg = float(sys.argv[iarg + 1])
-        except:
-            floatarg = np.nan
-        if(sys.argv[iarg] == '-f'):
-            basedir = sys.argv[iarg + 1]
-            # print('setting base dir to', basedir, file=sys.stderr)
-            continue
-        if(sys.argv[iarg] == '-w' and not np.isnan(floatarg)):
-            wigglefactor = floatarg
-            # print('setting wiggle factor to', wigglefactor)
-            continue
-        if(sys.argv[iarg] == '-n'):
-            targetfiletype = sys.argv[iarg + 1]
-            # print('setting target file type to', targetfiletype)
-            continue
-        modifiers = '__'
-        if('_' in sys.argv[iarg]):
-            # a peak name string with modifiers
-            modifiers = sys.argv[iarg][(sys.argv[iarg].find('_')):]
-            sys.argv[iarg] = sys.argv[iarg][:sys.argv[iarg].find('_')]
-        if(sys.argv[iarg][0] == '-' and not np.isnan(floatarg)):
-            if('s' in modifiers):
-                sourcepeak = len(peaknames)
-            if(not 't' in modifiers):
-                biggestpeaklist.append(len(peaknames))
-            if('m' in modifiers):
-                metabolitelist.append(len(peaknames))
-            peaknames.append(sys.argv[iarg][1:])
-            peakoffsets.append(floatarg)
-    # run all mrd2 files in the directory for local run
-    if basedir != '.':
-        fnames = findmrd2files(basedir, targetfiletype)
-        for i, f in enumerate(fnames):
-            experiment_name = Path(f).parent.name
-            output_path = f.replace('raw.mrd2', experiment_name + '_recon.mrd2')
-            print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {output_path}', file=sys.stderr, flush=True)
-            reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
-    else:
-        reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
+    parser = argparse.ArgumentParser(description="Reconstruct MRS data from mrd2 file")
+    parser.add_argument("-f", "--folder", type=Path, required=False, help="Folder with mrs raw.mrd2 file")
+    parser.add_argument("-i", "--input", type=Path, required=False, help="Input mrd2 file")
+    parser.add_argument("-o", "--output", type=Path, required=False, help="Output mrd2 file")
+    parser.add_argument("-lb", "--line-broadening", type=float, default=42, required=False, help="Line broadening factor in Hz")
+    args = parser.parse_args()
 
-# now look for specification of metabolite peaks
-# BA's cirrhrat is -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
-# SZ's mouse kidney is -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -poop_tm 15.9 -hyd_tm 18.1 -lac_m 21.8
-# BA's spectra is -bic_tm -0.4 -urea 2.1 -urea2_t 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8 -w 0.5
-# DT's spectra is -urea 0.0 -KIC_s 8.6 -leu_tm 13.0 -hyd_tm 18.1 -?_tm 21.8 -w 1.
+    if args.folder and args.input:
+        raise ValueError("Cannot specify both --folder and --input")
+    elif args.folder:
+        if not args.folder.is_dir():
+            raise ValueError(f"{args.folder} is not a directory")
+        else:
+            # search for raw.mrd2 or targetfilename and turn into a list
+            mrd2_filepaths: List[Path] = []
+            for root, dirnames, filenames in os.walk(args.folder):
+                if "raw.mrd2" in filenames:
+                    mrd2_filepaths.append(Path(os.path.join(root, "raw.mrd2")))
+            if len(mrd2_filepaths) > 0:
+                # for raw filepath, run reconstruct with parameters from cmd line arguments
+                for i, input_filepath in enumerate(mrd2_filepaths):
+                    recon_filepath = input_filepath.with_name(input_filepath.parent.name + "_recon.mrd2")
+                    print(f"Reconstructing {i+1}/{len(mrd2_filepaths)} at: {recon_filepath}", file=sys.stderr)
+                    input = open(input_filepath, "rb")
+                    output = open(recon_filepath, "wb")
+                reconstruct_mrs(input, output, args.line_broadening)
+            else:
+                raise ValueError(f"No mrd2 files found in {args.folder}")
+    elif args.input:
+        if not args.input.is_file():
+            raise ValueError(f"{args.input} is not a file")
+        if not args.output.is_file():
+            raise ValueError(f"{args.output} is not a file")
+        input = open(args.input, "rb")
+        output = open(args.output, "wb")
+        reconstruct_mrs(input, output, args.line_broadening)
+    else:
+        raise ValueError("Either --folder or --input must be specified")

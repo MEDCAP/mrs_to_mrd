@@ -93,6 +93,7 @@ def lorneval(x0):
 
     for j in range(len(c)):
         y += A[j] * np.exp(1j * ph[j]) / (1 + 1j * (xscale - c[j]) / w[j])
+        # add the negative and positive BW to acount for wrap-around
         y += A[j] * np.exp(1j * ph[j]) / (1 + 1j * (xscale - c[j] - BW) / w[j])
         y += A[j] * np.exp(1j * ph[j]) / (1 + 1j * (xscale - c[j] + BW) / w[j])
 
