@@ -15,7 +15,7 @@ import mrd
 # from watchdog.events import FileSystemEventHandler
 from scipy.ndimage import zoom
 
-def plot_mrd(input: BinaryIO, phantom: BinaryIO):
+def plot_mrd(input: BinaryIO):
     current_streamables_list = []
     current_acquisition_list = []
     current_image_list = []
@@ -53,8 +53,8 @@ def plot_mrd(input: BinaryIO, phantom: BinaryIO):
             nimg += 1
             metshape = np.shape(i.data)[-3:] + (nimg,)  # metshape=(y, x, frequency, rep)
 
-    for i in current_phantom_list:
-        phantom_data = i.data[0, 0, :, :, 0]    # phantom_data shape=(y, x, frequency=0)
+#    for i in current_phantom_list:
+#        phantom_data = i.data[0, 0, :, :, 0]    # phantom_data shape=(y, x, frequency=0)
 
 
     zf = 2
@@ -64,7 +64,7 @@ def plot_mrd(input: BinaryIO, phantom: BinaryIO):
         [height, width, nmet, nimg] = metshape
         print('h-w-met-img', metshape)
         plotfig = np.zeros((height * nmet * zf, width * nimg * zf))
-        phantomplotfig = np.zeros_like(plotfig)
+#        phantomplotfig = np.zeros_like(plotfig)
         iimg = 0
         for i in current_image_list:
             if(i.head.image_type == mrd.ImageType.COMPLEX):
@@ -72,7 +72,7 @@ def plot_mrd(input: BinaryIO, phantom: BinaryIO):
             # put this image's data into the global metabolite array (for plotting and saving)
             met[: ,: ,:, iimg] = i.data[0, 0, ...]
             for imet in range(metshape[2]):
-                normalized_met[:, :, imet, iimg] = i.data[0, 0, :, :, imet] / zoom(phantom_data, 2/3)
+                normalized_met[:, :, imet, iimg] = i.data[0, 0, :, :, imet]# / zoom(phantom_data, 2/3)
             iimg += 1
         for imet in range(nmet):
             # find maximum (positive or negative) for scaling 
@@ -84,11 +84,13 @@ def plot_mrd(input: BinaryIO, phantom: BinaryIO):
                         width * zf)] = zoom(thisimg, zf, order=2) / themax
                 plotfig[imet * height * zf, :] = 1
 
-                phantomplotfig[(imet * height * zf):((imet + 1) * height * zf), (iimg * width * zf):((iimg + 1) * \
-                        width * zf)] = zoom(thisimg, zf, order=2) / phmax
-                phantomplotfig[imet * height * zf, :] = 1e-16*8
+#                phantomplotfig[(imet * height * zf):((imet + 1) * height * zf), (iimg * width * zf):((iimg + 1) * \
+#                        width * zf)] = zoom(thisimg, zf, order=2) / phmax
+#                phantomplotfig[imet * height * zf, :] = 1e-16*8
 
-    return plotfig, phantomplotfig, phantom_data
+    plt.imshow(plotfig)
+    plt.show()
+    return plotfig
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Plot MRD file contents')
@@ -104,17 +106,17 @@ if __name__ == "__main__":
         phantom = open(str(args.phantom), 'rb')
     else:
         phantom = ""
-    ratdata, normalized_data, phantom_data = plot_mrd(input, phantom)
+    ratdata = plot_mrd(input)
     plt.figure(1, figsize=(3, 10))
     plt.imshow(ratdata, cmap='gray')
     plt.title(f'Filename: {args.input.name} data rows=bic, urea, pyr, ala, hyd, lac')
     plt.colorbar(fraction=0.03, pad=0.02, shrink=0.6)
-    plt.figure(2, figsize=(3, 10))
-    plt.imshow(normalized_data, cmap='gray')
-    plt.title(f'Filename: {args.input.name} normalized by phantom rows=bic, urea, pyr, ala, hyd, lac')
-    plt.colorbar(fraction=0.03, pad=0.02, shrink=0.6)
-    plt.figure(3, figsize=(8, 10))
-    plt.imshow(phantom_data, cmap='gray')
-    plt.title(f'Phantom data')
-    plt.colorbar(fraction=0.03, pad=0.02, shrink=0.6)
+    #plt.figure(2, figsize=(3, 10))
+    #plt.imshow(normalized_data, cmap='gray')
+    #plt.title(f'Filename: {args.input.name} normalized by phantom rows=bic, urea, pyr, ala, hyd, lac')
+    #plt.colorbar(fraction=0.03, pad=0.02, shrink=0.6)
+    #plt.figure(3, figsize=(8, 10))
+    #plt.imshow(phantom_data, cmap='gray')
+    #plt.title(f'Phantom data')
+    #plt.colorbar(fraction=0.03, pad=0.02, shrink=0.6)
     plt.show()
