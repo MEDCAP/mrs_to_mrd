@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import BinaryIO, Union
 import argparse
 import re
+from acqtypes import AcqType
 
 # path to mrd python package is 'root/mrd-fork/python' 
 sys.path.insert(0, 'mrd-fork/python')
@@ -128,115 +129,142 @@ def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.
         img = mrd.Image(head=imghead, data=imgdata)
         yield(mrd.StreamItem.ImageDouble(img))
 
-def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: np.ndarray):#
+def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: np.ndarray):
     global experiment_name
     auximages = []
     numimages = sum([a.head.flags & mrd.AcquisitionFlags.LAST_IN_PHASE == \
             mrd.AcquisitionFlags.LAST_IN_PHASE for a in raw_acquisition_list])
-    a = raw_acquisition_list[0]
-    sampletime = a.head.sample_time_ns / 1.0E+9
-    centerfreq = a.head.acquisition_center_frequency
-    totalppswitch = int(a.data.shape[0] / a.head.idx.contrast + 0.1)
-    nro = totalppswitch - a.head.discard_pre - a.head.discard_post
-    npe = int(len(raw_acquisition_list) / numimages + 0.1)
-    kspace = np.zeros((numimages, npe, nro, a.head.idx.contrast * fidpad), dtype = 'complex')
     ia = 0
-    for iimg in range(kspace.shape[0]):
-        for ipe in range(kspace.shape[1]):
+    kspaces = []
+    phantom_kspaces = []
+    for iimg in range(numimages):
+        # check to see if kspace has the right dimensions for this image
+        sampletime = raw_acquisition_list[ia].head.sample_time_ns / 1.0E+9
+        centerfreq = raw_acquisition_list[ia].head.acquisition_center_frequency
+        totalppswitch = int(raw_acquisition_list[ia].data.shape[0] / raw_acquisition_list[ia].head.idx.contrast + 0.1)
+        nro = totalppswitch - raw_acquisition_list[ia].head.discard_pre - raw_acquisition_list[ia].head.discard_post
+        necho = raw_acquisition_list[ia].head.idx.contrast
+        for iap in range(ia + 1, len(raw_acquisition_list)):
+            if(raw_acquisition_list[iap].head.flags & \
+                    mrd.AcquisitionFlags.LAST_IN_PHASE == mrd.AcquisitionFlags.LAST_IN_PHASE):
+                break
+        npe = iap - ia + 1
+        kspace = np.zeros((npe, nro, necho * fidpad), dtype = 'complex')
+        if(AcqType(raw_acquisition_list[ia].head.user_int[0]) == AcqType.MRS_EPSI_PHANTOM):
+            phantom_kspaces.append(kspace)
+        elif(AcqType(raw_acquisition_list[ia].head.user_int[0]) == AcqType.MRS_EPSI):
+            kspaces.append(kspace)
+        for ipe in range(npe):
             a = raw_acquisition_list[ia]
             for iecho in range(a.head.idx.contrast):
                 # line broadening
                 tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
-                kspace[iimg, ipe, :, iecho] = a.data[(iecho * totalppswitch + \
-                    a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[2]), 0] * \
+                kspace[ipe, :, iecho] = a.data[(iecho * totalppswitch + \
+                    a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[1]), 0] * \
                     np.exp(-tk * lb)
             ia += 1
     print(f'Performing fft', file=sys.stderr)
-    img = np.fft.fftshift(np.fft.fftn(kspace, axes = (1, 2, 3)), axes = (1, 2, 3))
-    # print('finding biggest voxel')
-    currmax = 0
-    for ide in range(numimages):
-        for j in range(npe):
-            for k in range(nro):
-                thismax = np.max(np.abs(img[ide, j, k, :]))
-                if(thismax > currmax):
-                    currmax = thismax
-                    maxj = j
-                    maxk = k
-                    maxide = ide
-    # estimate noise level by looking at the last image in the series
-    noise = np.mean(np.abs(img[-1, :, :, :]))
-    # print('noise =', noise)
-    maxspect = img[maxide,maxj,maxk,:].copy()
-    globalspect = np.zeros((a.head.idx.contrast * fidpad), dtype = 'complex')
-    for ide in range(numimages):
-        # go through all the voxels and minimize the phase difference
-        for j in range(npe):
-            for k in range(nro):
-                thisspect = img[ide, j, k, :]
-                # discard spectral data signal less than 3XNoise
-                if(np.max(np.abs(thisspect)) < noise * 3):
-                    continue
-                bestoverlap = 0
-                for r in range(-15,16):
-                    thisrollspect = np.roll(thisspect,r)    # array flatten before shifting and then shape restored
-                    S0 = np.sum(np.real(thisrollspect * np.conj(maxspect)))
-                    Spi2 = np.sum(np.real(thisrollspect * 1j * np.conj(maxspect)))
-                    overlap = S0**2 + Spi2**2
-                    if(overlap > bestoverlap):
-                        bestr = r
-                        bestoverlap = overlap
-                        th0 = np.pi / 2 - np.arctan2(S0, Spi2)
-                img[ide,j,k,:] = np.roll(img[ide,j,k,:], bestr) * np.exp(1j * th0)
-                if(debugphasing):
-                    plt.clf()
-                    plt.plot(np.real(img[ide,j,k,:]))
-                    plt.plot(np.real(maxspect))
-                    # number of acq pts = fidpad * acq pts
-                    plt.plot([0, a.head.idx.contrast * fidpad], [100*bestr, 100*bestr], 'k')
-                    plt.draw()
-                    plt.pause(.1)
-                if(ide > 1):
-                    globalspect += img[ide, j, k, :]
-    if savePhasedEPSILocal:
-        epsi_images_dir = f"/Users/kento/dev/data/cirrhrat_data/{experiment_name}"
-    else:
-        epsi_images_dir = "C:/Users/MRS/Desktop/shurik/phased_epsi_npyfiles"
-    if os.path.exists(epsi_images_dir):
-        try:
-            epsi_images_path = os.path.join(epsi_images_dir, f'{experiment_name}_epsi.npy')
-            np.save(epsi_images_path, img)
-            print(f"Saving epsi images npy files at: {epsi_images_path}", file=sys.stderr)
-        except Exception as e:
-            print(f"Error saving epsi images npy files: {e}", file=sys.stderr)
-    else:
-        raise FileNotFoundError(f"Directory {epsi_images_dir} does not exist.")
-    BW = 1 / sampletime / totalppswitch
-    xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
-    globalspect /= np.max(np.abs(globalspect))
-    # estimate peak widths using the FWHM of the largest peak
-    maxpeakidx = np.argmax(np.abs(globalspect))
-    leftidx = -1
-    rightidx = -1
-    for isp in range(len(globalspect)):
-        if(np.abs(globalspect[(maxpeakidx - isp) % len(globalspect)]) < 0.5 and leftidx == -1):
-            leftidx = -isp
-        if(np.abs(globalspect[(maxpeakidx + isp) % len(globalspect)]) < 0.5 and rightidx == -1):
-            rightidx = isp
-    widthguess = (rightidx - leftidx) * (xscale[1] - xscale[0]) / 2
-    lornputspect(xscale, globalspect, widthguess, 1.0, debuglorn)
-    # fit global spectrum to 6 lorentzians. Biggest peak has got to be either pyruvate or urea. 
+    imgs = []
+    phantom_imgsets = []
+    for kspace in phantom_kspaces:
+        img = np.zeros(([1] + list(kspace.shape)), dtype = 'complex')
+        img[0, :] = np.fft.fftshift(np.fft.fftn(kspace))
+        phantom_imgsets = phantom_imgsets + [img]
+    hpimgset = np.zeros(([len(kspaces)] + list(kspaces[0].shape)), dtype = 'complex')
+    for iimg in range(len(kspaces)):
+        hpimgset[iimg, :] = np.fft.fftshift(np.fft.fftn(kspaces[iimg]))
+    allimgsets = phantom_imgsets + [hpimgset]
+    phantomscaling = 0
+    for imgset in allimgsets:
+        print('finding biggest voxel')
+        currmax = 0
+        for ide in range(imgset.shape[0]):
+            for j in range(imgset.shape[1]):
+                for k in range(imgset.shape[2]):
+                    thismax = np.max(np.abs(imgset[ide, j, k, :]))
+                    if(thismax > currmax):
+                        currmax = thismax
+                        maxj = j
+                        maxk = k
+                        maxide = ide
+        isphantom = any(x is imgset for x in phantom_imgsets)
+        noise = 0.0
+        if(not isphantom):
+            # estimate noise level by looking at the last image in the series
+            noise = np.mean(np.abs(imgset[-1, :, :, :]))
+        maxspect = imgset[maxide,maxj,maxk,:].copy()
+        globalspect = np.zeros((imgset[0].shape[2]), dtype = 'complex')
+        for ide in range(imgset.shape[0]):
+            # go through all the voxels and minimize the phase difference
+            for j in range(imgset.shape[1]):
+                for k in range(imgset.shape[2]):
+                    thisspect = imgset[ide, j, k, :]
+                    # discard spectral data signal less than 3XNoise
+                    if((not isphantom) and (np.max(np.abs(thisspect)) < noise * 3)):
+                        continue
+                    bestoverlap = 0
+                    for r in range(-15,16):
+                        thisrollspect = np.roll(thisspect,r)    # array flatten before shifting and then shape restored
+                        S0 = np.sum(np.real(thisrollspect * np.conj(maxspect)))
+                        Spi2 = np.sum(np.real(thisrollspect * 1j * np.conj(maxspect)))
+                        overlap = S0**2 + Spi2**2
+                        if(overlap > bestoverlap):
+                            bestr = r
+                            bestoverlap = overlap
+                            th0 = np.pi / 2 - np.arctan2(S0, Spi2)
+                    imgset[ide,j,k,:] = np.roll(imgset[ide,j,k,:], bestr) * np.exp(1j * th0)
+                    globalspect += imgset[ide, j, k, :]
+        BW = 1 / sampletime / totalppswitch
+        xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
+        globalspectscaling = np.max(np.abs(globalspect))
+        globalspect /= globalspectscaling
+        # estimate peak widths using the FWHM of the largest peak
+        maxpeakidx = np.argmax(np.abs(globalspect))
+        leftidx = -1
+        rightidx = -1
+        for isp in range(len(globalspect)):
+            if(np.abs(globalspect[(maxpeakidx - isp) % len(globalspect)]) < 0.5 and leftidx == -1):
+                leftidx = -isp
+            if(np.abs(globalspect[(maxpeakidx + isp) % len(globalspect)]) < 0.5 and rightidx == -1):
+                rightidx = isp
+        widthguess = (rightidx - leftidx) * (xscale[1] - xscale[0]) / 2
+        lornputspect(xscale, globalspect, widthguess, 1.0, debuglorn)
+        if(isphantom):
+            # fit to one peak for a phantom
+            x0 = np.zeros((6))
+            centers = [xscale[np.argmax(np.abs(globalspect))]]
+            x0[3] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[0]))])
+            x0[2] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[0]))])
+            lornputpeakparams(centers, np.ones((1)) * widthguess, x0[2:3], debuglorn)
+            x1 = minimize(lornfit, x0).x
+            c, w, ph, A, b = lornunpackx0(x1, False)
+            thisphantomscaling = A[0] * w[0] * globalspectscaling
+            phantomscaling = phantomscaling + thisphantomscaling / len(phantom_imgsets)
+            plt.clf()
+            plt.plot(xscale, np.real(globalspect), 'r')
+            plt.plot(xscale, np.imag(globalspect), 'g')
+            plt.plot(xscale, np.real(lorneval(x1)), 'k')
+            plt.plot(xscale, np.imag(lorneval(x1)), 'k')
+            plt.plot(xscale, np.abs(globalspect), 'c')
+            plt.text(xscale[10], .9, f'phantom scaling {thisphantomscaling:6.3f}')
+            plt.show()
+        else:
+            hpglobalspect = globalspect.copy()
+    if(phantomscaling == 0):
+        phantomscaling = 1
+    print('phantom scaling = ', phantomscaling)
+    # fit global spectrum to npeaks lorentzians. Biggest peak has got to be either pyruvate or urea. 
     # Maybe some day this will fail if it's lactate
     npeaks = len(peakoffsets)
     x0 = np.zeros(((4 * npeaks) + 2))
     x1 = np.zeros((len(biggestpeaklist), len(x0)))
     diff = np.zeros((len(biggestpeaklist)))
     for icg in range(len(biggestpeaklist)):
-        centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
+        centers = (xscale[np.argmax(np.abs(hpglobalspect))] - (peakoffsets - \
                 peakoffsets[biggestpeaklist[icg]])) % (BW / centerfreq * 1E+6)
         for ip in range(npeaks):
-            x0[3 * npeaks + ip] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
-            x0[2 * npeaks + ip] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
+            x0[3 * npeaks + ip] = np.abs(hpglobalspect[np.argmin(np.abs(xscale - centers[ip]))])
+            x0[2 * npeaks + ip] = np.angle(hpglobalspect[np.argmin(np.abs(xscale - centers[ip]))])
         lornputpeakparams(centers, np.ones((npeaks)) * widthguess, x0[(2 * npeaks):(3 * npeaks)], debuglorn)
         # print('begin minimize', icg, flush=True)
         x1[icg, :] = minimize(lornfit, x0).x
@@ -244,27 +272,21 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
             if(x1[icg, 3 * npeaks + ip] < 0):
                 x1[icg, 3 * npeaks + ip] *= -1
                 x1[icg, 2 * npeaks + ip] += np.pi
-        diff[icg] = np.sum(np.abs(globalspect - lorneval(x1[icg, :])))
-#        plt.plot(xscale, np.real(globalspect), 'r')
-#        plt.plot(xscale, np.imag(globalspect), 'g')
-#        plt.plot(xscale, np.real(lorneval(x1[icg, :])), 'k')
-#        plt.plot(xscale, np.imag(lorneval(x1[icg, :])), 'k')
-#        plt.draw()
-#        plt.pause(.1)
-        # print("icg ", icg, "diff = ", diff[icg], flush=True)
-    centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
+        diff[icg] = np.sum(np.abs(hpglobalspect - lorneval(x1[icg, :])))
+    centers = (xscale[np.argmax(np.abs(hpglobalspect))] - (peakoffsets - \
             peakoffsets[biggestpeaklist[np.argmin(diff)]])) % (BW / centerfreq * 1E+6)
     lornputpeakparams(centers, np.ones((npeaks)) * widthguess, x0[(2 * npeaks):(3 * npeaks)], debuglorn)
     centers, widths, phases, amplitudes, baseline = lornunpackx0(x1[np.argmin(diff)], debuglorn)
     specteval = lorneval(x1[np.argmin(diff)])
     plt.clf()
-    plt.plot(xscale, np.real(globalspect), 'r')
-    plt.plot(xscale, np.imag(globalspect), 'g')
+    plt.plot(xscale, np.real(hpglobalspect), 'r')
+    plt.plot(xscale, np.imag(hpglobalspect), 'g')
     plt.plot(xscale, np.real(specteval), 'k')
     plt.plot(xscale, np.imag(specteval), 'k')
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
+    plt.plot()
     # if saveLornFitLocal:
     #     # save current figure as a PNG file
     #     lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
@@ -285,11 +307,11 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     lornputpeakparams(centers, widths, phases, debuglorn)
     metabolites = np.zeros((npeaks, numimages, npe, nro))
     # shorten the list for quick debugging
-    for ide in range(numimages):
+    for ide in range(hpimgset.shape[0]):
         # print('voxel fit img', ide, flush=True)
-        for j in range(npe):
-            for k in range(nro):
-                thisspect = img[ide,j,k,:]
+        for j in range(hpimgset.shape[1]):
+            for k in range(hpimgset.shape[2]):
+                thisspect = hpimgset[ide,j,k,:]
                 scaling = np.max(np.abs(thisspect))
                 if(np.max(np.abs(thisspect)) < noise * 3):
                     continue
@@ -301,7 +323,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                 bounds = Bounds(np.concatenate((np.zeros((npeaks)), [-.1, -.1])), \
                         np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
                 x1 = minimize(lor1fit, x0, bounds=bounds)
-                metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
+                metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling / phantomscaling
     # # rotate by 90deg
     # metabolites = np.rot90(metabolites, k=1, axes=(2,3))
     return([metabolites, auximages])

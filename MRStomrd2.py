@@ -7,6 +7,7 @@ import sys
 import os
 import argparse
 from statistics import mode
+from acqtypes import AcqType
 
 # mrd python package
 # https://github.com/MEDCAP/mrd-fork/tree/dev# is added at root of this repository as a git submodule
@@ -17,14 +18,14 @@ from MRSreader import MRSdata
 
 mrs = MRSdata()
 
-def generate_acquisition(g, ide):
+def generate_acquisition(g, ide, acqtype):
     # make the pulse, gradient, and (raw data) acquisitions. g is the MRSdata structure read in from an individual
     # file, and ide is the index of this file in the image series
     npts = g.rawdata.shape[0] # number of points per acquisition
     pulse_len = 100E-6        # guess 100us, I don't know what it is
     pulsedt = 10.0E-6         # specify pulse in steps of 10us
     TE = 180E-6               # just an estimate for now, start acquiring 180us after beginning of 100us pulse
-    if(g.pplfile.find('epsi') >= 0):
+    if(acqtype == AcqType.MRS_EPSI_PHANTOM or acqtype == AcqType.MRS_EPSI):
         nPE = g.rawdata.shape[1]  # number of acquisitions per image file (phase-encodes)
         for iacq in range(nPE):
             # pulse and gradients specified based on original format
@@ -49,6 +50,7 @@ def generate_acquisition(g, ide):
             yield mrd.StreamItem.Gradient(gr)
             # make the acquisition
             a = mrd.Acquisition()
+            a.head.user_int = np.array([acqtype.value]).astype(np.int32)
             if(iacq == 0):
                 a.head.flags = mrd.AcquisitionFlags.FIRST_IN_PHASE
             if(iacq == g.rawdata.shape[1] - 1):
@@ -64,7 +66,7 @@ def generate_acquisition(g, ide):
             a.head.sample_time_ns = g.sampleperiod * 100  # convert to ns (sampleperiod is in units of 100ns)
             a.phase = np.zeros((g.rawdata.shape[0]), dtype=np.float32)
             yield mrd.StreamItem.Acquisition(a)
-    elif(g.pplfile.find('1pul') >= 0):
+    elif(acqtype == AcqType.MRS_FID.value):
         nrep = g.rawdata.shape[5]  # number of acquisitions per image file (phase-encodes)
         for iacq in range(nrep):
             # make the pulse
@@ -85,6 +87,7 @@ def generate_acquisition(g, ide):
             # make the acquisition
             a = mrd.Acquisition()
             a.data = np.transpose(np.expand_dims(g.rawdata[:, 0, 0, 0, 0, iacq], (0)))
+            a.head.user_int = np.array([acqtype.value]).astype(np.int32)
             a.head.acquisition_center_frequency = g.basefreq
             # print('writing center freq = ', a.head.acquisition_center_frequency)
             a.head.idx.repetition = iacq
@@ -111,15 +114,10 @@ def groupMRDfiles_collect(rootdir):
             l.extend(groupMRDfiles_collect(rootdir + '/' + f))
         elif(f.find('.MRD') > 0):
             mrsdata_filepath = rootdir + '/' + f
-            # mrs class is filled when reading navg
             mrs.mread3d(mrsdata_filepath)
-            if mrs.navg == 1:
-                print(f'Add file {mrsdata_filepath} with {mrs.navg} avg')
-                l.append(mrsdata_filepath)
-            else:
-                print(f'Skipping phantom data with {mrs.navg} avg as phantom data', file=sys.stderr)
-                continue
-    return(l)
+            print(f'Add file {mrsdata_filepath} with {mrs.navg} avg')
+            l.append(mrsdata_filepath)
+    return l
 
 def groupMRDfiles(rootdir, unifylevel):
     '''
@@ -135,6 +133,7 @@ def groupMRDfiles(rootdir, unifylevel):
     if(not os.path.isdir(rootdir)):
         return([])
     l = groupMRDfiles_collect(rootdir)
+    # PUT NAVG INTO A USER INT FOR EACH ACQUISITION
     groups = []
     # for each .MRD files in the list,
     for f in l:
@@ -175,7 +174,7 @@ def make_header(mrs, measID):
     enc = mrd.EncodingType()
     enc.encoding_limits = limits
     h.encoding.append(enc)
-    return  h
+    return h
 
 # check to see if a directory is specified
 def convert_mrs_to_mrd(basedir, unifylevel):
@@ -192,10 +191,14 @@ def convert_mrs_to_mrd(basedir, unifylevel):
             # write the header once for the entire group after continue
             # re-read the data to set the correct header for each group
             mrs.mread3d(g[ig])
+            if(mrs.navg > 1):
+                at = AcqType.MRS_EPSI_PHANTOM
+            else:
+                at = AcqType.MRS_EPSI
             if ig == 0:
                 h = make_header(mrs, measID)
                 w.write_header(h)
-            w.write_data(generate_acquisition(mrs, ig))
+            w.write_data(generate_acquisition(mrs, ig, at))
         w.close()
 
 # -u 3 consolidates the files as appropriate for EPSI. 
