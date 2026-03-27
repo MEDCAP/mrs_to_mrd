@@ -19,10 +19,11 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 
 debugphasing = False
 debuglorn = False
+phantom_correction = False
 savePhasedEPSILocal = True
 saveLornFitLocal = False
 saveMetaboliteLocal = False
-kfitdata_local = True
+kfitdata_local = False
 
 basedir = '.'
 fidpad = 1
@@ -287,20 +288,20 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
     plt.plot()
-    # if saveLornFitLocal:
-    #     # save current figure as a PNG file
-    #     lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
-    # else:
-    #     lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
-    # if os.path.exists(lorn_fit_dir):
-    #     lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
-    #     try:
-    #         plt.savefig(lorn_fit_path)
-    #         print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
-    #     except Exception as e:
-    #         print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
-    # else:
-    #     raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
+    if saveLornFitLocal:
+        # save current figure as a PNG file
+        lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
+    else:
+        lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
+    if os.path.exists(lorn_fit_dir):
+        lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
+        try:
+            plt.savefig(lorn_fit_path)
+            print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
+        except Exception as e:
+            print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
+    else:
+        raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
 
     # append_auximage(auximages, echo_number=a.head.idx.contrast)
     # now do voxel fits
@@ -323,7 +324,10 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                 bounds = Bounds(np.concatenate((np.zeros((npeaks)), [-.1, -.1])), \
                         np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
                 x1 = minimize(lor1fit, x0, bounds=bounds)
-                metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling / phantomscaling
+                if phantom_correction:
+                    metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling / phantomscaling
+                else:
+                    metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
     # # rotate by 90deg
     # metabolites = np.rot90(metabolites, k=1, axes=(2,3))
     return([metabolites, auximages])
@@ -589,25 +593,25 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             experiment_name = str(Path(input).parents[0].name)
             [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
             # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-            # if saveMetaboliteLocal:
-            #     npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
-            # else:
-            #     npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
-            # if os.path.exists(npy_dir):
-            #     try:
-            #         npy_filepath = os.path.join(npy_dir, f'{experiment_name}_metabolites.npy')
-            #         np.save(npy_filepath, metabolites)
-            #         print(f"Saving metabolites npy file at {npy_filepath}")
-            #     except Exception as e:
-            #         print(f"Error saving metabolites npy file: {e}", file=sys.stderr)
-            # else:
-            #     raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
+            if saveMetaboliteLocal:
+                npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
+            else:
+                npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
+            if os.path.exists(npy_dir):
+                try:
+                    npy_filepath = os.path.join(npy_dir, f'{experiment_name}_metabolites.npy')
+                    np.save(npy_filepath, metabolites)
+                    print(f"Saving metabolites npy file at {npy_filepath}")
+                except Exception as e:
+                    print(f"Error saving metabolites npy file: {e}", file=sys.stderr)
+            else:
+                raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
             # read_data can be called only once to get Stream +Item
             # write_data can be rewritten by converting list of mrd objects to StreamItem
-            # writer.write_data(generate_stream(raw_pulse_list))
-            # writer.write_data(generate_stream(raw_gradient_list))
-            # writer.write_data(generate_stream(raw_acquisition_list))
+            writer.write_data(generate_stream(raw_pulse_list))
+            writer.write_data(generate_stream(raw_gradient_list))
+            writer.write_data(generate_stream(raw_acquisition_list))
         elif(raw_header.measurement_information.sequence_name.find('1pul') > -1):
             [measurementtimes_ns, spectra, peakfrequencies, peakamplitudes, auximages] = spectra_recon(
                 h=raw_header,
@@ -637,6 +641,7 @@ if __name__ == "__main__":
     targetfiletype = ''
     sourcepeak = 0
     get_npy = True
+    phantom_correction = False  # reset per invocation; set True by -p below
     for iarg in range(len(sys.argv) - 1):
         try:
             floatarg = float(sys.argv[iarg + 1])
@@ -653,6 +658,9 @@ if __name__ == "__main__":
         if(sys.argv[iarg] == '-n'):
             targetfiletype = sys.argv[iarg + 1]
             # print('setting target file type to', targetfiletype)
+            continue
+        if(sys.argv[iarg] == '-p'):
+            phantom_correction = True
             continue
         modifiers = '__'
         if('_' in sys.argv[iarg]):
