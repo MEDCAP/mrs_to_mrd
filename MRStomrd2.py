@@ -188,23 +188,29 @@ def convert_mrs_to_mrd(basedir, unifylevel):
         basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
         print(f'grouping {len(g)} files into {basedir}', file=sys.stderr)
         w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
+        header_written = False
         for ig in range(len(g)):
             # write the header once for the entire group after continue
             # re-read the data to set the correct header for each group
             mrs.mread3d(g[ig])
             if unifylevel == 3:
+                if "1pul" in mrs.pplfile:
+                    continue
                 if(mrs.navg > 1):
                     at = AcqType.MRS_EPSI_PHANTOM
                 else:
                     at = AcqType.MRS_EPSI
             elif unifylevel == 1:
+                if "epsi" in mrs.pplfile:
+                    continue
                 at = AcqType.MRS_FID
             else:
                 print('unifylevel not supported', file=sys.stderr)
                 return
-            if ig == 0:
+            if not header_written:
                 h = make_header(mrs, measID)
                 w.write_header(h)
+                header_written = True
             w.write_data(generate_acquisition(mrs, ig, at))
         w.close()
 

@@ -20,7 +20,7 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 debugphasing = False
 debuglorn = False
 phantom_correction = False
-savePhasedEPSILocal = True
+savePhasedEPSILocal = False
 saveLornFitLocal = False
 saveMetaboliteLocal = False
 kfitdata_local = False
