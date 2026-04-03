@@ -66,7 +66,8 @@ def generate_acquisition(g, ide, acqtype):
             a.head.sample_time_ns = g.sampleperiod * 100  # convert to ns (sampleperiod is in units of 100ns)
             a.phase = np.zeros((g.rawdata.shape[0]), dtype=np.float32)
             yield mrd.StreamItem.Acquisition(a)
-    elif(acqtype == AcqType.MRS_FID.value):
+
+    elif(acqtype == AcqType.MRS_FID):
         nrep = g.rawdata.shape[5]  # number of acquisitions per image file (phase-encodes)
         for iacq in range(nrep):
             # make the pulse
@@ -191,10 +192,16 @@ def convert_mrs_to_mrd(basedir, unifylevel):
             # write the header once for the entire group after continue
             # re-read the data to set the correct header for each group
             mrs.mread3d(g[ig])
-            if(mrs.navg > 1):
-                at = AcqType.MRS_EPSI_PHANTOM
+            if unifylevel == 3:
+                if(mrs.navg > 1):
+                    at = AcqType.MRS_EPSI_PHANTOM
+                else:
+                    at = AcqType.MRS_EPSI
+            elif unifylevel == 1:
+                at = AcqType.MRS_FID
             else:
-                at = AcqType.MRS_EPSI
+                print('unifylevel not supported', file=sys.stderr)
+                return
             if ig == 0:
                 h = make_header(mrs, measID)
                 w.write_header(h)

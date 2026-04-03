@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import os
 from scipy.optimize import minimize
 import sys
+import argparse
 
 MRSdatadebug = False
 
@@ -220,3 +221,12 @@ class MRSdata:
         self.acqstarttime = int(self.parameters[beginidx:endidx])
         if(MRSdatadebug):
             print(f'   setting acq start time to {self.acqstarttime} since some time in units of 100ns', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    MRSdatadebug = True
+    argparse = argparse.ArgumentParser(description='Convert MRS .MRD file to .MRD file with acquisition data in MRD format')
+    argparse.add_argument('-i', '--input', type=str, help='path to input .MRD file containing MRS data in Siemens format')
+    args = argparse.parse_args()
+    m = MRSdata()
+    m.mread3d(args.input)

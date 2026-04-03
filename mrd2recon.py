@@ -56,8 +56,19 @@ def get_clarg(clarg, arg, ty):
 
 def append_auximage(aux_images_list: list, echo_number: int):
     plt.gcf().canvas.draw()
-    width, height = plt.gcf().canvas.get_width_height()
-    bmp = np.frombuffer(plt.gcf().canvas.tostring_argb(), dtype=np.uint8).reshape((height, width, 4))
+    canvas = plt.gcf().canvas
+    width, height = canvas.get_width_height()
+    bmp_buffer = np.frombuffer(canvas.tostring_argb(), dtype=np.uint8)
+    expected = int(width) * int(height) * 4
+    if bmp_buffer.size != expected and hasattr(canvas, "get_renderer"):
+        renderer = canvas.get_renderer()
+        width, height = renderer.width, renderer.height
+        expected = int(width) * int(height) * 4
+    if bmp_buffer.size != expected:
+        pixel_count = bmp_buffer.size // 4
+        height = int(height)
+        width = int(pixel_count // height) if height else int(width)
+    bmp = bmp_buffer.reshape((int(height), int(width), 4))
     bmp = bmp.astype(np.uint32)
     encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
     # number of spectral pts=fidpadding * 64 acquired pts
@@ -682,7 +693,7 @@ if __name__ == "__main__":
         for i, f in enumerate(fnames):
             experiment_name = Path(f).parent.name
             output_path = f.replace('raw.mrd2', experiment_name + '_recon.mrd2')
-            print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {output_path}', file=sys.stderr, flush=True)
+            print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {f}', file=sys.stderr, flush=True)
             reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
