@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from statistics import mode
 import os
 from scipy.optimize import minimize, Bounds
+from scipy.io import savemat
 import sys
 from pathlib import Path
 from typing import BinaryIO, Union
@@ -19,11 +20,10 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 
 debugphasing = False
 debuglorn = False
-phantom_correction = False
-savePhasedEPSILocal = False
-saveLornFitLocal = False
-saveMetaboliteLocal = False
-kfitdata_local = False
+saveLornFitLocal = True
+saveMetaboliteLocal = True
+kfitdata_local = True
+MRSsave_dir = "C:/Users/MRS/Desktop"
 
 basedir = '.'
 fidpad = 1
@@ -178,10 +178,13 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     print(f'Performing fft', file=sys.stderr)
     imgs = []
     phantom_imgsets = []
-    for kspace in phantom_kspaces:
-        img = np.zeros(([1] + list(kspace.shape)), dtype = 'complex')
-        img[0, :] = np.fft.fftshift(np.fft.fftn(kspace))
-        phantom_imgsets = phantom_imgsets + [img]
+    print(f"phantom_kspaces shape: {phantom_kspaces[0].shape}")
+    phantom_recon_array = np.zeros((len(phantom_kspaces), phantom_kspaces[0].shape[0], phantom_kspaces[0].shape[1]))
+    if len(phantom_kspaces) > 0:
+        for kspace in phantom_kspaces:
+            img = np.zeros(([1] + list(kspace.shape)), dtype = 'complex')
+            img[0, :] = np.fft.fftshift(np.fft.fftn(kspace))
+            phantom_imgsets = phantom_imgsets + [img]
     hpimgset = np.zeros(([len(kspaces)] + list(kspaces[0].shape)), dtype = 'complex')
     for iimg in range(len(kspaces)):
         hpimgset[iimg, :] = np.fft.fftshift(np.fft.fftn(kspaces[iimg]))
@@ -242,11 +245,13 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         widthguess = (rightidx - leftidx) * (xscale[1] - xscale[0]) / 2
         lornputspect(xscale, globalspect, widthguess, 1.0, debuglorn)
         if(isphantom):
-            # fit to one peak for a phantom
+            # fit to one peak for a phantom 4params + real-imag
             x0 = np.zeros((6))
             centers = [xscale[np.argmax(np.abs(globalspect))]]
-            x0[3] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[0]))])
-            x0[2] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[0]))])
+            # thisspect -> globalspect
+            # center, width are fixed
+            x0[3] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[0]))]) # amp
+            x0[2] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[0]))])   # phase
             lornputpeakparams(centers, np.ones((1)) * widthguess, x0[2:3], debuglorn)
             x1 = minimize(lornfit, x0).x
             c, w, ph, A, b = lornunpackx0(x1, False)
@@ -259,9 +264,26 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
             plt.plot(xscale, np.imag(lorneval(x1)), 'k')
             plt.plot(xscale, np.abs(globalspect), 'c')
             plt.text(xscale[10], .9, f'phantom scaling {thisphantomscaling:6.3f}')
-            plt.show()
+            # plt.show()
         else:
             hpglobalspect = globalspect.copy()
+    # phantom_imgsets=list of (views, readouts, echoes)
+    for i, phantom_image in enumerate(phantom_imgsets):
+        for j in range(phantom_recon_array.shape[1]):
+            for k in range(phantom_recon_array.shape[2]):
+                thisspect = phantom_image[0, j, k, :]   # 0th channel
+                scaling = np.max(np.abs(thisspect))
+                thisspect /= scaling
+                x0 = np.zeros((6))
+                lornputspect(xscale, thisspect, widthguess, 1.0, debuglorn)
+                centers = [xscale[np.argmax(np.abs(thisspect))]]
+                x0[3] = np.abs(thisspect[np.argmin(np.abs(xscale - centers[0]))])
+                x0[2] = np.angle(thisspect[np.argmin(np.abs(xscale - centers[0]))])
+                lornputpeakparams(centers, np.ones((1)) * widthguess, x0[2:3], debuglorn)
+                x1 = minimize(lornfit, x0).x
+                c, w, ph, A, b = lornunpackx0(x1, False)
+                phantom_recon_array[i, j, k] = A[0] * w[0] * scaling
+    
     if(phantomscaling == 0):
         phantomscaling = 1
     print('phantom scaling = ', phantomscaling)
@@ -300,19 +322,19 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
     plt.plot()
     if saveLornFitLocal:
-        # save current figure as a PNG file
-        lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'
-    else:
-        lorn_fit_dir = 'C:/Users/MRS/Desktop/shurik/lorn_fit'
-    if os.path.exists(lorn_fit_dir):
-        lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
-        try:
-            plt.savefig(lorn_fit_path)
-            print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
-        except Exception as e:
-            print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
-    else:
-        raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
+        if "cirrhrat" in experiment_name:
+            lorn_fit_dir = os.path.join(MRSsave_dir, "Bukola's Data", "lorn_fit")
+        else:
+            lorn_fit_dir = os.path.join(MRSsave_dir, "shurik", "lorn_fit")
+        if os.path.exists(lorn_fit_dir):
+            lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
+            try:
+                plt.savefig(lorn_fit_path)
+                print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
+            except Exception as e:
+                print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
+        else:
+            raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
 
     # append_auximage(auximages, echo_number=a.head.idx.contrast)
     # now do voxel fits
@@ -329,18 +351,34 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     continue
                 thisspect /= scaling
                 lornputspect(xscale, thisspect, widths, 1.0, False)
-                x0 = np.zeros((npeaks + 2))
+                x0 = np.zeros((npeaks + 2)) # amp of npeaks + real-imag
                 for ip in range(npeaks):
                     x0[ip] = np.abs(thisspect[np.argmin(np.abs(xscale - centers[ip]))])
                 bounds = Bounds(np.concatenate((np.zeros((npeaks)), [-.1, -.1])), \
                         np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
                 x1 = minimize(lor1fit, x0, bounds=bounds)
-                if phantom_correction:
-                    metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling / phantomscaling
-                else:
-                    metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
-    # # rotate by 90deg
-    # metabolites = np.rot90(metabolites, k=1, axes=(2,3))
+                metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
+    
+    # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
+    if saveMetaboliteLocal:
+        if "cirrhrat" in experiment_name:
+            mat_dir = os.path.join(MRSsave_dir, "Bukola's Data", "processed_npyfiles")
+        else:
+            mat_dir = os.path.join(MRSsave_dir, "shurik", "processed_npyfiles")
+        if os.path.exists(mat_dir):
+            try:
+                mat_filepath = os.path.join(mat_dir, f'{experiment_name}_metabolites.mat')
+                savemat(mat_filepath, {
+                    'rawdata': metabolites,
+                    'phantom_scale': phantomscaling,
+                    'phantom': phantom_recon_array
+                }
+                )
+                print(f"Saving metabolites mat file at {mat_filepath}")
+            except Exception as e:
+                print(f"Error saving metabolites mat file: {e}", file=sys.stderr)
+        else:
+            raise FileNotFoundError(f"Directory {mat_dir} does not exist.")
     return([metabolites, auximages])
 
 def generate_spectra(h: mrd.Header,
@@ -535,8 +573,6 @@ def spectra_recon(h: mrd.Header,
     plt.yticks([])
     append_auximage(auximages, echo_number=a.head.idx.contrast)
     if kfitdata_local:
-        kfitdata_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/mrs_to_mrd/kfitdata'
-    else:
         kfitdata_dir = 'C:/Users/MRS/Desktop/mrs_to_mrd/kfitdata'
     
     if os.path.exists(kfitdata_dir):
@@ -603,20 +639,6 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
         if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
             experiment_name = str(Path(input).parents[0].name)
             [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
-            # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-            if saveMetaboliteLocal:
-                npy_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/processed_npyfiles'
-            else:
-                npy_dir = 'C:/Users/MRS/Desktop/shurik/processed_npyfiles'
-            if os.path.exists(npy_dir):
-                try:
-                    npy_filepath = os.path.join(npy_dir, f'{experiment_name}_metabolites.npy')
-                    np.save(npy_filepath, metabolites)
-                    print(f"Saving metabolites npy file at {npy_filepath}")
-                except Exception as e:
-                    print(f"Error saving metabolites npy file: {e}", file=sys.stderr)
-            else:
-                raise FileNotFoundError(f"Directory {npy_dir} does not exist.")
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
             # read_data can be called only once to get Stream +Item
             # write_data can be rewritten by converting list of mrd objects to StreamItem
@@ -652,7 +674,6 @@ if __name__ == "__main__":
     targetfiletype = ''
     sourcepeak = 0
     get_npy = True
-    phantom_correction = False  # reset per invocation; set True by -p below
     for iarg in range(len(sys.argv) - 1):
         try:
             floatarg = float(sys.argv[iarg + 1])
@@ -669,9 +690,6 @@ if __name__ == "__main__":
         if(sys.argv[iarg] == '-n'):
             targetfiletype = sys.argv[iarg + 1]
             # print('setting target file type to', targetfiletype)
-            continue
-        if(sys.argv[iarg] == '-p'):
-            phantom_correction = True
             continue
         modifiers = '__'
         if('_' in sys.argv[iarg]):

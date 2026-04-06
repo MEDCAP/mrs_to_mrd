@@ -197,6 +197,7 @@ def convert_mrs_to_mrd(basedir, unifylevel):
                 if "1pul" in mrs.pplfile:
                     continue
                 if(mrs.navg > 1):
+                    print(f"Saving file {g[ig]} with {mrs.navg} averages as phantom", file=sys.stderr)
                     at = AcqType.MRS_EPSI_PHANTOM
                 else:
                     at = AcqType.MRS_EPSI
