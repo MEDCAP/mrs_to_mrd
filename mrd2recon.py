@@ -645,7 +645,10 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             writer.write_data(generate_stream(raw_pulse_list))
             writer.write_data(generate_stream(raw_gradient_list))
             writer.write_data(generate_stream(raw_acquisition_list))
-        elif(raw_header.measurement_information.sequence_name.find('1pul') > -1):
+        elif(
+            raw_header.measurement_information.sequence_name.find('1puls') > -1 or
+            raw_header.measurement_information.sequence_name.find('one_pulse') > -1 or 
+            raw_header.measurement_information.sequence_name.find('fid') > -1):
             [measurementtimes_ns, spectra, peakfrequencies, peakamplitudes, auximages] = spectra_recon(
                 h=raw_header,
                 raw_acquisition_list=raw_acquisition_list,

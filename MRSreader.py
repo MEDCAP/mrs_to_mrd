@@ -94,15 +94,17 @@ class MRSdata:
             print(f'   reading data {self.rawdata.shape} nsamp x nview x nslcview x nslc x necho x nex', file=sys.stderr)
         self.parameters = str(fdbytes[dend:])
         # set ppm file name
-        endidx = self.parameters.find('.ppl')
-        if endidx == -1:
-            return("")
-        for beginidx in range(endidx, 0, -1):
-            if(self.parameters[beginidx] == '/' or self.parameters[beginidx] == '\\'):
-                 break
+        if self.parameters.find('PPL') != -1:
+            beginidx = self.parameters.find('PPL')
+        elif self.parameters.find('SEQUENCE') != -1:
+            beginidx = self.parameters.find('SEQUENCE')
+        else:
+            return
+        beginidx += self.parameters[beginidx:].find(' ')
+        endidx = beginidx + self.parameters[beginidx:].find(r'\r\n')
         self.pplfile = self.parameters[(beginidx + 1):endidx]
         if(MRSdatadebug):
-            print(f'   setting ppl file name ={self.pplfile}', file=sys.stderr)
+            print(f'   setting ppl file name {self.pplfile}', file=sys.stderr)
         # set sample period in 1/10ths of a microsecond
         beginidx = self.parameters.find('SAMPLE_PERIOD')
         beginidx += self.parameters[beginidx:].find(',') + 1

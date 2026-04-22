@@ -194,7 +194,7 @@ def convert_mrs_to_mrd(basedir, unifylevel):
             # re-read the data to set the correct header for each group
             mrs.mread3d(g[ig])
             if unifylevel == 3:
-                if "1pul" in mrs.pplfile:
+                if "1puls" in mrs.pplfile or "one_pulse" in mrs.pplfile or "fid" in mrs.pplfile:
                     continue
                 if(mrs.navg > 1):
                     print(f"Saving file {g[ig]} with {mrs.navg} averages as phantom", file=sys.stderr)
