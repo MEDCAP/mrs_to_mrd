@@ -29,25 +29,11 @@ def generate_acquisition(g, ide, acqtype):
         nPE = g.rawdata.shape[1]  # number of acquisitions per image file (phase-encodes)
         for iacq in range(nPE):
             # pulse and gradients specified based on original format
-            p = mrd.Pulse()
             CO_freq = g.basefreq
             pulse_start = np.uint64(g.acqstarttime * 100) + np.uint64(iacq * g.tr * 1.0E+6)
             pulse_end = pulse_start + np.uint64(pulse_len * 1.0E+9)
-            p.head.pulse_time_stamp_ns = pulse_start
-            p.head.sample_time_ns = g.sampleperiod * 100  # convert to ns (sampleperiod is in units of 100ns)
             npulsepoints = int(pulse_len / pulsedt)
-            p.amplitude = np.zeros((1, npulsepoints)).astype(np.float32)
-            p.phase = np.zeros(npulsepoints).astype(np.float32)
-            for idt in range(npulsepoints):
-                p.amplitude[0, idt] = 1.0    # we don't know the pulse amplitude or phase yet
-                p.phase[idt] = 0.0
-            yield mrd.StreamItem.Pulse(p)
             # make the gradients
-            gr = mrd.Gradient()
-            gr.head.gradient_time_stamp_ns = pulse_start + np.uint64(TE * 1.0E+9)
-            gr.head.gradient_sample_time_ns = 10000 # 10us
-            # at some point we'll have to reproduce the whole flyback gradient waveform but not now
-            yield mrd.StreamItem.Gradient(gr)
             # make the acquisition
             a = mrd.Acquisition()
             a.head.user_int = np.array([acqtype.value]).astype(np.int32)

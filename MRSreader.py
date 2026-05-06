@@ -23,7 +23,7 @@ class MRSdata:
         self.alpha = 0
         self.navg = 0
         self.nswitch = 0
-        self.npswitch = 0
+        self.nppswitch = 0
         self.FOVoff = [0.0, 0.0, 0.0]
         self.FOVaspect = 0.0
         self.FOV = 0.0
@@ -173,7 +173,7 @@ class MRSdata:
         try:
             self.nppswitch = int(self.parameters[beginidx:endidx])
             if(MRSdatadebug):
-                print(f'   setting flip angle to {self.alpha}', file=sys.stderr)
+                print(f'   number of points per switch {self.nppswitch}', file=sys.stderr)
         except:
             print('   points per switch not specified', file=sys.stderr)
         # set FOV offsets
@@ -223,7 +223,6 @@ class MRSdata:
         self.acqstarttime = int(self.parameters[beginidx:endidx])
         if(MRSdatadebug):
             print(f'   setting acq start time to {self.acqstarttime} since some time in units of 100ns', file=sys.stderr)
-
 
 if __name__ == '__main__':
     MRSdatadebug = True

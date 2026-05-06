@@ -39,6 +39,9 @@ def findmrd2files(basedir, targetfiletype):
         return [basedir]
     for root, dirnames, filenames in os.walk(basedir):
         if 'raw.mrd2' in filenames or targetfiletype in filenames:
+            if len(dirnames) == 0:
+                print(f"Found raw.mrd2 file at {os.path.join(root, 'raw.mrd2')}")
+                continue
             mrd2list.append(os.path.join(root, 'raw.mrd2'))
     return(mrd2list)
 
@@ -161,20 +164,42 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                     mrd.AcquisitionFlags.LAST_IN_PHASE == mrd.AcquisitionFlags.LAST_IN_PHASE):
                 break
         npe = iap - ia + 1
-        kspace = np.zeros((npe, nro, necho * fidpad), dtype = 'complex')
+
+        ########
+        # method1 discard the first echo=63 echoes
+        kspace = np.zeros((npe, nro, (necho-1) * fidpad), dtype = 'complex')
+        # # method2
+        # kspace = np.zeros((npe, nro, necho * fidpad), dtype = 'complex')
+
         if(AcqType(raw_acquisition_list[ia].head.user_int[0]) == AcqType.MRS_EPSI_PHANTOM):
             phantom_kspaces.append(kspace)
         elif(AcqType(raw_acquisition_list[ia].head.user_int[0]) == AcqType.MRS_EPSI):
             kspaces.append(kspace)
         for ipe in range(npe):
             a = raw_acquisition_list[ia]
-            for iecho in range(a.head.idx.contrast):
+            # plot raw echo data
+            # plt.figure()
+            # plt.plot(np.abs(a.data))
+            # plt.title(f'a.data shape: {a.data.shape}, ipe: {ipe} iimg: {iimg}')
+            # plt.show()
+            #######
+            # method1
+            for iecho in range(a.head.idx.contrast-1):
+                kspace[ipe, :, iecho] = a.data[(13 + iecho * totalppswitch + a.head.discard_pre):(13 + iecho * totalppswitch + a.head.discard_post + nro), 0]
                 # line broadening
                 tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
-                kspace[ipe, :, iecho] = a.data[(iecho * totalppswitch + \
-                    a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[1]), 0] * \
-                    np.exp(-tk * lb)
+                kspace[ipe, :, iecho] *= np.exp(-tk * lb)
             ia += 1
+            #######
+            # # method2
+            # for iecho in range(a.head.idx.contrast):
+            #     kspace[ipe, :, 0] = np.concatenate((np.zeros(3), a.data[:9,0]))
+            #     if iecho > 0:
+            #         kspace[ipe, :, iecho] = a.data[(13 + (iecho-1) * totalppswitch + a.head.discard_pre):(13 + (iecho-1) * totalppswitch + a.head.discard_post + nro), 0]
+            #     # line broadening
+            #     tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
+            #     kspace[ipe, :, iecho] *= np.exp(-tk * lb)
+            # ia += 1
     print(f'Performing fft', file=sys.stderr)
     imgs = []
     phantom_imgsets = []
@@ -186,6 +211,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
             img[0, :] = np.fft.fftshift(np.fft.fftn(kspace))
             phantom_imgsets = phantom_imgsets + [img]
     hpimgset = np.zeros(([len(kspaces)] + list(kspaces[0].shape)), dtype = 'complex')
+    # plot kspace
     for iimg in range(len(kspaces)):
         hpimgset[iimg, :] = np.fft.fftshift(np.fft.fftn(kspaces[iimg]))
     allimgsets = phantom_imgsets + [hpimgset]
@@ -210,7 +236,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         maxspect = imgset[maxide,maxj,maxk,:].copy()
         globalspect = np.zeros((imgset[0].shape[2]), dtype = 'complex')
         for ide in range(imgset.shape[0]):
-            # go through all the voxels and minimize the phase difference
+        #     # go through all the voxels and minimize the phase difference
             for j in range(imgset.shape[1]):
                 for k in range(imgset.shape[2]):
                     thisspect = imgset[ide, j, k, :]
@@ -320,7 +346,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     for ip in range(0, npeaks):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-    plt.plot()
+    # plt.show()
     if saveLornFitLocal:
         if "cirrhrat" in experiment_name:
             lorn_fit_dir = os.path.join(MRSsave_dir, "Bukola's Data", "lorn_fit")
@@ -358,7 +384,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                         np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
                 x1 = minimize(lor1fit, x0, bounds=bounds)
                 metabolites[:, ide, j, k] = x1.x[:npeaks] * scaling
-    
+
     # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
     if saveMetaboliteLocal:
         if "cirrhrat" in experiment_name:
@@ -616,19 +642,11 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
     global experiment_name
     def generate_stream(input: list):
         for item in input:
-            if isinstance(item, mrd.Pulse):
-                yield mrd.StreamItem.Pulse(item)
-            if isinstance(item, mrd.Gradient):
-                yield mrd.StreamItem.Gradient(item)
             if isinstance(item, mrd.Acquisition):
                 yield mrd.StreamItem.Acquisition(item)
     with mrd.BinaryMrdReader(input) as reader:
         raw_header = reader.read_header()
         raw_streamables_list = list(reader.read_data())
-        raw_pulse_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Pulse]
-        raw_pulse_list.sort(key = lambda x: x.head.pulse_time_stamp_ns)
-        raw_gradient_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Gradient]
-        raw_gradient_list.sort(key = lambda x: x.head.gradient_time_stamp_ns)
         raw_acquisition_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Acquisition]
         raw_acquisition_list.sort(key = lambda x: x.head.acquisition_time_stamp_ns)
         img_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Image]
@@ -642,8 +660,6 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
             writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
             # read_data can be called only once to get Stream +Item
             # write_data can be rewritten by converting list of mrd objects to StreamItem
-            writer.write_data(generate_stream(raw_pulse_list))
-            writer.write_data(generate_stream(raw_gradient_list))
             writer.write_data(generate_stream(raw_acquisition_list))
         elif(
             raw_header.measurement_information.sequence_name.find('1puls') > -1 or
@@ -659,9 +675,6 @@ def reconstruct_mrs(input: Union[str, BinaryIO],
                 peaknames=peaknames,
                 wigglefactor=wigglefactor)
             writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakamplitudes, peakoffsets, spectra))
-            # fill in pulse, gradient, acq data
-            writer.write_data(generate_stream(raw_pulse_list))
-            writer.write_data(generate_stream(raw_gradient_list))
             writer.write_data(generate_stream(raw_acquisition_list))
         if(len(auximages) > 0):
             writer.write_data(generate_aux_images(auximages))
