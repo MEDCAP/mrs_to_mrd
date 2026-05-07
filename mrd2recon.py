@@ -154,13 +154,14 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
             phantom_kspaces.append(kspace)
         elif(AcqType(raw_acquisition_list[ia].head.user_int[0]) == AcqType.MRS_EPSI):
             kspaces.append(kspace)
+        # TEMPORARY KLUGE TO THROW AWAY 13 POINTS
         for ipe in range(npe):
             a = raw_acquisition_list[ia]
-            for iecho in range(a.head.idx.contrast):
+            for iecho in range(a.head.idx.contrast - 1):
                 # line broadening
                 tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
                 kspace[ipe, :, iecho] = a.data[(iecho * totalppswitch + \
-                    a.head.discard_pre):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[1]), 0] * \
+                    a.head.discard_pre + 13):(iecho * totalppswitch + a.head.discard_pre + kspace.shape[1] + 13), 0] * \
                     np.exp(-tk * lb)
             ia += 1
     print(f'Performing fft', file=sys.stderr)
@@ -287,6 +288,7 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
     plt.plot()
+    plt.show()
     # if saveLornFitLocal:
     #     # save current figure as a PNG file
     #     lorn_fit_dir = 'C:/Users/kento/dev/rawdata/mrsolutions/test_shur/lorn_fit'

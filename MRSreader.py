@@ -4,7 +4,7 @@ import os
 from scipy.optimize import minimize
 import sys
 
-MRSdatadebug = False
+MRSdatadebug = True
 
 class MRSdata:
     def __init__(self):
@@ -92,10 +92,15 @@ class MRSdata:
         if(MRSdatadebug):
             print(f'   reading data {self.rawdata.shape} nsamp x nview x nslcview x nslc x necho x nex', file=sys.stderr)
         self.parameters = str(fdbytes[dend:])
+        if(MRSdatadebug):
+            print("full parameters list:")
+            print(self.parameters)
         # set ppm file name
         endidx = self.parameters.find('.ppl')
         if endidx == -1:
-            return("")
+            endidx = self.parameters.find('.plseq')
+            if endidx == -1:
+                return("")
         for beginidx in range(endidx, 0, -1):
             if(self.parameters[beginidx] == '/' or self.parameters[beginidx] == '\\'):
                  break
