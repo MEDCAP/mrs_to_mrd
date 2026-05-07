@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import os
 from scipy.optimize import minimize
 import sys
+import argparse
 
 MRSdatadebug = True
 
@@ -22,7 +23,7 @@ class MRSdata:
         self.alpha = 0
         self.navg = 0
         self.nswitch = 0
-        self.npswitch = 0
+        self.nppswitch = 0
         self.FOVoff = [0.0, 0.0, 0.0]
         self.FOVaspect = 0.0
         self.FOV = 0.0
@@ -93,15 +94,17 @@ class MRSdata:
             print(f'   reading data {self.rawdata.shape} nsamp x nview x nslcview x nslc x necho x nex', file=sys.stderr)
         self.parameters = str(fdbytes[dend:])
         # set ppm file name
-        endidx = self.parameters.find('.ppl')
-        if endidx == -1:
-            return("")
-        for beginidx in range(endidx, 0, -1):
-            if(self.parameters[beginidx] == '/' or self.parameters[beginidx] == '\\'):
-                 break
+        if self.parameters.find('PPL') != -1:
+            beginidx = self.parameters.find('PPL')
+        elif self.parameters.find('SEQUENCE') != -1:
+            beginidx = self.parameters.find('SEQUENCE')
+        else:
+            return
+        beginidx += self.parameters[beginidx:].find(' ')
+        endidx = beginidx + self.parameters[beginidx:].find(r'\r\n')
         self.pplfile = self.parameters[(beginidx + 1):endidx]
         if(MRSdatadebug):
-            print(f'   setting ppl file name ={self.pplfile}', file=sys.stderr)
+            print(f'   setting ppl file name {self.pplfile}', file=sys.stderr)
         # set sample period in 1/10ths of a microsecond
         beginidx = self.parameters.find('SAMPLE_PERIOD')
         beginidx += self.parameters[beginidx:].find(',') + 1
@@ -170,7 +173,7 @@ class MRSdata:
         try:
             self.nppswitch = int(self.parameters[beginidx:endidx])
             if(MRSdatadebug):
-                print(f'   setting flip angle to {self.alpha}', file=sys.stderr)
+                print(f'   number of points per switch {self.nppswitch}', file=sys.stderr)
         except:
             print('   points per switch not specified', file=sys.stderr)
         # set FOV offsets
@@ -222,7 +225,9 @@ class MRSdata:
             print(f'   setting acq start time to {self.acqstarttime} since some time in units of 100ns', file=sys.stderr)
 
 if __name__ == '__main__':
-    filepath = sys.argv[1]
+    MRSdatadebug = True
+    argparse = argparse.ArgumentParser(description='Convert MRS .MRD file to .MRD file with acquisition data in MRD format')
+    argparse.add_argument('-i', '--input', type=str, help='path to input .MRD file containing MRS data in Siemens format')
+    args = argparse.parse_args()
     m = MRSdata()
-    m.mread3d(filepath)
-    print(m.sampleperiod)
+    m.mread3d(args.input)

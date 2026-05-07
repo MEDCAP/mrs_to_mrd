@@ -17,9 +17,11 @@ __pycache__/
 # ignore csv exports
 *.csv
 
-# ignore test output files
-<<<<<<< HEAD
-stream-test/
-=======
-stream-test/
->>>>>>> add_pulseq
+# ignore DS_Store files
+.DS_Store
+
+# claude 
+.claude/
+
+# vscode
+.vscode/
