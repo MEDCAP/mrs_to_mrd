@@ -309,7 +309,8 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
                 x1 = minimize(lornfit, x0).x
                 c, w, ph, A, b = lornunpackx0(x1, False)
                 phantom_recon_array[i, j, k] = A[0] * w[0] * scaling
-    
+    # restore HP global spectrum into lorn state (phantom voxel loop above overwrites it)
+    lornputspect(xscale, hpglobalspect, widthguess, 1.0, debuglorn)
     if(phantomscaling == 0):
         phantomscaling = 1
     print('phantom scaling = ', phantomscaling)
