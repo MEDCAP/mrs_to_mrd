@@ -39,9 +39,7 @@ def findmrd2files(basedir, targetfiletype):
         return [basedir]
     for root, dirnames, filenames in os.walk(basedir):
         if 'raw.mrd2' in filenames or targetfiletype in filenames:
-            if len(dirnames) == 0:
-                print(f"Found raw.mrd2 file at {os.path.join(root, 'raw.mrd2')}")
-                continue
+            print(f"Found raw.mrd2 file at {os.path.join(root, 'raw.mrd2')}")
             mrd2list.append(os.path.join(root, 'raw.mrd2'))
     return(mrd2list)
 
@@ -73,9 +71,9 @@ def append_auximage(aux_images_list: list, echo_number: int):
         width = int(pixel_count // height) if height else int(width)
     bmp = bmp_buffer.reshape((int(height), int(width), 4))
     bmp = bmp.astype(np.uint32)
-    encodedbmp = np.zeros((bmp.shape[0], bmp.shape[1]), dtype=np.uint32)
-    # number of spectral pts=fidpadding * 64 acquired pts
-    encodedbmp = bmp[:,:,0]*16777216 + bmp[:,:,1]*65536 + bmp[:,:,2]*echo_number*fidpad* + bmp[:,:,3]
+    # Pack ARGB bytes from canvas.tostring_argb() into a single uint32 per pixel:
+    #   bits 24-31 = A, 16-23 = R, 8-15 = G, 0-7 = B
+    encodedbmp = (bmp[:, :, 0] << 24) | (bmp[:, :, 1] << 16) | (bmp[:, :, 2] << 8) | bmp[:, :, 3]
     aux_images_list.append(encodedbmp)
 
 def kABfiteval(x):
@@ -463,15 +461,15 @@ def spectra_recon(h: mrd.Header,
     a = raw_acquisition_list[0]
     sampletime = a.head.sample_time_ns / 1.0E+9
     centerfreq = a.head.acquisition_center_frequency
-    sampletime = a.head.sample_time_ns / 1.0E+9
     npts = len(a.data)
-    # kspace shape=(spectra, measurements)
-    kspace = np.zeros((numspectra, len(a.data)), dtype = 'complex')
+    # kspace shape=(measurements=80, spectra=1280)
+    kspace = np.zeros((numspectra, npts), dtype = 'complex')
     ia = 0
     for ispect in range(kspace.shape[0]):
         kspace[ispect, :] = raw_acquisition_list[ispect].data[:, 0]
         for ipt in range(kspace.shape[1]):
              tk = ipt * sampletime
+             lb = 42
              kspace[ispect, ipt] *= np.exp(-tk * lb)
     spectra = np.fft.fftshift(np.fft.fft(kspace, axis = (1)), axes = (1))
     currmax = 0
@@ -540,6 +538,8 @@ def spectra_recon(h: mrd.Header,
     for ip in range(0, len(peakoffsets)):
         plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
+    plt.title(f'{experiment_name} global spectrum')
+    # plt.show()
     append_auximage(auximages, echo_number=a.head.idx.contrast)
     # now do voxel fits
     lornputpeakparams(centers, widths, phases, debuglorn)
@@ -569,8 +569,8 @@ def spectra_recon(h: mrd.Header,
     kAB_auc_data = {}
     for ip in range(len(peakoffsets)):
         P = peakamplitudes[sourcepeak, :]   # peak amp of injected sample
-        t = np.array(measurementtimes_ns) * 1.0E-9
         y = peakamplitudes[ip, :]           # peak amp of each metabolite
+        t = np.arange(len(y))               # Use the index as the time axis for y
         if(ip in metabolitelist):
             # x[0]=kAB, x[1]=1/T1, x[2]=initial amount of metabolite
             if peaknames[ip] == 'lac' or peaknames[ip] == 'ala':
@@ -582,35 +582,36 @@ def spectra_recon(h: mrd.Header,
                                            '1/T1': 1/x1[1],
                                            'AUC': auc[ip]}
             # save values as text file
-            plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'.', \
+            plt.plot(t, y, colors[ip]+'.', \
                     label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/T1inverse={:.2f}'.format(1/x1[1]) + \
                     '/AUC={:.2f}'.format(auc[ip]))
             # fitted line
-            plt.plot(np.array(measurementtimes_ns) * 1.0E-9, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
+            plt.plot(t, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
         else:
             kAB_auc_data[peaknames[ip]] = {'AUC': auc[ip]}
             if(ip == sourcepeak):
-                plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'-', label=peaknames[ip] + \
+                plt.plot(t, y, colors[ip]+'-', label=peaknames[ip] + \
                     '/AUC={:.2f}'.format(auc[ip]))
             else:
-                plt.plot(np.array(measurementtimes_ns) * 1.0E-9, y, colors[ip]+'--', label=peaknames[ip] + \
+                plt.plot(t, y, colors[ip]+'--', label=peaknames[ip] + \
                     '/AUC={:.2f}'.format(auc[ip]))
     plt.legend(title='')
-    plt.xlabel('time (s)')
+    plt.title(experiment_name)
+    plt.xlabel('time')
     plt.yticks([])
+    # plt.show()
     append_auximage(auximages, echo_number=a.head.idx.contrast)
     if kfitdata_local:
         kfitdata_dir = 'C:/Users/MRS/Desktop/mrs_to_mrd/kfitdata'
-    
     if os.path.exists(kfitdata_dir):
         import csv
         try:
             csv_filepath = os.path.join(kfitdata_dir, f'{experiment_name}_kAB.csv')
             with open(csv_filepath, 'w', newline='') as f:
                 writer = csv.writer(f)
-                headers = [experiment_name]
+                headers = ['experiment_name']
                 for metabolite_name in kAB_auc_data.keys():
-                    headers.append(f'kAB_{metabolite_name}')
+                    headers.append(f'kpyr_to_{metabolite_name}')
                     headers.append(f'1/T1_{metabolite_name}')
                     headers.append(f'AUC_{metabolite_name}')
                 writer.writerow(headers)

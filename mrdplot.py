@@ -40,11 +40,13 @@ def plot_mrd(input: BinaryIO):
             bmp = np.squeeze(i.data)
             if bmp.ndim < 2:
                 continue
+            # Aux images are packed as 0xAARRGGBB by mrd2recon.append_auximage().
+            # matplotlib imshow expects channels in RGBA order, so unpack accordingly.
             unpacked_bmp = np.zeros([bmp.shape[0], bmp.shape[1], 4], dtype=np.uint8)
-            unpacked_bmp[:,:,0] = ((bmp & 0x000000FF) / 2**0).astype(np.uint8)
-            unpacked_bmp[:,:,1] = ((bmp & 0x0000FF00) / 2**8).astype(np.uint8)
-            unpacked_bmp[:,:,2] = ((bmp & 0x00FF0000) / 2**16).astype(np.uint8)
-            unpacked_bmp[:,:,3] = ((bmp & 0xFFFF0000) / 2**24).astype(np.uint8)
+            unpacked_bmp[:, :, 0] = ((bmp >> 16) & 0xFF).astype(np.uint8)  # R
+            unpacked_bmp[:, :, 1] = ((bmp >> 8) & 0xFF).astype(np.uint8)   # G
+            unpacked_bmp[:, :, 2] = (bmp & 0xFF).astype(np.uint8)          # B
+            unpacked_bmp[:, :, 3] = ((bmp >> 24) & 0xFF).astype(np.uint8)  # A
             fig2 = plt.figure()
             fig2.suptitle(f'File: {input.name}')
             plt.xticks([])
