@@ -39,8 +39,13 @@ def findmrd2files(basedir, targetfiletype):
         return [basedir]
     for root, dirnames, filenames in os.walk(basedir):
         if 'raw.mrd2' in filenames or targetfiletype in filenames:
-            print(f"Found raw.mrd2 file at {os.path.join(root, 'raw.mrd2')}")
-            mrd2list.append(os.path.join(root, 'raw.mrd2'))
+            if '*_recon.mrd2' in filenames:
+                continue
+            else:
+                print(f"Found raw.mrd2 file at {os.path.join(root, 'raw.mrd2')}", file=sys.stderr)
+                mrd2list.append(os.path.join(root, 'raw.mrd2'))
+        else:
+            print(f"No raw.mrd2 file found at {os.path.join(root, 'raw.mrd2')}", file=sys.stderr)
     return(mrd2list)
 
 def generate_aux_images(imglist):
