@@ -731,11 +731,24 @@ if __name__ == "__main__":
     # run all mrd2 files in the directory for local run
     if basedir != '.':
         fnames = findmrd2files(basedir, targetfiletype)
+        # collect only the recon.mrd2 files generated in this run so already
+        # reconstructed (skipped) files are not picked up downstream
+        new_recon_files = []
         for i, f in enumerate(fnames):
             experiment_name = Path(f).parent.name
             output_path = f.replace('raw.mrd2', experiment_name + '_recon.mrd2')
+            if os.path.exists(output_path):
+                print(f'Skipping {i+1}/{len(fnames)}, recon already exists at filepath: {output_path}', file=sys.stderr, flush=True)
+                continue
             print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {f}', file=sys.stderr, flush=True)
             reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
+            new_recon_files.append(output_path)
+        # write a manifest of newly generated recon files for downstream tools
+        manifest_path = os.path.join(basedir, 'new_recon_files.txt')
+        with open(manifest_path, 'w') as mf:
+            for recon_path in new_recon_files:
+                mf.write(recon_path + '\n')
+        print(f'Wrote {len(new_recon_files)} new recon file(s) to manifest: {manifest_path}', file=sys.stderr, flush=True)
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
 

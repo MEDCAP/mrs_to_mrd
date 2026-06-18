@@ -49,20 +49,30 @@ if ! winpty python mrd2recon.py -f "$folder_path" -bic_tm 0.0 -urea 2.3 -pyr_s 9
     exit 1
 fi
 
-echo "🔍 Searching for recon.mrd2 files..."
+echo "🔍 Searching for newly generated recon.mrd2 files..."
 
-# Find all recon.mrd2 files under the folder path
-mapfile -t mrd2_files < <(find "$folder_path" -name "*recon.mrd2" -type f 2>/dev/null)
+# Read only the recon.mrd2 files generated in this run from the manifest
+# written by mrd2recon.py (skipped/pre-existing recon files are excluded)
+manifest_file="$folder_path/new_recon_files.txt"
 
-# Check if any files were found
-if [ ${#mrd2_files[@]} -eq 0 ]; then
-    echo "No recon.mrd2 files found in $folder_path"
+if [ ! -f "$manifest_file" ]; then
+    echo "No recon manifest found at $manifest_file"
     echo "Press any key to exit..."
     read -n 1
     exit 1
 fi
 
-echo "Found ${#mrd2_files[@]} recon.mrd2 file(s):"
+mapfile -t mrd2_files < <(grep -v '^[[:space:]]*$' "$manifest_file")
+
+# Check if any files were found
+if [ ${#mrd2_files[@]} -eq 0 ]; then
+    echo "No newly generated recon.mrd2 files in $folder_path"
+    echo "Press any key to exit..."
+    read -n 1
+    exit 1
+fi
+
+echo "Found ${#mrd2_files[@]} new recon.mrd2 file(s):"
 echo ""
 
 # Add Ctrl+C handler for graceful exit
