@@ -98,7 +98,11 @@ def groupMRDfiles_collect(rootdir):
     d = os.listdir(rootdir)
     for f in d:
         if(os.path.isdir(rootdir + '/' + f)):
-            l.extend(groupMRDfiles_collect(rootdir + '/' + f))
+            if 'raw.mrd2' in os.listdir(rootdir + '/' + f):
+                print(f'Skipping {rootdir + '/' + f} as it contains a raw.mrd2 file', file=sys.stderr)
+                continue
+            else:
+                l.extend(groupMRDfiles_collect(rootdir + '/' + f))
         elif(f.find('.MRD') > 0):
             mrsdata_filepath = rootdir + '/' + f
             mrs.mread3d(mrsdata_filepath)
@@ -168,10 +172,15 @@ def convert_mrs_to_mrd(basedir, unifylevel):
     groups = groupMRDfiles(basedir, unifylevel)
     # groups are lists of MRS files to be grouped together in a single .MRD2 file format
     for g in groups:
-        # get the measurement ID from the first file in the group
+        print(f'basedir: {basedir}')
         basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
+        raw_mrd2_path = basedir + '/' + 'raw.mrd2'
+        # skip groups that have already been converted and move to the next directory
+        if os.path.exists(raw_mrd2_path):
+            print(f'Skipping {basedir}, raw.mrd2 already exists at {raw_mrd2_path}', file=sys.stderr)
+            continue
         print(f'grouping {len(g)} files into {basedir}', file=sys.stderr)
-        w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
+        w = mrd.BinaryMrdWriter(raw_mrd2_path)
         header_written = False
         for ig in range(len(g)):
             # write the header once for the entire group after continue
