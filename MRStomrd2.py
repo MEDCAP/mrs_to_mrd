@@ -139,7 +139,7 @@ def groupMRDfiles(rootdir, unifylevel):
             groups.append([f])
     return(groups)
 
-def make_header(mrs, measID):
+def make_header(mrs):
     # make mrd2 header. For now only filling in sequence name but some day should do more
     h = mrd.Header()
     h.measurement_information = mrd.MeasurementInformationType()
@@ -151,7 +151,6 @@ def make_header(mrs, measID):
     h.measurement_information.relative_table_position.z = mrs.FOVoff[2]
     # This is definitely a misuse of h1 resonance frequency for non-1H acquisitions
     h.experimental_conditions.h1_resonance_frequency_hz = mrs.basefreq
-    h.measurement_information.measurement_id = measID
 
     limits_avg = mrd.LimitType()
     limits_avg.minimum = 0
@@ -170,7 +169,6 @@ def convert_mrs_to_mrd(basedir, unifylevel):
     # groups are lists of MRS files to be grouped together in a single .MRD2 file format
     for g in groups:
         # get the measurement ID from the first file in the group
-        measID = g[0].split('/')[-(unifylevel + 1)]
         basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
         print(f'grouping {len(g)} files into {basedir}', file=sys.stderr)
         w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
@@ -195,7 +193,7 @@ def convert_mrs_to_mrd(basedir, unifylevel):
                 print('unifylevel not supported', file=sys.stderr)
                 return
             if not header_written:
-                h = make_header(mrs, measID)
+                h = make_header(mrs)
                 w.write_header(h)
                 header_written = True
             w.write_data(generate_acquisition(mrs, ig, at))
