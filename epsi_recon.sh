@@ -41,28 +41,50 @@ if ! winpty python MRStomrd2.py -f "$folder_path" -u 3; then
     exit 1
 fi
 
-echo "Running reconstruction code..."
-if ! winpty python mrd2recon.py -f "$folder_path" -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -poop_tm 15.9 -hyd_tm 18.1 -lac_m 21.8; then
-    echo "❌ Reconstruction failed!"
+# MRStomrd2.py writes the folders it converted in this run to this manifest;
+# recon and plotting only operate on these folders
+manifest_file="$folder_path/new_convert_files.txt"
+
+if [ ! -f "$manifest_file" ]; then
+    echo "No convert manifest found at $manifest_file"
     echo "Press any key to exit..."
     read -n 1
     exit 1
 fi
+
+# Load the newly converted folders into an array
+mapfile -t convert_dirs < <(grep -v '^[[:space:]]*$' "$manifest_file")
+
+if [ ${#convert_dirs[@]} -eq 0 ]; then
+    echo "No newly converted folders in $folder_path"
+    echo "Press any key to exit..."
+    read -n 1
+    exit 1
+fi
+
+echo "Running reconstruction on ${#convert_dirs[@]} newly converted folder(s)..."
+for folder in "${convert_dirs[@]}"; do
+    echo "Reconstructing: $folder"
+    if ! winpty python mrd2recon.py -f "$folder" -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -poop_tm 15.9 -hyd_tm 18.1 -lac_m 21.8; then
+        echo "❌ Reconstruction failed for $folder!"
+        echo "Press any key to exit..."
+        read -n 1
+        exit 1
+    fi
+done
 
 echo "🔍 Searching for newly generated recon.mrd2 files..."
 
-# Read only the recon.mrd2 files generated in this run from the manifest
-# written by mrd2recon.py (skipped/pre-existing recon files are excluded)
-manifest_file="$folder_path/new_recon_files.txt"
-
-if [ ! -f "$manifest_file" ]; then
-    echo "No recon manifest found at $manifest_file"
-    echo "Press any key to exit..."
-    read -n 1
-    exit 1
-fi
-
-mapfile -t mrd2_files < <(grep -v '^[[:space:]]*$' "$manifest_file")
+# Map each converted folder to its recon.mrd2 output for plotting
+mrd2_files=()
+for folder in "${convert_dirs[@]}"; do
+    recon_file=$(ls "$folder"/*_recon.mrd2 2>/dev/null | head -n 1)
+    if [ -n "$recon_file" ] && [ -f "$recon_file" ]; then
+        mrd2_files+=("$recon_file")
+    else
+        echo "⚠️  No recon.mrd2 found for converted folder: $folder"
+    fi
+done
 
 # Check if any files were found
 if [ ${#mrd2_files[@]} -eq 0 ]; then

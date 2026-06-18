@@ -731,10 +731,21 @@ if __name__ == "__main__":
     # run all mrd2 files in the directory for local run
     if basedir != '.':
         fnames = findmrd2files(basedir, targetfiletype)
+        # load the list of folders newly converted in this run; only these
+        # folders should be reconstructed. If the manifest is missing fall back
+        # to reconstructing everything found.
+        convert_manifest_path = os.path.join(basedir, 'new_convert_files.txt')
+        new_convert_dirs = None
+        if os.path.exists(convert_manifest_path):
+            with open(convert_manifest_path) as cf:
+                new_convert_dirs = set(os.path.normpath(line.strip()) for line in cf if line.strip())
         # collect only the recon.mrd2 files generated in this run so already
         # reconstructed (skipped) files are not picked up downstream
-        new_recon_files = []
         for i, f in enumerate(fnames):
+            folder = os.path.normpath(os.path.dirname(f))
+            if new_convert_dirs is not None and folder not in new_convert_dirs:
+                print(f'Skipping {i+1}/{len(fnames)}, folder not in convert manifest: {folder}', file=sys.stderr, flush=True)
+                continue
             experiment_name = Path(f).parent.name
             output_path = f.replace('raw.mrd2', experiment_name + '_recon.mrd2')
             if os.path.exists(output_path):
@@ -742,13 +753,6 @@ if __name__ == "__main__":
                 continue
             print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {f}', file=sys.stderr, flush=True)
             reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
-            new_recon_files.append(output_path)
-        # write a manifest of newly generated recon files for downstream tools
-        manifest_path = os.path.join(basedir, 'new_recon_files.txt')
-        with open(manifest_path, 'w') as mf:
-            for recon_path in new_recon_files:
-                mf.write(recon_path + '\n')
-        print(f'Wrote {len(new_recon_files)} new recon file(s) to manifest: {manifest_path}', file=sys.stderr, flush=True)
     else:
         reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames, wigglefactor)
 

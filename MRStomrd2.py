@@ -170,16 +170,18 @@ def make_header(mrs):
 def convert_mrs_to_mrd(basedir, unifylevel):
     # assemble groups of MRD files
     groups = groupMRDfiles(basedir, unifylevel)
+    # collect folders newly converted in this run so downstream recon only
+    # processes new data
+    new_convert_dirs = []
     # groups are lists of MRS files to be grouped together in a single .MRD2 file format
     for g in groups:
-        print(f'basedir: {basedir}')
-        basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
-        raw_mrd2_path = basedir + '/' + 'raw.mrd2'
+        group_dir = '/'.join(g[0].split('/')[:(-unifylevel)])
         # skip groups that have already been converted and move to the next directory
+        raw_mrd2_path = os.path.join(group_dir, 'raw.mrd2')
         if os.path.exists(raw_mrd2_path):
-            print(f'Skipping {basedir}, raw.mrd2 already exists at {raw_mrd2_path}', file=sys.stderr)
+            print(f'Skipping {group_dir}, raw.mrd2 already exists at {raw_mrd2_path}', file=sys.stderr)
             continue
-        print(f'grouping {len(g)} files into {basedir}', file=sys.stderr)
+        print(f'grouping {len(g)} files into {group_dir}', file=sys.stderr)
         w = mrd.BinaryMrdWriter(raw_mrd2_path)
         header_written = False
         for ig in range(len(g)):
@@ -207,6 +209,13 @@ def convert_mrs_to_mrd(basedir, unifylevel):
                 header_written = True
             w.write_data(generate_acquisition(mrs, ig, at))
         w.close()
+        new_convert_dirs.append(os.path.normpath(group_dir))
+    # write a manifest of newly converted folders for downstream tools
+    manifest_path = os.path.join(basedir, 'new_convert_files.txt')
+    with open(manifest_path, 'w') as mf:
+        for convert_dir in new_convert_dirs:
+            mf.write(convert_dir + '\n')
+    print(f'Wrote {len(new_convert_dirs)} newly converted folder(s) to manifest: {manifest_path}', file=sys.stderr)
 
 # -u 3 consolidates the files as appropriate for EPSI. 
 # spectral data like Bukola's and David's uses -u 1
