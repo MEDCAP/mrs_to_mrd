@@ -20,10 +20,10 @@ from lorn import lornfit, lor1fit, lorneval, lor1plot, lornputspect, lornpackx0,
 
 debugphasing = False
 debuglorn = False
-saveLornFitLocal = True
-saveMetaboliteLocal = True
-kfitdata_local = True
-MRSsave_dir = "C:/Users/MRS/Desktop"
+saveLornFitLocal = False
+saveMetaboliteLocal = False
+kfitdata_local = False
+MRSsave_dir = os.environ.get("MRS_SAVE_DIR", "C:/Users/MRS/Desktop")
 
 basedir = '.'
 fidpad = 1
@@ -44,8 +44,6 @@ def findmrd2files(basedir, targetfiletype):
             else:
                 print(f"Found raw.mrd2 file at {os.path.join(root, 'raw.mrd2')}", file=sys.stderr)
                 mrd2list.append(os.path.join(root, 'raw.mrd2'))
-        else:
-            print(f"No raw.mrd2 file found at {os.path.join(root, 'raw.mrd2')}", file=sys.stderr)
     return(mrd2list)
 
 def generate_aux_images(imglist):
@@ -206,17 +204,16 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
     print(f'Performing fft', file=sys.stderr)
     imgs = []
     phantom_imgsets = []
-    print(f"phantom_kspaces shape: {phantom_kspaces[0].shape}")
-    phantom_recon_array = np.zeros((len(phantom_kspaces), phantom_kspaces[0].shape[0], phantom_kspaces[0].shape[1]))
     if len(phantom_kspaces) > 0:
+        phantom_recon_array = np.zeros((len(phantom_kspaces), phantom_kspaces[0].shape[0], phantom_kspaces[0].shape[1]))
         for kspace in phantom_kspaces:
             img = np.zeros(([1] + list(kspace.shape)), dtype = 'complex')
             img[0, :] = np.fft.fftshift(np.fft.fftn(kspace))
             phantom_imgsets = phantom_imgsets + [img]
-    hpimgset = np.zeros(([len(kspaces)] + list(kspaces[0].shape)), dtype = 'complex')
-    # plot kspace
-    for iimg in range(len(kspaces)):
-        hpimgset[iimg, :] = np.fft.fftshift(np.fft.fftn(kspaces[iimg]))
+    if len(kspaces) > 0:
+        hpimgset = np.zeros(([len(kspaces)] + list(kspaces[0].shape)), dtype = 'complex')
+        for iimg in range(len(kspaces)):
+            hpimgset[iimg, :] = np.fft.fftshift(np.fft.fftn(kspaces[iimg]))
     allimgsets = phantom_imgsets + [hpimgset]
     phantomscaling = 0
     for imgset in allimgsets:
@@ -352,19 +349,19 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
         plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
     # plt.show()
     if saveLornFitLocal:
-        if "cirrhrat" in experiment_name:
-            lorn_fit_dir = os.path.join(MRSsave_dir, "Bukola's Data", "lorn_fit")
-        else:
-            lorn_fit_dir = os.path.join(MRSsave_dir, "shurik", "lorn_fit")
-        if os.path.exists(lorn_fit_dir):
-            lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
-            try:
-                plt.savefig(lorn_fit_path)
-                print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
-            except Exception as e:
-                print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
-        else:
-            raise FileNotFoundError(f"Directory {lorn_fit_dir} does not exist.")
+        lorn_fit_dir = os.environ.get("MRS_LORNFIT_DIR")
+        if not lorn_fit_dir:
+            if "cirrhrat" in experiment_name:
+                lorn_fit_dir = os.path.join(MRSsave_dir, "Bukola's Data", "lorn_fit")
+            else:
+                lorn_fit_dir = os.path.join(MRSsave_dir, "shurik", "lorn_fit")
+        os.makedirs(lorn_fit_dir, exist_ok=True)
+        lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
+        try:
+            plt.savefig(lorn_fit_path)
+            print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
+        except Exception as e:
+            print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
 
     # append_auximage(auximages, echo_number=a.head.idx.contrast)
     # now do voxel fits
@@ -391,24 +388,27 @@ def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: n
 
     # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
     if saveMetaboliteLocal:
-        if "cirrhrat" in experiment_name:
-            mat_dir = os.path.join(MRSsave_dir, "Bukola's Data", "processed_npyfiles")
-        else:
-            mat_dir = os.path.join(MRSsave_dir, "shurik", "processed_npyfiles")
-        if os.path.exists(mat_dir):
-            try:
+        mat_dir = os.environ.get("MRS_PROCESSED_DIR")
+        if not mat_dir:
+            if "cirrhrat" in experiment_name:
+                mat_dir = os.path.join(MRSsave_dir, "Bukola's Data", "processed_npyfiles")
+            else: # ischema or control
+                mat_dir = os.path.join(MRSsave_dir, "shurik", "processed_npyfiles")
+        os.makedirs(mat_dir, exist_ok=True)
+        try:
+            if len(peakoffsets) == 7 and not "cirrhrat" in experiment_name:
+                mat_filepath = os.path.join(mat_dir, f'{experiment_name}_metaboites_withpoop.mat')
+            else:
                 mat_filepath = os.path.join(mat_dir, f'{experiment_name}_metabolites.mat')
-                savemat(mat_filepath, {
-                    'rawdata': metabolites,
-                    'phantom_scale': phantomscaling,
-                    'phantom': phantom_recon_array
-                }
-                )
-                print(f"Saving metabolites mat file at {mat_filepath}")
-            except Exception as e:
-                print(f"Error saving metabolites mat file: {e}", file=sys.stderr)
-        else:
-            raise FileNotFoundError(f"Directory {mat_dir} does not exist.")
+            savemat(mat_filepath, {
+                'rawdata': metabolites,
+                'phantom_scale': phantomscaling,
+                'phantom': phantom_recon_array
+            }
+            )
+            print(f"Saving metabolites mat file at {mat_filepath}")
+        except Exception as e:
+            print(f"Error saving metabolites mat file: {e}", file=sys.stderr)
     return([metabolites, auximages])
 
 def generate_spectra(h: mrd.Header,

@@ -7,18 +7,19 @@ import sys
 import os
 import argparse
 from statistics import mode
-from acqtypes import AcqType
+from pathlib import Path
 
 # mrd python package
 # https://github.com/MEDCAP/mrd-fork/tree/dev# is added at root of this repository as a git submodule
 # path to mrd python package is 'root/mrd-fork/python' 
-# sys.path.insert(0, 'mrd-fork/python')
+sys.path.insert(0, 'mrd-fork/python')
 import mrd
 from MRSreader import MRSdata
+from acqtypes import AcqType
 
 mrs = MRSdata()
 
-def generate_acquisition(g, ide, acqtype):
+def generate_acquisition(g, acqtype):
     # make the pulse, gradient, and (raw data) acquisitions. g is the MRSdata structure read in from an individual
     # file, and ide is the index of this file in the image series
     npts = g.rawdata.shape[0] # number of points per acquisition
@@ -99,7 +100,6 @@ def groupMRDfiles_collect(rootdir):
     for f in d:
         if(os.path.isdir(rootdir + '/' + f)):
             if 'raw.mrd2' in os.listdir(rootdir + '/' + f):
-                print(f'Skipping {rootdir + '/' + f} as it contains a raw.mrd2 file', file=sys.stderr)
                 continue
             else:
                 l.extend(groupMRDfiles_collect(rootdir + '/' + f))
@@ -109,39 +109,6 @@ def groupMRDfiles_collect(rootdir):
             print(f'Add file {mrsdata_filepath} with {mrs.navg} avg')
             l.append(mrsdata_filepath)
     return l
-
-def groupMRDfiles(rootdir, unifylevel):
-    '''
-    Group .MRD files into groups of files that have the same path up to the unifylevel
-    Args:
-        rootdir: path to the root directory as a string specified by -f command line argument
-        unifylevel: 3 to concatenate each image file into single MRD file
-                    1 to keep each image file as a separate MRD file
-                    as an integer specified by -u command line argument
-    Returns
-        List of paths of .MRD files to be grouped together
-    '''
-    if(not os.path.isdir(rootdir)):
-        return([])
-    l = groupMRDfiles_collect(rootdir)
-    # PUT NAVG INTO A USER INT FOR EACH ACQUISITION
-    groups = []
-    # for each .MRD files in the list,
-    for f in l:
-        fs = f.split('/')
-        addedtogroup = False
-        for g in groups:
-            gs = g[0].split('/')
-            if(len(fs) == len(gs)):
-                issame = True
-                for i in range(len(fs) - unifylevel):
-                    issame = issame and (fs[i] == gs[i])
-                if(issame):
-                    g.append(f)
-                    addedtogroup = True
-        if(not addedtogroup):
-            groups.append([f])
-    return(groups)
 
 def make_header(mrs):
     # make mrd2 header. For now only filling in sequence name but some day should do more
@@ -166,22 +133,54 @@ def make_header(mrs):
     h.encoding.append(enc)
     return h
 
+def groupMRDfiles(rootdir, unifylevel):
+    '''
+    Group .MRD files into groups of files that have the same path up to the unifylevel
+    Args:
+        rootdir: path to the root directory as a string specified by -f command line argument
+        unifylevel: 3 to concatenate each image file into single MRD file
+                    1 to keep each image file as a separate MRD file
+                    as an integer specified by -u command line argument
+    Returns
+        List of paths of .MRD files to be grouped together
+    '''
+    if(not os.path.isdir(rootdir)):
+        return([])
+    l = groupMRDfiles_collect(rootdir)
+    # PUT NAVG INTO A USER INT FOR EACH ACQUISITION
+    grouped_mrd_files = []
+    # for each .MRD files in the list,
+    for f in l:
+        fs = f.split('/')
+        addedtogroup = False
+        for g in grouped_mrd_files:
+            gs = g[0].split('/')
+            if(len(fs) == len(gs)):
+                issame = True
+                for i in range(len(fs) - unifylevel):
+                    issame = issame and (fs[i] == gs[i])
+                if(issame):
+                    g.append(f)
+                    addedtogroup = True
+        if(not addedtogroup):
+            grouped_mrd_files.append([f])
+    return grouped_mrd_files
+
 # check to see if a directory is specified
 def convert_mrs_to_mrd(basedir, unifylevel):
     # assemble groups of MRD files
-    groups = groupMRDfiles(basedir, unifylevel)
-    # collect folders newly converted in this run so downstream recon only
-    # processes new data
+    grouped_mrd_files = groupMRDfiles(basedir, unifylevel)
+    # collect folders newly converted in this run so downstream recon only processes new data
     new_convert_dirs = []
     # groups are lists of MRS files to be grouped together in a single .MRD2 file format
-    for g in groups:
-        group_dir = '/'.join(g[0].split('/')[:(-unifylevel)])
+    for g in grouped_mrd_files:
+        experiment_dir = Path(g[0]).parents[unifylevel-1]
         # skip groups that have already been converted and move to the next directory
-        raw_mrd2_path = os.path.join(group_dir, 'raw.mrd2')
+        raw_mrd2_path = os.path.join(experiment_dir, 'raw.mrd2')
         if os.path.exists(raw_mrd2_path):
-            print(f'Skipping {group_dir}, raw.mrd2 already exists at {raw_mrd2_path}', file=sys.stderr)
+            print(f'Skipping {experiment_dir}, raw.mrd2 already exists at {raw_mrd2_path}', file=sys.stderr)
             continue
-        print(f'grouping {len(g)} files into {group_dir}', file=sys.stderr)
+        print(f'grouping {len(g)} files into {raw_mrd2_path}', file=sys.stderr)
         w = mrd.BinaryMrdWriter(raw_mrd2_path)
         header_written = False
         for ig in range(len(g)):
@@ -207,11 +206,11 @@ def convert_mrs_to_mrd(basedir, unifylevel):
                 h = make_header(mrs)
                 w.write_header(h)
                 header_written = True
-            w.write_data(generate_acquisition(mrs, ig, at))
+            w.write_data(generate_acquisition(mrs, at))
         w.close()
-        new_convert_dirs.append(os.path.normpath(group_dir))
+        new_convert_dirs.append(os.path.normpath(raw_mrd2_path))
     # write a manifest of newly converted folders for downstream tools
-    manifest_path = os.path.join(basedir, 'new_convert_files.txt')
+    manifest_path = os.path.join(basedir, "newly_converted_mrd_files.txt")
     with open(manifest_path, 'w') as mf:
         for convert_dir in new_convert_dirs:
             mf.write(convert_dir + '\n')
