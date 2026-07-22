@@ -31,7 +31,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import BinaryIO, Iterable, List, BinaryIO
+from typing import BinaryIO, Iterable, List, Union
 import numpy as np
 
 # mrd python package
@@ -193,7 +193,8 @@ def generate_acquisition(mrs: MRSdata, head: mrd.Header, idx: int) -> Iterable[m
         for iview in range(nrep):
             # encode acquisition field
             acq = mrd.Acquisition()
-            acq.data = np.transpose(np.expand_dims(mrs.rawdata[:, 0, 0, 0, 0, iview], (0)))
+            # MRS is single channel acquisition. Add new empty coil dimension since acq.data.shape=(coils,samples)
+            acq.data = np.expand_dims(mrs.rawdata[:, 0, 0, 0, 0, iview], (0))
             pulse_start = np.uint64(mrs.acqstarttime * 100) + np.uint64(iview * TR) # mrs.acqstarttime in units of 100ns converted to ns
             acq.head.idx.repetition = iview
             acq.head.acquisition_time_stamp_ns = pulse_start + TE
@@ -240,17 +241,20 @@ def make_header(mrs: MRSdata, meas_id: str, rep_count: int, phantom_idx_list: Li
     limits_rep.minimum = 0
     limits_rep.maximum = rep_count - len(phantom_idx_list) - 1  # max repetition as index
     
+    # encode size of each dimension of rawdata
+    limits_kspace_encode_step_0 = mrd.LimitType()
+    limits_kspace_encode_step_0.maximum = mrs.rawdata.shape[0] - 1
+
     limits_kspace_encode_step_1 = mrd.LimitType()
-    limits_kspace_encode_step_1.minimum = 0
     limits_kspace_encode_step_1.maximum = mrs.rawdata.shape[1] - 1     # max views as index
 
     limits_slice = mrd.LimitType()
-    limits_slice.minimum = 0
     limits_slice.maximum = mrs.rawdata.shape[3] - 1     # max slices as index
 
     limits = mrd.EncodingLimitsType()
+    limits.kspace_encoding_step_0 = limits_kspace_encode_step_0
+    limits.kspace_encoding_step_1 = limits_kspace_encode_step_1
     limits.repetition = limits_rep
-    limits.kspace_encode_step_1 = limits_kspace_encode_step_1
     limits.slice = limits_slice
     enc = mrd.EncodingType()
     enc.encoded_space = e
@@ -300,8 +304,6 @@ def group_mrd_files(folder: Path, unifylevel: int) -> List[List[Path]]:
     Returns:
         List of lists of Path objects
     """
-    if not folder.is_dir():
-        raise ValueError(f"Input folder {folder} is not a directory")
     mrd_filepath_list = collect_mrd_files(folder)   # list of all MRS filepaths in the folder   
     mrd_file_groups: List[List[Path]] = []          # list of list as grouped mrd files
     for file in mrd_filepath_list:
@@ -334,18 +336,19 @@ def convert_mrs_folder_to_mrd(folder: Path, unifylevel: int) -> None:
     mrs = MRSdata()
     mrd_file_groups = group_mrd_files(folder, unifylevel)
     for group in mrd_file_groups:
-        meas_id = group[0].parts[-(unifylevel+1)]                                   # e.g.) meas_id=cirrhrat_0_1
-        output_dir = Path(*group[0].parts[:-unifylevel])                            # e.g.) cirrhrat_data/cirrhrat_0_1/
-        with mrd.BinaryMrdWriter(os.path.join(output_dir, "raw.mrd2")) as writer:   # e.g.) cirrhrat_data/cirrhrat_0_1/raw.mrd2
+        meas_id = group[0].parts[-(unifylevel+1)]                                       # e.g.) meas_id=cirrhrat_0_1
+        raw_filepath = os.path.join(Path(*group[0].parts[:-unifylevel]), "raw.mrd2")    # e.g.) cirrhrat_data/cirrhrat_0_1/raw.mrd2
+        with mrd.BinaryMrdWriter(raw_filepath) as writer:
             # iterate through group to count the number of phantoms
-            phantom_idx_list: List[int] = []                                    # index of phantom data in each file group
+            phantom_idx_list: List[int] = []                                            # index of phantom data in each file group
             for j, filepath in enumerate(group):
                 mrs.mread3d(filepath)
                 # if files in the group are inconsistent between epsi and fid with unifylevel, remove it
-                if unifylevel == 3 and "1pul" in mrs.pplfile:
+                if unifylevel == 3 and "1pul" in mrs.pplfile or "fid" in mrs.pplfile:
                     group.remove(filepath)
                 if unifylevel == 1 and "epsi" in mrs.pplfile:
                     group.remove(filepath)
+                # if navg>1 the file is phantom data
                 if mrs.navg > 1:                                                # navg>1 is phantom
                     phantom_idx_list.append(j)
                     print(f"Phantom data found at {filepath}", file=sys.stderr)
@@ -361,12 +364,19 @@ def convert_mrs_folder_to_mrd(folder: Path, unifylevel: int) -> None:
                 writer.write_data(generate_acquisition(mrs, header, idx))
                 # writer.write_data(generate_pulseq(mrs))                       # generate pulseq field, currently not writing pulseq to save time as it is not used for reconstruction
     
-def convert_mrs_file_to_mrd2(input: BinaryIO, output: BinaryIO, write_header: bool):
+def convert_mrs_file_to_mrd(input: Path,
+                            output: Path):
     """
     Convert single MRS .MRD file to mrd2 format
     """
-    pass
-
+    mrs = MRSdata()
+    with mrd.BinaryMrdWriter(output) as writer:
+        mrs.mread3d(input)
+        meas_id = input.parent.name
+        rep_count = mrs.rawdata.shape[5]
+        header = make_header(mrs, meas_id, rep_count, [])
+        writer.write_header(header)
+        writer.write_data(generate_acquisition(mrs, header, 0))
 
 def main() -> int:
     """
@@ -397,7 +407,8 @@ def main() -> int:
         if not args.input.is_file():
             raise ValueError(f"{args.input} is not a file")
         print(f"Convert single input file {args.input} to mrd2", file=sys.stderr)
-        convert_mrs_file_to_mrd(args.input)
+        output = os.path.join(args.input.parent,"raw.mrd")
+        convert_mrs_file_to_mrd(args.input, output)
     else:
         raise ValueError("Either --folder or --input must be specified")
     return 0
