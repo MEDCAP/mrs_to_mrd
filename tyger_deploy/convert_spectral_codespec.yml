@@ -1,0 +1,35 @@
+# Convert a tar of one spectral (1pul/fid) scan directory to an MRD2 stream.
+#
+#   tar cf - -C /data PYR_HepG22.mrs \
+#     | tyger run exec -f tyger_deploy/convert_spectral_codespec.yml > raw.mrd2
+#
+# Tyger turns each declared buffer into a named FIFO and passes its path in <NAME>_PIPE, so the
+# entrypoint's --input/--output defaults would pick these up on their own; they are spelled out
+# here so the wiring is visible in the codespec.
+job:
+  codespec:
+    image: ghcr.io/medcap/mrs-convert-spectral:latest
+    buffers:
+      inputs: ["input"]
+      outputs: ["output"]
+    args:
+      - --input
+      - $(INPUT_PIPE)
+      - --output
+      - $(OUTPUT_PIPE)
+    resources:
+      requests:
+        cpu: 1
+        # a spectral scan is one file, so this is roomier than it needs to be
+        memory: 1G
+
+  tags:
+    version: "1.0"
+
+  nodePool: cpunp
+
+  replicas: 1
+
+cluster: tep-centralus-1
+
+timeoutSeconds: 3600

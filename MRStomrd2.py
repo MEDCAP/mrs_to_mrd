@@ -1,5 +1,5 @@
 """
-Convert a list of MRS files to MRD2 format
+Convert of MRS files to MRD2 format
 EPSI:
 - raw folder can be one experiment folder with multiple scans or one parent folder with multiple experiment folders
 - skip scans with more than one measurement as phantom data
@@ -277,8 +277,9 @@ def collect_mrd_files(folder: Path) -> List[Path]:
     """
     mrd_filepath_list: List[Path] = []
     file_extension = ".MRD"
-    # recursively find all file paths with .MRD extension in the rootdir
-    for entry in folder.iterdir():
+    # sorted, because iterdir order is arbitrary and a file's position in this list becomes its
+    # acquisition repetition index
+    for entry in sorted(folder.iterdir()):
         if entry.is_dir():
             mrd_filepath_list.extend(collect_mrd_files(entry))
             continue
@@ -304,18 +305,66 @@ def group_mrd_files(folder: Path, unifylevel: int) -> List[List[Path]]:
     Returns:
         List of lists of Path objects
     """
-    mrd_filepath_list = collect_mrd_files(folder)   # list of all MRS filepaths in the folder   
+    mrd_filepath_list = collect_mrd_files(folder)   # list of all MRS filepaths in the folder
     mrd_file_groups: List[List[Path]] = []          # list of list as grouped mrd files
+    # unifylevel=3 groups on the directory two levels up (…/cirrhrat_0_1/epsi), unifylevel=1 on the
+    # file's own parent (…/PYR_HepG22.mrs). Note parts[:-0] is the empty tuple, not the whole path,
+    # so the unifylevel=1 case has to be clamped or every file lands in one group
+    trim = max(unifylevel - 1, 1)
     for file in mrd_filepath_list:
         is_grouped = False
         for group in mrd_file_groups:
-            if file.parts[:-(unifylevel-1)] == group[0].parts[:-(unifylevel-1)]:
+            if file.parts[:-trim] == group[0].parts[:-trim]:
                 group.append(file)
                 is_grouped = True
+                break
         if not is_grouped:
             mrd_file_groups.append([file])
     print(f"Grouped {len(mrd_filepath_list)} files into {len(mrd_file_groups)} groups", file=sys.stderr)
     return mrd_file_groups
+
+def convert_group_to_mrd(mrs_list: List[MRSdata],
+                         meas_id: str,
+                         output: BinaryIO,
+                         rep_count: int = 0) -> None:
+    """
+    Write a group of already-parsed MRS files as one MRD2 stream.
+    Split out from convert_mrs_folder_to_mrd so that callers which obtained the data by some route
+    other than walking a directory (e.g. a tar stream arriving on a Tyger buffer) share one
+    implementation of the phantom detection, header, and repetition numbering.
+    Args:
+        - mrs_list: parsed MRSdata, one per file, in acquisition order
+        - meas_id: measurement id recorded in the header, e.g. cirrhrat_0_1
+        - output: writable binary stream. Must be a file object, not a path: BinaryMrdWriter
+                  special-cases str only, so a Path would be mistaken for a stream
+        - rep_count: repetitions the header should advertise. Defaults to len(mrs_list), which is
+                     correct for EPSI where each file holds one repetition. Spectral data carries
+                     its repetitions on the nex axis inside a single file, so that path passes
+                     rawdata.shape[5] instead
+    Returns:
+        - None
+    """
+    if not mrs_list:
+        raise ValueError("Cannot convert an empty group")
+    # navg>1 marks phantom data, which is written but excluded from the repetition numbering
+    phantom_idx_list = [i for i, mrs in enumerate(mrs_list) if mrs.navg > 1]
+    print(f"Found {len(phantom_idx_list)} phantom data among {len(mrs_list)} files", file=sys.stderr)
+    # the header describes the real acquisitions, so derive it from the first non-phantom file. A
+    # phantom is a separate calibration scan and its matrix size differs from the data it calibrates
+    # (e.g. 1664x12 against 1280x8), so taking the header from a phantom mis-sizes the encoding
+    header_idx = next((i for i in range(len(mrs_list)) if i not in phantom_idx_list), -1)
+    if header_idx < 0:
+        raise ValueError("Every file in the group is phantom data (navg>1)")
+    if header_idx != 0:
+        print(f"Header taken from file index {header_idx}, the first non-phantom", file=sys.stderr)
+    if not rep_count:
+        rep_count = len(mrs_list)
+    # the writer must be closed to emit the end-of-stream sentinel, hence the with block
+    with mrd.BinaryMrdWriter(output) as writer:
+        header = make_header(mrs_list[header_idx], meas_id, rep_count, phantom_idx_list)
+        writer.write_header(header)
+        for idx, mrs in enumerate(mrs_list):
+            writer.write_data(generate_acquisition(mrs, header, idx))
 
 def convert_mrs_folder_to_mrd(folder: Path, unifylevel: int) -> None:
     """
@@ -333,37 +382,32 @@ def convert_mrs_folder_to_mrd(folder: Path, unifylevel: int) -> None:
     Returns:
         None
     """
-    mrs = MRSdata()
     mrd_file_groups = group_mrd_files(folder, unifylevel)
     for group in mrd_file_groups:
         meas_id = group[0].parts[-(unifylevel+1)]                                       # e.g.) meas_id=cirrhrat_0_1
         raw_filepath = os.path.join(Path(*group[0].parts[:-unifylevel]), "raw.mrd2")    # e.g.) cirrhrat_data/cirrhrat_0_1/raw.mrd2
-        with mrd.BinaryMrdWriter(raw_filepath) as writer:
-            # iterate through group to count the number of phantoms
-            phantom_idx_list: List[int] = []                                            # index of phantom data in each file group
-            for j, filepath in enumerate(group):
-                mrs.mread3d(filepath)
-                # if files in the group are inconsistent between epsi and fid with unifylevel, remove it
-                if unifylevel == 3 and "1pul" in mrs.pplfile or "fid" in mrs.pplfile:
-                    group.remove(filepath)
-                if unifylevel == 1 and "epsi" in mrs.pplfile:
-                    group.remove(filepath)
-                # if navg>1 the file is phantom data
-                if mrs.navg > 1:                                                # navg>1 is phantom
-                    phantom_idx_list.append(j)
-                    print(f"Phantom data found at {filepath}", file=sys.stderr)
-            print(f"Found {len(phantom_idx_list)} phantom data among {len(group)} files", file=sys.stderr)
-            for idx, filepath in enumerate(group):
-                mrs.mread3d(filepath)
-                if idx==0:
-                    if mrs.navg == 1:
-                        header = make_header(mrs, meas_id, len(group), phantom_idx_list)
-                        writer.write_header(header)                                 # write header for the first non-phantom data in the group
-                    else:
-                        raise ValueError(f"First file in group {filepath} is phantom data")            
-                writer.write_data(generate_acquisition(mrs, header, idx))
-                # writer.write_data(generate_pulseq(mrs))                       # generate pulseq field, currently not writing pulseq to save time as it is not used for reconstruction
-    
+        mrs_list: List[MRSdata] = []
+        for filepath in group:
+            mrs = MRSdata()                                                             # one instance per file, they are all kept
+            mrs.mread3d(filepath)
+            # a group can pick up a stray file from the other sequence family, drop it
+            if unifylevel == 3 and "epsi" not in mrs.pplfile:
+                print(f"Skipping non-EPSI {filepath} (ppl={mrs.pplfile})", file=sys.stderr)
+                continue
+            if unifylevel == 1 and not ("1pul" in mrs.pplfile or "fid" in mrs.pplfile):
+                print(f"Skipping non-spectral {filepath} (ppl={mrs.pplfile})", file=sys.stderr)
+                continue
+            if mrs.navg > 1:
+                print(f"Phantom data found at {filepath}", file=sys.stderr)
+            mrs_list.append(mrs)
+        if not mrs_list:
+            print(f"No usable files in group {meas_id}, skipping", file=sys.stderr)
+            continue
+        # spectral repetitions live on the nex axis of one file, EPSI repetitions span files
+        rep_count = mrs_list[0].rawdata.shape[5] if unifylevel == 1 else 0
+        with open(raw_filepath, "wb") as output:
+            convert_group_to_mrd(mrs_list, meas_id, output, rep_count)
+
 def convert_mrs_file_to_mrd(input: Path,
                             output: Path):
     """
