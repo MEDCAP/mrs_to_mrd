@@ -1,233 +1,410 @@
+"""
+Read MRSolutions proprietary raw data format .MRD file into class MRSdata object
+For quick check, read a particular mrd file with --input to debug
+
+The raw .MRD file and .SPR file both have headers in the format of
+':FIELDNAME ...\\r\\n' records. There are two notations for a parameter:
+
+    pattern1: FIELDNAME value               :FOV 45
+                                            :AcquisitionStartTime 13312456532890
+
+    pattern2: FIELDNAME key, value          :OBSERVE_FREQUENCY "13C 0.0", 0.0, MHz, kHz, Hz, rx1MHz
+                                            :VAR alpha, 13
+                                            :SAMPLE_PERIOD sample_period, 400, 14, "25.0 KHz  40 us"
+
+A parameter is looked up by its FIELDNAME, and by the key as well wherever the record carries one -
+the sequence variables are all recorded as ':VAR', ~50 of them in one scan, and the base frequency
+record is keyed by nucleus. FIELDNAME has to match in full, so 'FOV' never matches ':FOV_OFFSETS',
+and of the records under one FIELDNAME the first one keyed as asked is the one read, so the key 'tr'
+never picks up ':VAR tramp, 100'.
+"""
+
 from pathlib import Path
-from sqlite3 import paramstyle
-from matplotlib import container
 import numpy as np
-# import matplotlib.pyplot as plt
-import os
-# from scipy.optimize import minimize
+import re
 import sys
 import argparse
 
-MRSdatadebug = False
+# enable below to print the obtained variables
+DEBUG_MRSREADER = False
 
 class MRSdata:
+    # used when neither the header nor a .SPR sidecar gives a frequency
+    DEFAULT_BASE_FREQUENCY = 74941736       # urea centered frequency in Hz
+    # the binary header occupies a fixed block and the data follows it immediately
+    DATA_START = 512
+    # bytes one acquired point occupies, per MR Solutions data format code. Every code but 3 is
+    # complex and stored as an interleaved real/imaginary pair, so the width covers both halves
+    BYTES_PER_POINT = {3: 2, 16: 2, 17: 2, 18: 4, 19: 4, 20: 8, 21: 8, 22: 16}
+    # dtype each format is read as. Code 3 is the only real one, the rest are read interleaved
+    POINT_DTYPE = {3: 'int16', 16: 'uint8', 17: 'int8', 18: 'int16', 19: 'int16',
+                   20: 'int32', 21: 'float32', 22: 'float64'}
+
     def __init__(self):
-        self.samples = 0
-        self.views = 0
-        self.sliceviews = 0
-        self.slices = 0
-        self.echoes = 0
-        self.nex = 0
-        self.basefreq = 0
-        self.pplfile = ''
-        self.sampleperiod = 0   # in 100ns
-        self.nslc = 0
-        self.acqstarttime = 0
-        self.alpha = 0
-        self.navg = 0
-        self.nswitch = 0
-        self.npswitch = 0
-        self.FOVoff = [0.0, 0.0, 0.0]
+        self.nsamples = 0
+        self.nviews = 0
+        self.nsliceviews = 0
+        self.nslices = 0
+        self.nechoes = 0
+        self.nrepetitions = 0
+        self.base_frequency = self.DEFAULT_BASE_FREQUENCY
+        self.base_frequency_in_SPR = False  # set when the header defers the frequency to the sidecar
+        self.sequence_name = ''
+        self.sample_period = 0           # in 100ns
+        self.acquisition_timestamp = 0  # in 100ns since some epoch
+        self.flip_angle = 0
+        self.naverages = 0              # one dimension of the acquisition, read as nothing more
+        self.nswitch = 1                # a divisor downstream, never 0
+        self.npoints_per_switch = 0
+        self.FOVoffset = [0.0, 0.0, 0.0]
         self.FOVaspect = 0.0
         self.FOV = 0.0
-        self.tr = 0.0           # in ms
-    def mread3d(self, f):
-        if(MRSdatadebug):
-            print(f'reading MRS file {f}', file=sys.stderr)
-        # first get base frequency from SPR file
-        for auxfile in f.parent.iterdir():
-            if auxfile.is_file() and auxfile.suffix == '.SPR':
-                with open(auxfile, 'rb') as file:
-                    content = str(file.read())
-                    freqidx = content.find('FREQ')                 # frequency stored in SPR file
-                    if freqidx > 0:
-                        self.basefreq = int(float(content[(freqidx + 5):(freqidx + 19)]) * 1.0E+6 + 0.5)
-                        if MRSdatadebug:
-                            print(f'   setting base frequency to {self.basefreq}Hz', file=sys.stderr)
-        # if no .SPR file included in the folder, set basefrequency manually
-        if self.basefreq == 0:
-            self.basefreq = 74941736        # urea centered frequency
-        # now read MRS file
-        file = open(f, 'rb')
-        fdbytes = file.read()
-        self.samples = np.frombuffer(fdbytes[0:4], dtype = 'int32')[0]
-        self.views = np.frombuffer(fdbytes[4:8], dtype = 'int32')[0]
-        self.sliceviews = np.frombuffer(fdbytes[8:12], dtype = 'int32')[0]
-        self.slices = np.frombuffer(fdbytes[12:16], dtype = 'int32')[0]
-        self.type = np.frombuffer(fdbytes[18:20], dtype = 'int16')[0] 
-        self.echoes = np.frombuffer(fdbytes[152:156], dtype = 'int32')[0]
-        self.nex = np.frombuffer(fdbytes[156:160], dtype = 'int32')[0]
-        totalpts = self.samples * self.views * self.sliceviews * self.slices * self.echoes * self.nex
-        dstart = 512
-        if self.type == 3:
-            dend = dstart + totalpts * 2
-            rawdata = np.frombuffer(fdbytes[dstart:dend], dtype = 'int16')
-        elif self.type == 16:
-            dend = dstart + totalpts * 2
-            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'uint8')
-            rawdata = dir[::2] + 1j * dir[1::2]
-        elif self.type == 17:
-            dend = dstart + totalpts * 2
-            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'int8')
-            rawdata = dir[::2] + 1j * dir[1::2]
-        elif self.type == 18 or self.type == 19:
-            dend = dstart + totalpts * 4
-            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'int16')
-            rawdata = dir[::2] + 1j * dir[1::2]
-        elif self.type == 20:
-            dend = dstart + totalpts * 8
-            rawdata = dir[::2] + 1j * dir[1::2]
-            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'int32')
-        elif self.type == 21:
-            dend = dstart + totalpts * 8
-            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'float32')
-            rawdata = dir[::2] + 1j * dir[1::2]
-        elif self.type == 22:
-            dend = dstart + totalpts * 16
-            dir = np.frombuffer(fdbytes[dstart:dend], dtype = 'float64')
-            rawdata = dir[::2] + 1j * dir[1::2]
-        else:
-            print('unknown data format', file=sys.stderr)
+        self.tr = 0.0                   # in ms
+        self.datatype = 0               # MR Solutions data format code
+        self.rawdata = None             # np.array of shape=(nsamples, nviews, nsliceviews, nslices, nechoes, nrepetitions)
+        self.parameters = ''            # sequence parameters appended as header at the end of the file
+        # a missing record is reported per file, which is worth reading for one file and is noise
+        # when probing a whole tree, so probing silences it
+        self.quiet = False
+
+    def _warn(self, message):
+        """
+        Report a record the parameter block does not carry. Silenced while probing, where the same
+        handful of absences repeats once per file across a whole directory tree
+        """
+        if not self.quiet:
+            print(message, file=sys.stderr)
+
+    def read_from_file(self, filepath):
+        """
+        Read the MRS file into class fields by passing the filepath. The base frequency comes from a
+        .SPR sidecar in the same folder when the header defers to it
+        """
+        filepath = Path(filepath)
+        try:
+            if DEBUG_MRSREADER:
+                print(f"Reading MRS file at {filepath}", file=sys.stderr)
+            self.parse_from_buffer(filepath.read_bytes())
+        except Exception as e:
+            print(f"{e} at {filepath}", file=sys.stderr)
             return
+        if self.base_frequency_in_SPR:
+            # a sidecar that is missing, or that carries no FREQ record, leaves the default in place
+            base_frequency = self._read_frequency_from_SPR(filepath)
+            if not base_frequency:
+                print(f"   no base frequency read, keeping base_frequency={self.base_frequency}Hz",
+                      file=sys.stderr)
+                return
+            self.base_frequency = base_frequency
+            if DEBUG_MRSREADER:
+                print(f"   setting base frequency to {self.base_frequency}Hz", file=sys.stderr)
+
+    def parse_from_buffer(self, fdbytes):
+        """
+        Parse the bytes of an MR Solutions .MRD file. Split out from read_from_file(filepath) so that
+        callers holding the bytes already (e.g. a member of a tar stream) can parse without a
+        filesystem. When base_frequency_in_SPR comes back set, the frequency was not in these bytes and
+        such a caller finishes with base_frequency = MRSdata.parse_spr(sprbytes), as read_from_file does
+        Args:
+            - fdbytes: complete contents of one .MRD file
+        """
+        try:
+            shape, dend = self._read_dimensions(fdbytes)
+        except ValueError as e:
+            print(e, file=sys.stderr)
+            return
+        if self.datatype == 3:                                          # real int16, no imaginary part
+            rawdata = np.frombuffer(fdbytes[self.DATA_START:dend], dtype=self.POINT_DTYPE[self.datatype])
+        else:
+            interleaved = np.frombuffer(fdbytes[self.DATA_START:dend], dtype=self.POINT_DTYPE[self.datatype])
+            rawdata = interleaved[::2] + 1j * interleaved[1::2]
+        self.rawdata = np.reshape(rawdata, shape, order='F')
+        if DEBUG_MRSREADER:
+            print(f"Reading {self.rawdata.shape} nsamples x nviews x nsliceviews x nslices x nechoes x nrepetitions",
+                  file=sys.stderr)
         # parameters describes settings, appended to the end of the file
-        self.rawdata = np.reshape(rawdata, (self.samples, self.views, self.sliceviews, self.slices, \
-                self.echoes, self.nex), order = 'F')
-        if(MRSdatadebug):
-            print(f'   reading data {self.rawdata.shape} nsamp x nview x nslcview x nslc x necho x nex', file=sys.stderr)
         self.parameters = str(fdbytes[dend:])
-        # set ppm file name
-        endidx = self.parameters.find('.ppl')
-        if endidx == -1:
-            return("")
-        for beginidx in range(endidx, 0, -1):
-            if(self.parameters[beginidx] == '/' or self.parameters[beginidx] == '\\'):
-                 break
-        self.pplfile = self.parameters[(beginidx + 1):endidx]
-        if(MRSdatadebug):
-            print(f'   setting ppl file name ={self.pplfile}', file=sys.stderr)
-        # set sample period in 1/10ths of a microsecond
-        beginidx = self.parameters.find('SAMPLE_PERIOD')
-        beginidx += self.parameters[beginidx:].find(',') + 1
-        endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
-        self.sampleperiod = int(self.parameters[beginidx:endidx])
-        if(MRSdatadebug):
-            print(f'   setting sample period to {self.sampleperiod} tenths of a microsecond', file=sys.stderr)
-        # set number of slices
-        beginidx = self.parameters.find('NO_SLICES')
-        beginidx += self.parameters[beginidx:].find(',') + 1
-        endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
+        if DEBUG_MRSREADER:
+            print(f"header={self.parameters}", file=sys.stderr)
+        self._set_parameters()
+
+    def _read_dimensions(self, fdbytes):
+        """
+        Read the fixed size binary header: the six array dimensions and the data format code. Split
+        out of parse_from_buffer so that probing a file for its parameters can find where the data
+        block ends without decoding the block itself
+        Args:
+            - fdbytes: at least the first DATA_START bytes of one .MRD file
+        Returns:
+            - (shape, dend): the shape rawdata takes, and the offset one past the end of the data,
+              which is where the appended parameter block starts
+        Raises:
+            - ValueError on a data format code this reader does not know
+        """
+        # int(), because these are written straight into the MRD header and its serializer takes
+        # Python integers only: a numpy scalar is rejected as 'not an unsigned 32-bit integer'
+        self.nsamples = int(np.frombuffer(fdbytes[0:4], dtype='int32')[0])
+        self.nviews = int(np.frombuffer(fdbytes[4:8], dtype='int32')[0])
+        self.nsliceviews = int(np.frombuffer(fdbytes[8:12], dtype='int32')[0])
+        self.nslices = int(np.frombuffer(fdbytes[12:16], dtype='int32')[0])
+        self.datatype = int(np.frombuffer(fdbytes[18:20], dtype='int16')[0])
+        self.nechoes = int(np.frombuffer(fdbytes[152:156], dtype='int32')[0])
+        self.nrepetitions = int(np.frombuffer(fdbytes[156:160], dtype='int32')[0])
+        shape = (self.nsamples, self.nviews, self.nsliceviews, self.nslices, self.nechoes, self.nrepetitions)
+        if self.datatype not in self.BYTES_PER_POINT:
+            raise ValueError(f"Unknown data format {self.datatype}")
+        totalpts = int(np.prod(shape))
+        return shape, self.DATA_START + totalpts * self.BYTES_PER_POINT[self.datatype]
+
+    def probe_from_buffer(self, fdbytes, quiet=True):
+        """
+        Read the parameters of a .MRD file without decoding its data, leaving rawdata None. Grouping
+        files by experiment needs the sequence name and little else, and decoding every file in a
+        tree to reach a parameter block that sits after the data is what makes that expensive
+        Args:
+            - fdbytes: the binary header and the parameter block. The data block in between may be
+              anything, including absent, as long as the parameter block starts at the same offset
+            - quiet: suppress the per record 'not found' reporting, which repeats once per file
+        """
+        self.quiet = quiet
         try:
-            self.nslc = int(self.parameters[beginidx:endidx])
-            if(MRSdatadebug):
-                print(f'   setting num slices to {self.nslc}', file=sys.stderr)
-        except:
-            print('   nslc not specified', file=sys.stderr)
-        # set number of averages
-        beginidx = self.parameters.find('NO_AVERAGES')
-        beginidx += self.parameters[beginidx:].find(',') + 1
-        endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
-        self.navg = int(self.parameters[beginidx:endidx])
-        if(MRSdatadebug):
-            print(f'   setting num averages to {self.navg}', file=sys.stderr)
-        # set alpha
-        beginidx = self.parameters.find('alpha')
-        beginidx += self.parameters[beginidx:].find(',') + 1
-        endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
+            _, dend = self._read_dimensions(fdbytes)
+        except ValueError as e:
+            self._warn(str(e))
+            return
+        self.parameters = str(fdbytes[dend:])
+        self._set_parameters()
+
+    def probe_from_file(self, filepath, quiet=True):
+        """
+        Read the parameters of a .MRD file from disk without reading its data block. Reads the fixed
+        binary header, computes where the data ends from it, then seeks straight to the parameter
+        block, so the cost is a few KB per file rather than the whole array.
+
+        Unlike read_from_file this does not chase the .SPR sidecar: the base frequency plays no part
+        in deciding which files belong together, and finding a sidecar costs a directory listing per
+        file. A caller that wants it finishes with set_base_frequency
+        Args:
+            - filepath: path to the .MRD file to probe
+            - quiet: suppress the per record 'not found' reporting, which repeats once per file
+        """
+        self.quiet = quiet
+        filepath = Path(filepath)
         try:
-            self.alpha = int(self.parameters[beginidx:endidx])
-            if(MRSdatadebug):
-                print(f'   setting flip angle to {self.alpha}', file=sys.stderr)
-        except:
-            print('   alpha not specified', file=sys.stderr)
-        # set tr
-        beginidx = self.parameters.find('tr,')
-        beginidx += self.parameters[beginidx:].find(',') + 1
-        endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
-        try:
-            self.tr = int(self.parameters[beginidx:endidx])
-            if(MRSdatadebug):
-                print(f'   setting tr to {self.tr}', file=sys.stderr)
-        except:
-            print('   tr not specified', file=sys.stderr)
-        # set number of switches
-        beginidx = self.parameters.find('no_switches')
-        beginidx += self.parameters[beginidx:].find(',') + 1
-        endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
-        try:
-            self.nswitch = int(self.parameters[beginidx:endidx])
-            if(MRSdatadebug):
-                print(f'   setting number of switches {self.nswitch}', file=sys.stderr) 
-        except:
-            print('   nswitches not specified', file=sys.stderr)
-        # set number of points per switch
-        beginidx = self.parameters.find('no_pts_switch')
-        beginidx += self.parameters[beginidx:].find(',') + 1
-        endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
-        try:
-            self.nppswitch = int(self.parameters[beginidx:endidx])
-            if(MRSdatadebug):
-                print(f'   setting flip angle to {self.alpha}', file=sys.stderr)
-        except:
-            print('   points per switch not specified', file=sys.stderr)
-        # set FOV offsets
-        beginidx = self.parameters.find('FOV_OFFSETS')
-        beginidx += self.parameters[beginidx:].find(',') + 1
-        endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
-        try:
-            self.FOVoff[0] = float(self.parameters[beginidx:endidx]) / 1000.0
-            beginidx = endidx + 1
-            endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                    beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
-            self.FOVoff[1] = float(self.parameters[beginidx:endidx]) / 1000.0
-            beginidx = endidx + 1
-            endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                    beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
-            self.FOVoff[2] = float(self.parameters[beginidx:endidx]) / 1000.0
-            if(MRSdatadebug):
-                print(f'   setting FOV offsets (m) to {self.FOVoff[0]}, {self.FOVoff[1]}, {self.FOVoff[2]}', file=sys.stderr)
-        except:
-            print('   FOV offsets not specified', file=sys.stderr)
-        # set FOV
-        beginidx = self.parameters.find('FOV') + 3
-        if(beginidx >  3):
-            endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                    beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
+            with open(filepath, 'rb') as fd:
+                head = fd.read(self.DATA_START)
+                if len(head) < self.DATA_START:
+                    raise ValueError(f"file holds {len(head)} bytes, too short for a .MRD header")
+                _, dend = self._read_dimensions(head)
+                fd.seek(dend)
+                self.parameters = str(fd.read())
+        except (OSError, ValueError) as e:
+            print(f"{e} at {filepath}", file=sys.stderr)
+            return
+        self._set_parameters()
+
+    def set_base_frequency(self, base_frequency):
+        """
+        Apply a base frequency read from a .SPR sidecar elsewhere, for callers that parsed from
+        bytes and so could not look the sidecar up themselves. A frequency the header already
+        carried is left alone, and so is the default when the sidecar had no FREQ record
+        Args:
+            - base_frequency: frequency in Hz, or 0 when none was found
+        """
+        if not self.base_frequency_in_SPR or not base_frequency:
+            return
+        self.base_frequency = base_frequency
+        if DEBUG_MRSREADER:
+            print(f"   setting base frequency to {self.base_frequency}Hz", file=sys.stderr)
+
+    @staticmethod
+    def _parse_parameters(text, fieldname, key=None):
+        """
+        Acquire the values recorded for fieldname, in the two notations described at the top of the
+        file. fieldname has to match in full, opened by ':' or a space and closed by a space or a ','
+        Args:
+            - text: repr of a parameter block, i.e. str(bytes)
+            - fieldname: name of the record, e.g. 'FOV' or 'VAR'
+            - key: pattern2 only, the name the record carries ahead of its value, e.g. 'alpha' or
+                   '13C 0.0'. Quotes around it in the file are ignored. One fieldname can be recorded
+                   many times, ':VAR' ~50 times in a scan, so every record under it is searched and
+                   the first one keyed like this is the one returned
+        Returns:
+            - the record's comma separated values, as a list of stripped strings, the key dropped
+        Raises:
+            - AttributeError when fieldname is absent
+            - KeyError when no record under fieldname carries key
+        """
+        matches = list(re.finditer(r'(?:^|[: ])' + re.escape(fieldname) + r'(?=[ ,])', text))
+        if not matches:
+            raise AttributeError(f"{fieldname} not found")
+        for match in matches:
+            # a record runs to the line ending that starts the next one, so it can span a line break
+            # as ':FOV_OFFSETS 1\r\n, 0, -3.49875, 0' does, and ends at the closing quote of the repr
+            tail = text[match.end():]
+            end = re.search(r"\\r\\n(?=:|'|\Z)", tail)
+            record = (tail[:end.start()] if end else tail).replace('\\r\\n', '')
+            values = [value.strip() for value in record.split(',')]
+            if key is None:
+                # pattern1, the value follows the field name directly and there is nothing to choose
+                # between, so the first record is the record
+                return [value for value in values if value] or ['']
+            if values[0].strip('"') == key:      # pattern2, the key is quoted in the file
+                return values[1:]
+        raise KeyError(f"no {fieldname} record is keyed {key}")
+
+    @staticmethod
+    def _parse_parameter(text, fieldname, key=None):
+        """
+        First of the values recorded for fieldname, which is the only one most records carry
+        """
+        return MRSdata._parse_parameters(text, fieldname, key)[0]
+
+    def _set_parameters(self):
+        """
+        Extract value from header based on FIELDNAME notated as two patterns below:
+        pattern1: FIELDNAME value               :FOV 45
+                                                :AcquisitionStartTime 13312456532890
+
+        pattern2: FIELDNAME key, value          :OBSERVE_FREQUENCY "13C 0.0", 0.0, MHz, kHz, Hz, rx1MHz
+                                                :VAR alpha, 13
+                                                :SAMPLE_PERIOD sample_period, 400, 14, "25.0 KHz  40 us"
+
+        If no values were found, just sets default values on __init__
+        """
+        # sequence_name are stored with FIELDNAME 'SEQUENCE' for EVO2 and 'PPL' for EVO1
+        # example: ':PPL C:\\smis\\dev\\Seq\\epsigre43_FB_13C.ppl' becomes 'epsigre43_FB_13C'
+        for fieldname in ('SEQUENCE', 'PPL'):
             try:
-                self.FOV = float(self.parameters[beginidx:endidx]) / 1000.0
-                if(MRSdatadebug):
-                    print(f'   setting FOV (m){self.FOV})', file=sys.stderr) 
-            except:
-                print('   FOV not specified', file=sys.stderr)
-        # set aspect ratio
-        beginidx = self.parameters.find('aspect_ratio')
-        beginidx += self.parameters[beginidx:].find(',') + 1
-        endidx =  min(beginidx + self.parameters[(beginidx + 1):].find(',') + 1, \
-                beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1)
+                value = self._parse_parameter(self.parameters, fieldname)
+            except AttributeError:
+                continue                    # not this generation's field name, try the other
+            else:
+                # the parameter block is a repr, so a Windows path arrives with doubled backslashes
+                path = value.strip('"\'').replace('\\\\', '/').replace('\\', '/')
+                self.sequence_name = Path(path).stem
+                if DEBUG_MRSREADER:
+                    print(f"   setting sequence name to {self.sequence_name}", file=sys.stderr)
+                break
+
+        # base_frequency are stored with FIELDNAME='FREQUENCY' for EVO2 and 'OBSERVE_FREQUENCY' for EVO1
+        # base_frequency = system_frequency - frequency_offset
+        #
+        # The key says where the frequency itself lives
+            # example: ':OBSERVE_FREQUENCY "13C", 29058858.0' is an offset in Hz below the system frequency
+            # example: ':FREQUENCY "13C 0.0", 0.0, frequency_base' has no offset, the frequency is in the
+            #          .SPR sidecar instead, so flag it for read_from_file to pick up
+        # If key="13C", the C:\smis\smis.ini file shows the system frequency via PTSMASK=190
+        SYSTEM_FREQUENCY = 104000000 # smis.ini PTSmask=190 104MHz for key=13C
+        for fieldname in ('FREQUENCY', 'OBSERVE_FREQUENCY'):
+            try:
+                offset = float(self._parse_parameter(self.parameters, fieldname, "13C"))
+            except AttributeError:
+                continue                    # not this generation's field name, try the other
+            except KeyError:
+                pass                        # the field is here but not keyed with "13C" 
+            else:
+                self.base_frequency = SYSTEM_FREQUENCY - int(offset)
+                if DEBUG_MRSREADER:
+                    print(f"   setting base frequency to {self.base_frequency}Hz", file=sys.stderr)
+                break
+
+            # If key is "13C 0.0", the offset frequency is 0
+            # Get the actual frequency stored in .SPR file in the same directory
+            try:
+                self._parse_parameter(self.parameters, fieldname, "13C 0.0")
+            except KeyError as e:
+                # KeyError renders its message quoted, so unwrap it to keep the log readable
+                self._warn(f"   {e.args[0]}, keeping base_frequency={self.base_frequency}Hz")
+            else:
+                self.base_frequency_in_SPR = True
+                if DEBUG_MRSREADER:
+                    print(f"   {fieldname} defers the base frequency to the .SPR sidecar", file=sys.stderr)
+                break
+        
+        # every remaining record carries a single number, so they only differ in the attribute they
+        # land on and how it is converted: (attr, fieldname, key, dtype, scale). key is None on the
+        # records that hold their value directly, i.e. pattern1
+        FIELDS = (
+            ('naverages', 'NO_AVERAGES', 'no_averages', int, 1),                # ':NO_AVERAGES no_averages, 1'
+            ('sample_period', 'SAMPLE_PERIOD', 'sample_period', int, 1),         # ':SAMPLE_PERIOD sample_period, 400, 14, "25.0 KHz 40 \xb5s"'
+            ('flip_angle', 'VAR', 'alpha', int, 1),                             # ':VAR alpha, 13'
+            ('tr', 'VAR', 'tr', float, 1),                                      # ':VAR tr, 60'
+            ('nswitch', 'VAR', 'no_switches', int, 1),                          # ':VAR no_switches, 64'
+            ('npoints_per_switch', 'VAR', 'no_pts_switch', int, 1),             # ':VAR no_pts_switch, 12'
+            ('FOVaspect', 'VAR', 'aspect_ratio', float, 1),                     # ':VAR aspect_ratio, 1'
+            ('FOV', 'FOV', None, float, 1.0E-3),                                # ':FOV 45', in mm, stored in m
+            ('acquisition_timestamp', 'AcquisitionStartTime', None, int, 1),    # ':AcquisitionStartTime 13312456532890'
+        )
+        for attr, fieldname, key, dtype, scale in FIELDS:
+            # _parse_parameters raises on a record the block does not carry, and dtype on one it cannot
+            # read, so both are handled here and the attribute keeps the value it already has
+            try:
+                value = dtype(self._parse_parameter(self.parameters, fieldname, key)) * scale
+            except (AttributeError, KeyError, ValueError) as e:
+                # KeyError renders its message quoted, so unwrap it to keep the log readable
+                reason = e.args[0] if isinstance(e, KeyError) else e
+                self._warn(f"   {reason}, keeping {attr}={getattr(self, attr)}")
+                continue
+            setattr(self, attr, value)
+            if DEBUG_MRSREADER:
+                print(f"   setting {attr} to {value}", file=sys.stderr)
+
+        # FOV offsets are the one record holding more than one value, ':FOV_OFFSETS 1\r\n, 0, -3.49875,
+        # 0' - a count followed by the three offsets, in mm in the file and stored in m
         try:
-            self.FOVaspect = float(self.parameters[beginidx:endidx])
-            if(MRSdatadebug):
-                print(f'   setting FOV aspect ratio to {self.FOVaspect}', file=sys.stderr)
-        except:
-            print('   FOV aspect not specified', file=sys.stderr)
-        # set acquisition start time
-        beginidx = self.parameters.find('AcquisitionStartTime') + len('AcquisitionStartTime')
-        endidx =  beginidx + self.parameters[(beginidx + 1):].find('\\r') + 1
-        self.acqstarttime = int(self.parameters[beginidx:endidx])
-        if(MRSdatadebug):
-            print(f'   setting acq start time to {self.acqstarttime} since some time in units of 100ns', file=sys.stderr)
+            values = self._parse_parameters(self.parameters, 'FOV_OFFSETS')
+            offsets = [float(value) / 1000.0 for value in values[1:4]]
+            if len(offsets) != 3:
+                raise ValueError(f"FOV_OFFSETS holds {len(offsets)} offsets, not 3")
+        except (AttributeError, ValueError) as e:
+            self._warn(f"   {e}, keeping FOVoffset={self.FOVoffset}")
+        else:
+            self.FOVoffset = offsets
+            if DEBUG_MRSREADER:
+                print(f"   setting FOV offsets (m) to {self.FOVoffset}", file=sys.stderr)
+
+    @staticmethod
+    def parse_spr(sprbytes):
+        """
+        Read the base frequency out of a .SPR sidecar, recorded as ':EDITTEXT FREQ 74.942486000000' in
+        MHz. Takes the bytes rather than a path so that a caller holding them already (e.g. a member of
+        a tar stream) can read the frequency without a filesystem
+        Args:
+            - sprbytes: complete contents of one .SPR file
+        Returns:
+            - base frequency in Hz, or 0 when the file carries no FREQ record
+        """
+        try:
+            return int(float(MRSdata._parse_parameter(str(sprbytes), 'FREQ')) * 1.0E+6 + 0.5)
+        except (AttributeError, ValueError) as e:
+            print(f"   no base frequency in the .SPR sidecar: {e}", file=sys.stderr)
+            return 0
+
+    def _read_frequency_from_SPR(self, filepath):
+        """
+        Find file with extension .SPR in the same directory as .MRD and read its FREQ record
+        Args:
+            - filepath: path to the .MRD file whose sidecar to look for
+        Returns:
+            - base frequency in Hz, or 0 when no sidecar carries one
+        """
+        base_frequency = 0
+        try:
+            for auxfile in Path(filepath).parent.iterdir():
+                if auxfile.is_file() and auxfile.suffix == '.SPR':
+                    freq = self.parse_spr(auxfile.read_bytes())
+                    if freq:                # keep an earlier hit if this SPR has no FREQ record
+                        base_frequency = freq
+        except OSError as e:
+            print(f"{e} looking for a .SPR sidecar next to {filepath}", file=sys.stderr)
+        return base_frequency
 
 if __name__ == '__main__':
-    MRSdatadebug = True
-    argparse = argparse.ArgumentParser(description='Convert MRS .MRD file to .MRD file with acquisition data in MRD format')
-    argparse.add_argument('-i', '--input', type=Path, help='path to input .MRD file containing MRS data in Siemens format')
-    args = argparse.parse_args()
-    m = MRSdata()
-    m.mread3d(args.input)
+    DEBUG_MRSREADER = True
+    parser = argparse.ArgumentParser(description='Read an MRS .MRD file and print the parsed parameters')
+    parser.add_argument('-i', '--input', type=Path, required=True,
+                        help='path to input .MRD file containing MRS data')
+    args = parser.parse_args()
+    mrs = MRSdata()
+    mrs.read_from_file(args.input)

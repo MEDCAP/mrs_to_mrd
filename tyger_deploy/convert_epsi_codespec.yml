@@ -1,0 +1,36 @@
+# Convert a tar of one EPSI scan directory to an MRD2 stream.
+#
+#   tar cf - -C /data cirrhrat_0_1 \
+#     | tyger run exec -f tyger_deploy/convert_epsi_codespec.yml > raw.mrd2
+#
+# Tyger turns each declared buffer into a named FIFO and passes its path in <NAME>_PIPE, so the
+# entrypoint's --input/--output defaults would pick these up on their own; they are spelled out
+# here so the wiring is visible in the codespec.
+job:
+  codespec:
+    image: ghcr.io/medcap/mrs-convert-epsi:latest
+    buffers:
+      inputs: ["input"]
+      outputs: ["output"]
+    args:
+      - --input
+      - $(INPUT_PIPE)
+      - --output
+      - $(OUTPUT_PIPE)
+    resources:
+      requests:
+        cpu: 1
+        # the whole scan is held in memory: the format's parameter block sits after the data at
+        # EOF, and the header needs the phantom count across every file before the first write
+        memory: 2G
+
+  tags:
+    version: "1.0"
+
+  nodePool: cpunp
+
+  replicas: 1
+
+cluster: tep-centralus-1
+
+timeoutSeconds: 3600
