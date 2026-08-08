@@ -5,18 +5,21 @@ For quick check, read a particular mrd file with --input to debug
 The settings appended after the raw data, and the .SPR sidecar next to it, are both a sequence of
 ':FIELDNAME ...\\r\\n' records. There are two notations for a parameter:
 
-    pattern1: NAME value                    :FOV 45
+    pattern1: FIELDNAME value               :FOV 45
                                             :AcquisitionStartTime 13312456532890
+
+    pattern2: FIELDNAME key, value          :OBSERVE_FREQUENCY "13C 0.0", 0.0, MHz, kHz, Hz, rx1MHz
                                             :VAR alpha, 13
                                             :SAMPLE_PERIOD sample_period, 400, 14, "25.0 KHz  40 us"
-    pattern2: FIELDNAME key, value          :OBSERVE_FREQUENCY "13C 0.0", 0.0, MHz, kHz, Hz, rx1MHz
 
-In pattern1 the name looked up is whichever token sits immediately before the value, so it is the
-field name on ':FOV 45' but the variable name on ':VAR alpha, 13' and ':SAMPLE_PERIOD
-sample_period, 400' - the field name is ambiguous there, since one scan holds ~50 ':VAR' records.
-Pattern2 is only needed where the key selects between variants of the same field, i.e. the base
-frequency. Either way the name has to match in full, so 'FOV' never matches ':FOV_OFFSETS' and
-'tr' never matches ':VAR tramp, 100'.
+A parameter is looked up by the name that sits immediately before its value, so pattern1 is looked up
+on the field name and pattern2 on the key: 'alpha' rather than 'VAR', 'sample_period' rather than
+'SAMPLE_PERIOD'. One scan holds ~50 ':VAR' records, so the field name cannot single one out. Only the
+frequency needs both, because there its key says where the frequency lives rather than naming a
+variable, so _parse_parameters takes a key to check against.
+
+Either way the name has to match in full: 'FOV' matches ':FOV 45' but never ':FOV_OFFSETS 1' or
+':VAR FOVf, 12', and 'tr' matches ':VAR tr, 60' but never ':VAR tramp, 100'.
 """
 
 from pathlib import Path
@@ -28,29 +31,10 @@ import argparse
 # enable below to print the obtained variables
 DEBUG_MRSREADER = False
 
-# nucleus this pipeline acquires, as it is keyed in the frequency record
-NUCLEUS = '13C'
-
-# used when neither the header nor a .SPR sidecar gives a frequency
-DEFAULT_BASE_FREQUENCY = 74941736       # urea centered frequency
-
-def parse_spr(sprbytes):
-    """
-    Read the base frequency out of a .SPR sidecar, recorded as ':EDITTEXT FREQ 74.942486000000' in
-    MHz. Kept at module level so that callers holding the bytes already (e.g. a member of a tar
-    stream) can read it without a filesystem
-    Args:
-        - sprbytes: complete contents of one .SPR file
-    Returns:
-        - base frequency in Hz, or 0 when the file carries no FREQ record
-    """
-    try:
-        return int(float(MRSdata._parse_parameter(str(sprbytes), 'FREQ')) * 1.0E+6 + 0.5)
-    except (AttributeError, ValueError) as e:
-        print(f"   no base frequency in the .SPR sidecar: {e}", file=sys.stderr)
-        return 0
-
 class MRSdata:
+    # used when neither the header nor a .SPR sidecar gives a frequency
+    DEFAULT_BASE_FREQUENCY = 74941736       # urea centered frequency
+
     def __init__(self):
         self.nsamples = 0
         self.nviews = 0
@@ -58,7 +42,7 @@ class MRSdata:
         self.nslices = 0
         self.nechoes = 0
         self.nrepetitions = 0
-        self.base_frequency = DEFAULT_BASE_FREQUENCY
+        self.base_frequency = self.DEFAULT_BASE_FREQUENCY
         self.base_frequency_in_SPR = False  # set when the header defers the frequency to the sidecar
         self.sequence_name = ''
         self.sampleperiod = 0           # in 100ns
@@ -97,17 +81,20 @@ class MRSdata:
         Parse the bytes of an MR Solutions .MRD file. Split out from read_from_file(filepath) so that
         callers holding the bytes already (e.g. a member of a tar stream) can parse without a
         filesystem. When base_frequency_in_SPR comes back set, the frequency was not in these bytes
-        and such a caller finishes with set_base_frequency(parse_spr(sprbytes))
+        and such a caller finishes with set_base_frequency(MRSdata.parse_spr(sprbytes))
         Args:
             - fdbytes: complete contents of one .MRD file
         """
-        self.nsamples = np.frombuffer(fdbytes[0:4], dtype='int32')[0]
-        self.nviews = np.frombuffer(fdbytes[4:8], dtype='int32')[0]
-        self.nsliceviews = np.frombuffer(fdbytes[8:12], dtype='int32')[0]
-        self.nslices = np.frombuffer(fdbytes[12:16], dtype='int32')[0]
-        self.datatype = np.frombuffer(fdbytes[18:20], dtype='int16')[0]
-        self.nechoes = np.frombuffer(fdbytes[152:156], dtype='int32')[0]
-        self.nrepetitions = np.frombuffer(fdbytes[156:160], dtype='int32')[0]
+        # kept as python ints rather than the numpy scalars frombuffer returns, since these are
+        # loop bounds and are written straight into MRD header fields, whose serializer takes an
+        # int or a same-width numpy scalar but rejects the int32 read here
+        self.nsamples = int(np.frombuffer(fdbytes[0:4], dtype='int32')[0])
+        self.nviews = int(np.frombuffer(fdbytes[4:8], dtype='int32')[0])
+        self.nsliceviews = int(np.frombuffer(fdbytes[8:12], dtype='int32')[0])
+        self.nslices = int(np.frombuffer(fdbytes[12:16], dtype='int32')[0])
+        self.datatype = int(np.frombuffer(fdbytes[18:20], dtype='int16')[0])
+        self.nechoes = int(np.frombuffer(fdbytes[152:156], dtype='int32')[0])
+        self.nrepetitions = int(np.frombuffer(fdbytes[156:160], dtype='int32')[0])
         shape = (self.nsamples, self.nviews, self.nsliceviews, self.nslices, self.nechoes, self.nrepetitions)
         totalpts = int(np.prod(shape))
         dstart = 512
@@ -258,27 +245,27 @@ class MRSdata:
         """
         Set the base frequency from the frequency record, named 'OBSERVE_FREQUENCY' on EVO1 and
         'FREQUENCY' on EVO2. Its key says where the frequency itself lives:
-            - keyed NUCLEUS, e.g. ':FREQUENCY "13C", 1234' - an offset in Hz from the transmitter
+            - keyed '13C', e.g. ':FREQUENCY "13C", 1234' - an offset in Hz below the transmitter
               board's own frequency, which is what PTSMASK_190_FREQUENCY records
-            - keyed 'NUCLEUS 0.0', e.g. ':OBSERVE_FREQUENCY "13C 0.0", 0.0, MHz' - the frequency is in
-              the .SPR sidecar instead, so flag it for read_from_file to pick up
+            - keyed '13C 0.0', e.g. ':OBSERVE_FREQUENCY "13C 0.0", 0.0, MHz' - the frequency is in the
+              .SPR sidecar instead, so flag it for read_from_file to pick up
         A record keyed for another nucleus, or no record at all, leaves the default from __init__
         """
-        PTSMASK_190_FREQUENCY = 45900000    # CHECK smis.ini on scanner for 45.9MHz for key=NUCLEUS
-        for fieldname in ('FREQUENCY', 'OBSERVE_FREQUENCY'):
+        PTSMASK_190_FREQUENCY = 104000000 # smis.ini PTSmask=190 104MHz for key=13C
+        for fieldname in ('FREQUENCY', 'OBSERVE_FREQUENCY'):    # two version of fieldnames for EVO1 and EVO2
             try:
-                offset = float(self._parse_parameter(self.parameters, fieldname, NUCLEUS))
+                offset = float(self._parse_parameter(self.parameters, fieldname, "13C"))
             except AttributeError:
                 continue                    # not this generation's field name, try the other
             except (KeyError, ValueError):
                 pass                        # the field is here but not keyed with a bare nucleus
             else:
-                self.base_frequency = PTSMASK_190_FREQUENCY + int(offset)
+                self.base_frequency = PTSMASK_190_FREQUENCY - int(offset)
                 if DEBUG_MRSREADER:
                     print(f"   setting base frequency to {self.base_frequency}Hz", file=sys.stderr)
                 return
             try:
-                self._parse_parameter(self.parameters, fieldname, f"{NUCLEUS} 0.0")
+                self._parse_parameter(self.parameters, fieldname, "13C 0.0")
             except KeyError as e:
                 # KeyError renders its message quoted, so unwrap it to keep the log readable
                 print(f"   {e.args[0]}, keeping base_frequency={self.base_frequency}Hz", file=sys.stderr)
@@ -297,15 +284,32 @@ class MRSdata:
         """
         try:
             values = self._parse_parameters(self.parameters, 'FOV_OFFSETS')
-            self.FOVoffset = [float(value) / 1000.0 for value in values[1:4]]
-            if len(self.FOVoffset) != 3:
-                raise ValueError(f"FOV_OFFSETS holds {len(self.FOVoffset)} offsets, not 3")
+            offsets = [float(value) / 1000.0 for value in values[1:4]]
+            if len(offsets) != 3:
+                raise ValueError(f"FOV_OFFSETS holds {len(offsets)} offsets, not 3")
         except (AttributeError, ValueError) as e:
-            self.FOVoffset = [0.0, 0.0, 0.0]
             print(f"   {e}, keeping FOVoffset={self.FOVoffset}", file=sys.stderr)
             return
+        self.FOVoffset = offsets
         if DEBUG_MRSREADER:
             print(f"   setting FOV offsets (m) to {self.FOVoffset}", file=sys.stderr)
+
+    @staticmethod
+    def parse_spr(sprbytes):
+        """
+        Read the base frequency out of a .SPR sidecar, recorded as ':EDITTEXT FREQ 74.942486000000' in
+        MHz. Takes the bytes rather than a path so that a caller holding them already (e.g. a member of
+        a tar stream) can read the frequency without a filesystem
+        Args:
+            - sprbytes: complete contents of one .SPR file
+        Returns:
+            - base frequency in Hz, or 0 when the file carries no FREQ record
+        """
+        try:
+            return int(float(MRSdata._parse_parameter(str(sprbytes), 'FREQ')) * 1.0E+6 + 0.5)
+        except (AttributeError, ValueError) as e:
+            print(f"   no base frequency in the .SPR sidecar: {e}", file=sys.stderr)
+            return 0
 
     def _read_frequency_from_SPR(self, filepath):
         """
@@ -319,7 +323,7 @@ class MRSdata:
         try:
             for auxfile in Path(filepath).parent.iterdir():
                 if auxfile.is_file() and auxfile.suffix == '.SPR':
-                    freq = parse_spr(auxfile.read_bytes())
+                    freq = self.parse_spr(auxfile.read_bytes())
                     if freq:                # keep an earlier hit if this SPR has no FREQ record
                         base_frequency = freq
         except OSError as e:
