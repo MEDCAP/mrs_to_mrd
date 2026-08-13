@@ -60,6 +60,7 @@ class MRSdata:
         self.FOVaspect = 0.0
         self.FOV = 0.0
         self.tr = 0.0                   # in ms
+        self.te = 0.0                   # in ms
         self.datatype = 0               # MR Solutions data format code
         self.rawdata = None             # np.array of shape=(nsamples, nviews, nsliceviews, nslices, nechoes, nrepetitions)
         self.parameters = ''            # sequence parameters appended as header at the end of the file
@@ -120,8 +121,7 @@ class MRSdata:
             rawdata = interleaved[::2] + 1j * interleaved[1::2]
         self.rawdata = np.reshape(rawdata, shape, order='F')
         if DEBUG_MRSREADER:
-            print(f"Reading {self.rawdata.shape} nsamples x nviews x nsliceviews x nslices x nechoes x nrepetitions",
-                  file=sys.stderr)
+            print(f"Reading {self.rawdata.shape} nsamples x nviews x nsliceviews x nslices x nechoes x nrepetitions", file=sys.stderr)
         # parameters describes settings, appended to the end of the file
         self.parameters = str(fdbytes[dend:])
         if DEBUG_MRSREADER:
@@ -327,9 +327,10 @@ class MRSdata:
         # records that hold their value directly, i.e. pattern1
         FIELDS = (
             ('naverages', 'NO_AVERAGES', 'no_averages', int, 1),                # ':NO_AVERAGES no_averages, 1'
-            ('sample_period', 'SAMPLE_PERIOD', 'sample_period', int, 1),         # ':SAMPLE_PERIOD sample_period, 400, 14, "25.0 KHz 40 \xb5s"'
+            ('sample_period', 'SAMPLE_PERIOD', 'sample_period', int, 1),        # ':SAMPLE_PERIOD sample_period, 400, 14, "25.0 KHz 40 \xb5s"'
             ('flip_angle', 'VAR', 'alpha', int, 1),                             # ':VAR alpha, 13'
             ('tr', 'VAR', 'tr', float, 1),                                      # ':VAR tr, 60'
+            ('te', 'VAR', 'te', float, 1),                                      # ':VAR te, 0'
             ('nswitch', 'VAR', 'no_switches', int, 1),                          # ':VAR no_switches, 64'
             ('npoints_per_switch', 'VAR', 'no_pts_switch', int, 1),             # ':VAR no_pts_switch, 12'
             ('FOVaspect', 'VAR', 'aspect_ratio', float, 1),                     # ':VAR aspect_ratio, 1'
@@ -363,6 +364,190 @@ class MRSdata:
             self.FOVoffset = offsets
             if DEBUG_MRSREADER:
                 print(f"   setting FOV offsets (m) to {self.FOVoffset}", file=sys.stderr)
+
+    # ---------- finding the EPSI readout sampling window ----------------------
+
+    def switch_layout(self):
+        """
+        How one EPSI readout divides into gradient switches.
+
+        no_switches and no_pts_switch are recorded separately from the sample count, so the
+        acquisition holds more points per switch than the sequence calls usable: the extra ones
+        are the gradient ramps either side of the flat top.
+        Returns:
+            - (nswitch, total points in one switch, points the sequence keeps per switch)
+        """
+        nswitch = max(self.nswitch, 1)
+        total = self.nsamples // nswitch
+        return nswitch, total, (self.npoints_per_switch or total)
+
+    def switch_profile(self, spectral=True, view=None, repeat=None):
+        """
+        How much signal sits at each position within a readout switch.
+
+        Every sample of the readout falls at one of `total` positions inside a gradient switch,
+        and the gradient echo, the point where kx crosses zero, sits at one of them. Summing raw
+        magnitude over the switches locates it only when the object fills the field of view. For a
+        compact object |k-space| is close to flat and the echo hides in the phase instead, so the
+        default first transforms along the switch axis and keeps the strongest spectral line,
+        which is a coherent sum over all the switches and lifts the echo well clear of the noise.
+        Args:
+            - spectral: aggregate through the spectral transform rather than by raw magnitude
+            - view: phase encode line to read, or None for the one carrying the most signal
+            - repeat: index into the folded slice/echo/repetition axis, or None to sum over it
+        Returns:
+            - (profile of length total, peak over median of the profile)
+        Raises:
+            - ValueError when called on an object whose data block was never read
+        """
+        if self.rawdata is None:
+            raise ValueError("no data to profile; read_from_file rather than probe_from_file")
+        nswitch, total, _ = self.switch_layout()
+        # (switch, position in switch, view, everything else). The sample axis comes first, so
+        # splitting it in C order is exactly the switch-major order the samples were acquired in.
+        # The slice, sliceview and echo axes are single valued in an EPSI scan and are folded in
+        # with the repetitions, since for this purpose they are all just repeats
+        cube = self.rawdata[:nswitch * total].reshape(nswitch, total, self.nviews, -1)
+
+        if spectral:
+            spectrum = np.fft.fft(cube, axis=0)
+            power = (np.abs(spectrum) ** 2).sum(axis=(1, 2, 3))
+            band = np.abs(spectrum[int(np.argmax(power))])          # (position, view, repeat)
+        else:
+            band = np.abs(cube).sum(axis=0)                         # (position, view, repeat)
+
+        if view is None:
+            view = int(np.argmax(band.sum(axis=(0, 2))))
+        lines = band[:, view, :]
+        profile = lines[:, repeat] if repeat is not None else lines.sum(axis=1)
+        median = np.median(profile)
+        return profile, (float(profile.max() / median) if median else np.inf)
+
+    def sliding_window(self, profile, kept):
+        """
+        Score every candidate sampling window of `kept` consecutive positions.
+
+        Windows wrap, because the last position of one switch is followed by the first position of
+        the next, so a window may legitimately straddle the boundary.
+        Args:
+            - profile: signal per position within the switch, from switch_profile
+            - kept: width of the window, i.e. the points the reconstruction keeps per switch
+        Returns:
+            - (signal summed inside each window, position of the profile peak within each window),
+              both indexed by the window's first position
+        """
+        total = len(profile)
+        offsets = np.arange(kept)
+        signal = np.array([profile[(start + offsets) % total].sum() for start in range(total)])
+        # where the echo lands inside the window; the window is right when this is its middle
+        peak_at = (int(np.argmax(profile)) - np.arange(total)) % total
+        return signal, peak_at
+
+    def window_report(self, spectral=True, view=None, repeat=None):
+        """
+        Pick the sampling window, both ways, and translate it for the reconstruction.
+
+        Two criteria, because they can disagree and the disagreement is the interesting part: the
+        window holding the most signal, and the window whose middle sits on the echo. mrd2recon
+        addresses the same window as an offset from discard_pre, so that conversion is reported
+        alongside, as the EPSIGRE_LEADING_PAD that would select it.
+        Returns:
+            - dict of the profile, the two winning window starts and the pads they imply
+        """
+        nswitch, total, kept = self.switch_layout()
+        profile, snr = self.switch_profile(spectral=spectral, view=view, repeat=repeat)
+        signal, peak_at = self.sliding_window(profile, kept)
+        middle = (kept - 1) / 2
+
+        by_signal = int(np.argmax(signal))
+        # distance from the middle measured the short way round, so a wrapped window is not
+        # penalised for having its peak reported as position 27 rather than -1
+        from_middle = np.abs((peak_at - middle + total / 2) % total - total / 2)
+        by_centre = int(np.argmin(from_middle))
+        discard_pre = (total - kept) // 2
+
+        def pad_for(start):
+            """
+            The EPSIGRE_LEADING_PAD that makes mrd2recon read this window.
+
+            It addresses a window as discard_pre - pad, so the pad is that difference, wrapped
+            the short way round the switch: the positions are cyclic, so a window starting at 29
+            of 34 is 5 before the boundary rather than 29 after it
+            """
+            return int((discard_pre - start + total // 2) % total - total // 2)
+
+        return dict(profile=profile, signal=signal, peak_at=peak_at, snr=snr,
+                    nswitch=nswitch, total=total, kept=kept, discard_pre=discard_pre,
+                    peak=int(np.argmax(profile)),
+                    by_signal=by_signal, by_centre=by_centre,
+                    pad_by_signal=pad_for(by_signal),
+                    pad_by_centre=pad_for(by_centre))
+
+    def plot_switch_profile(self, spectral=True, view=None, repeat=None, savepath=None, show=True):
+        """
+        Plot the sliding window scan over the positions within a readout switch.
+
+        Three panels: the signal at each position with the chosen windows drawn on it, the sliding
+        window scan itself, and the same profile per switch so that an echo whose position drifts
+        along the echo train shows up rather than being averaged away.
+        Args:
+            - savepath: write the figure here instead of, or as well as, showing it
+            - show: open a window, which blocks until it is closed
+        Returns:
+            - the window_report dict, so a caller can act on the numbers it plotted
+        """
+        import matplotlib.pyplot as plt
+
+        report = self.window_report(spectral=spectral, view=view, repeat=repeat)
+        total, kept = report['total'], report['kept']
+        profile, signal = report['profile'], report['signal']
+        middle = (kept - 1) / 2
+        positions = np.arange(total)
+
+        figure, axes = plt.subplots(3, 1, figsize=(11, 10))
+        title = (f"{self.sequence_name or 'unknown sequence'}: {report['nswitch']} switches of "
+                 f"{total} points, {kept} kept, peak/median {report['snr']:.2f}")
+        figure.suptitle(title)
+
+        axes[0].plot(positions, profile, 'o-', color='C0')
+        axes[0].axvline(report['peak'], color='C1', lw=2, label=f"echo peak at {report['peak']}")
+        for start, colour, name in ((report['by_signal'], 'C2', 'most signal'),
+                                    (report['by_centre'], 'C3', 'echo centred')):
+            # drawn as the positions it covers, so a window that wraps appears at both ends
+            covered = (start + np.arange(kept)) % total
+            axes[0].plot(covered, profile[covered], 'o', ms=11, mfc='none', color=colour,
+                         label=f"{name}: start {start}, pad "
+                               f"{report['discard_pre'] - start}")
+        axes[0].set_xlabel(f"position within the {total} point switch")
+        axes[0].set_ylabel("signal")
+        axes[0].legend(fontsize=8)
+
+        axes[1].plot(positions, signal / signal.max(), 'o-', color='C0', label='signal in window')
+        axes[1].plot(positions, report['peak_at'] / total, 's--', ms=3, color='C4',
+                     label='where the peak lands in the window')
+        axes[1].axhline(middle / total, color='C3', ls=':', label='window middle')
+        axes[1].axvline(report['by_signal'], color='C2', lw=2)
+        axes[1].axvline(report['by_centre'], color='C3', lw=2)
+        axes[1].set_xlabel("first position of the window")
+        axes[1].set_ylabel("normalised")
+        axes[1].legend(fontsize=8)
+
+        nswitch = report['nswitch']
+        cube = self.rawdata[:nswitch * total].reshape(nswitch, total, self.nviews, -1)
+        axes[2].imshow(np.abs(cube).sum(axis=(2, 3)), aspect='auto', origin='lower',
+                       interpolation='nearest')
+        axes[2].axvline(report['by_centre'], color='C3', lw=1.5)
+        axes[2].axvline((report['by_centre'] + kept - 1) % total, color='C3', lw=1.5)
+        axes[2].set_xlabel(f"position within the switch")
+        axes[2].set_ylabel("switch")
+
+        figure.tight_layout()
+        if savepath:
+            figure.savefig(savepath, dpi=110)
+            print(f"wrote {savepath}", file=sys.stderr)
+        if show:
+            plt.show()
+        return report
 
     @staticmethod
     def parse_spr(sprbytes):
@@ -405,6 +590,33 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Read an MRS .MRD file and print the parsed parameters')
     parser.add_argument('-i', '--input', type=Path, required=True,
                         help='path to input .MRD file containing MRS data')
+    parser.add_argument('-w', '--window', action='store_true',
+                        help='scan the sampling window within an EPSI readout switch and plot it')
+    parser.add_argument('--magnitude', action='store_true',
+                        help='profile by raw magnitude instead of the spectral transform, which '
+                             'only finds the echo when the object fills the field of view')
+    parser.add_argument('--view', type=int, default=None,
+                        help='phase encode line to profile (default: the brightest)')
+    parser.add_argument('--repeat', type=int, default=None,
+                        help='single repetition to profile (default: sum over all of them)')
+    parser.add_argument('--save', type=Path, default=None, help='write the figure to this path')
+    parser.add_argument('--no-show', action='store_true', help='do not open a plot window')
     args = parser.parse_args()
     mrs = MRSdata()
     mrs.read_from_file(args.input)
+    if args.window:
+        report = mrs.plot_switch_profile(spectral=not args.magnitude, view=args.view,
+                                         repeat=args.repeat, savepath=args.save,
+                                         show=not args.no_show)
+        print(f"{report['nswitch']} switches of {report['total']} points, keeping {report['kept']}, "
+              f"discard_pre={report['discard_pre']}, profile peak/median {report['snr']:.2f}")
+        print(f"echo peak at position {report['peak']}")
+        print(f"most signal:  window starts at {report['by_signal']}, echo lands at "
+              f"{report['peak_at'][report['by_signal']]} of {report['kept']}, "
+              f"EPSIGRE_LEADING_PAD = {report['pad_by_signal']}")
+        print(f"echo centred: window starts at {report['by_centre']}, echo lands at "
+              f"{report['peak_at'][report['by_centre']]} of {report['kept']}, "
+              f"EPSIGRE_LEADING_PAD = {report['pad_by_centre']}")
+        if report['snr'] < 1.5:
+            print("the profile is nearly flat, so this scan carries too little signal to place "
+                  "the window; check it against one that does", file=sys.stderr)
