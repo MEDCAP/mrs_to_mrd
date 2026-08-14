@@ -59,6 +59,7 @@ class MRSdata:
         self.FOVoffset = [0.0, 0.0, 0.0]
         self.FOVaspect = 0.0
         self.FOV = 0.0
+        self.tramp = 0                  # in us
         self.tr = 0.0                   # in ms
         self.te = 0.0                   # in ms
         self.datatype = 0               # MR Solutions data format code
@@ -328,6 +329,7 @@ class MRSdata:
         FIELDS = (
             ('naverages', 'NO_AVERAGES', 'no_averages', int, 1),                # ':NO_AVERAGES no_averages, 1'
             ('sample_period', 'SAMPLE_PERIOD', 'sample_period', int, 1),        # ':SAMPLE_PERIOD sample_period, 400, 14, "25.0 KHz 40 \xb5s"'
+            ('tramp', 'VAR', 'tramp', int, 1),                                  # ':VAR tramp, 100' 
             ('flip_angle', 'VAR', 'alpha', int, 1),                             # ':VAR alpha, 13'
             ('tr', 'VAR', 'tr', float, 1),                                      # ':VAR tr, 60'
             ('te', 'VAR', 'te', float, 1),                                      # ':VAR te, 0'
@@ -511,13 +513,13 @@ class MRSdata:
 
         axes[0].plot(positions, profile, 'o-', color='C0')
         axes[0].axvline(report['peak'], color='C1', lw=2, label=f"echo peak at {report['peak']}")
-        for start, colour, name in ((report['by_signal'], 'C2', 'most signal'),
-                                    (report['by_centre'], 'C3', 'echo centred')):
+        for start, pad, colour, name in ((report['by_signal'], report['pad_by_signal'], 'C2', 'most signal'),
+                                         (report['by_centre'], report['pad_by_centre'], 'C3', 'echo centred')):
             # drawn as the positions it covers, so a window that wraps appears at both ends
             covered = (start + np.arange(kept)) % total
             axes[0].plot(covered, profile[covered], 'o', ms=11, mfc='none', color=colour,
-                         label=f"{name}: start {start}, pad "
-                               f"{report['discard_pre'] - start}")
+                         label=f"{name}: start {start}, pad {pad}, "
+                               f"echo at {report['peak_at'][start]} of {kept}")
         axes[0].set_xlabel(f"position within the {total} point switch")
         axes[0].set_ylabel("signal")
         axes[0].legend(fontsize=8)

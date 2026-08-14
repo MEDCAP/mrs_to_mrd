@@ -388,6 +388,7 @@ def group_files(paths: Sequence[str],
                 root: str = "",
                 experiment_root: str = "",
                 fallback_meas_id: str = "",
+                meas_id_override: str = "",
                 resolve: bool = True) -> List[ScanGroup]:
     """
     Sort .MRD files into the streams they convert to. The one place the rule lives
@@ -400,6 +401,7 @@ def group_files(paths: Sequence[str],
           lone file leaves this empty and has its experiment read off the path
         - fallback_meas_id: used when the path gives no experiment name, e.g. a tar of a bare scan
           directory
+        - meas_id_override: names the experiment outright, ahead of the folder it was read from
         - resolve: see experiment_dir_for
     Returns:
         - groups, each with its files in acquisition order and its output name assigned
@@ -423,7 +425,9 @@ def group_files(paths: Sequence[str],
             alone.append(scan_file)
 
     members = _combine(buckets) + [[scan_file] for scan_file in alone]
-    groups = [ScanGroup(meas_id=scan_files[0].meas_id or fallback_meas_id,
+    # the caller naming the experiment outright wins over the folder it was read from, which is what
+    # names a file that arrived without an experiment folder around it
+    groups = [ScanGroup(meas_id=meas_id_override or scan_files[0].meas_id or fallback_meas_id,
                         sequence_name=scan_files[0].sequence_name,
                         family=scan_files[0].family,
                         experiment_dir=scan_files[0].experiment_dir,
@@ -440,27 +444,35 @@ def _combine(buckets: Dict[tuple, List[ScanFile]]) -> List[List[ScanFile]]:
     """
     Decide which buckets convert as one stream and which convert a file at a time.
 
-    An experiment folder records one repetition series, so within one experiment and sequence the
-    largest bucket is that series and combines. The rest were acquired differently and only happen
-    to be filed beside it - a calibration scan, a repeat at another matrix - so each of their files
-    converts on its own and keeps a scan id to be named by. Without that, two calibration scans run
-    alike would read as one acquisition of two repetitions: cirrhrat_43_1's 24792 and 24793 share a
-    matrix and consecutive ids, and are two scans rather than one.
+    An experiment folder records one acquisition, so within one experiment and sequence the bucket
+    holding the most repetitions is that acquisition and combines. The rest were acquired
+    differently and only happen to be filed beside it - a calibration scan, a test scan run before
+    the acquisition started - so each of their files converts on its own and keeps a scan id to be
+    named by. Without that, two calibration scans run alike would read as one acquisition of two
+    repetitions: cirrhrat_43_1's 24792 and 24793 share a matrix and consecutive ids, and are two
+    scans rather than one.
 
-    Buckets tied for the largest all combine, since nothing here can say which of them is the
-    series. That is the misfiled upload check_groups reports
+    Repetitions rather than files, because the acquisition is not always the fattest folder.
+    cirrhrat_39_4 holds 2 test scans at one repetition each and the acquisition in a single file at
+    40, so counting files would combine the two test scans and leave the acquisition out.
+
+    Buckets tied for the most repetitions all combine, since nothing here can say which of them is
+    the acquisition. That is the misfiled upload check_groups reports
     Args:
         - buckets: files sharing an experiment, sequence and acquisition matrix
     Returns:
         - the file lists each becoming one group
     """
+    def weight(scan_files: Sequence[ScanFile]) -> int:
+        return sum(scan_file.nrepetitions for scan_file in scan_files)
+
     largest: Dict[tuple, int] = {}
     for key, scan_files in buckets.items():
         experiment = key[:-1]                       # the key without the acquisition matrix
-        largest[experiment] = max(largest.get(experiment, 0), len(scan_files))
+        largest[experiment] = max(largest.get(experiment, 0), weight(scan_files))
     members: List[List[ScanFile]] = []
     for key, scan_files in buckets.items():
-        if len(scan_files) > 1 and len(scan_files) == largest[key[:-1]]:
+        if len(scan_files) > 1 and weight(scan_files) == largest[key[:-1]]:
             members.append(scan_files)
         else:
             members.extend([scan_file] for scan_file in scan_files)
@@ -526,7 +538,7 @@ def assign_output_names(groups: Sequence[ScanGroup]) -> None:
               f"distinguishing them by scan directory", file=sys.stderr)
 
 
-def organize_folder(root, quiet: bool = True) -> List[ScanGroup]:
+def organize_folder(root, meas_id_override: str = "", quiet: bool = True) -> List[ScanGroup]:
     """
     Group every .MRD file under one experiment folder.
 
@@ -535,6 +547,8 @@ def organize_folder(root, quiet: bool = True) -> List[ScanGroup]:
     puts them all in one experiment, and two series acquired at the same matrix would combine
     Args:
         - root: the experiment folder to walk, or a single .MRD file
+        - meas_id_override: name the experiment rather than taking it from the folder, which is how
+          a lone file with no experiment folder around it gets a name of its own
         - quiet: suppress MRSreader's per record reporting, which repeats once per file
     Returns:
         - groups, ordered and named
@@ -550,7 +564,8 @@ def organize_folder(root, quiet: bool = True) -> List[ScanGroup]:
     is_file = root_path.is_file()
     clamp_root = str(root_path.parent if is_file else root_path)
     experiment_root = "" if is_file else str(_posix(os.path.abspath(clamp_root)))
-    groups = group_files(paths, probe, root=clamp_root, experiment_root=experiment_root)
+    groups = group_files(paths, probe, root=clamp_root, experiment_root=experiment_root,
+                         meas_id_override=meas_id_override)
     print(f"Grouped {len(paths)} files into {len(groups)} scans", file=sys.stderr)
     return groups
 
@@ -587,8 +602,8 @@ def organize_members(members: Sequence[Tuple[str, bytes]],
 def reference_group(groups: Sequence[ScanGroup]) -> Optional[ScanGroup]:
     """
     The group the others in an experiment are a departure from: the acquisition the experiment was
-    for. That is the combined series when there is one, and otherwise the group holding the most
-    repetitions, which is the same reasoning _combine uses to pick the series in the first place
+    for. That is the group holding the most repetitions, which is the same reasoning _combine uses
+    to pick the acquisition in the first place, so a report always measures against what combined
     Args:
         - groups: the groups of one experiment
     Returns:
@@ -596,8 +611,7 @@ def reference_group(groups: Sequence[ScanGroup]) -> Optional[ScanGroup]:
     """
     if len(groups) < 2:
         return None
-    combined = [group for group in groups if group.is_combined]
-    return max(combined or groups, key=lambda group: (len(group.scan_files), group.nrepetitions))
+    return max(groups, key=lambda group: (group.nrepetitions, len(group.scan_files)))
 
 
 def report(groups: Sequence[ScanGroup]) -> int:

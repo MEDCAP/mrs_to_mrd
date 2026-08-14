@@ -34,6 +34,7 @@ types live.
 """
 
 import argparse
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -55,12 +56,16 @@ PHASE_SEARCH_RANGE = 15
 # spectral zero fill factor; 1 means the spectral axis is exactly one point per echo
 FIDPAD = 1
 
-# HARDCODED for the EVO2 'epsigre' sequence. It starts sampling before the readout gradient has
-# settled, so the first 13 points of a readout are not on the gradient plateau and are unusable.
-# They are zeroed rather than discarded, with 7 further zeros in front of them, so the first
-# 7 + 13 = 20 points of the first echo are zero. Discarding them instead would shift every echo
-# boundary and cost the last echo, which is what the legacy recon did.
-EPSIGRE_LEADING_PAD = 11
+# Where each echo of an EPSI readout starts. A gradient switch holds more points than the sequence
+# keeps, the extras being the ramps either side of the flat top, and only the flat top carries the
+# uniform kx spacing the transform assumes. discard_pre drops points as though the ramp were split
+# evenly across both ends, which it is not, so the window is addressed as a pad back from it: echo i
+# starts at i * totalppswitch + discard_pre - pad. MRStomrd2 records the ramp time as the 'tramp'
+# user parameter in us, and the ramp is what the pad is derived from; a file converted before that
+# was recorded falls back to this constant, i.e. to discard_pre exactly as the sequence set it
+EPSIGRE_DEFAULT_PAD = 0
+# leading samples of a readout to replace with zero, for a sequence whose first points are unusable
+# for a reason the ramp time does not account for. Only the first echo can reach samples this early
 EPSIGRE_ZERO_LEAD = 13
 
 
@@ -267,44 +272,107 @@ def emit(data: np.ndarray, *,
 # ---------- k-space assembly ---------------------------------------------
 
 
+def header_user_long(header: mrd.Header, name: str) -> Optional[int]:
+    """The named long user parameter, or None when the header does not carry it."""
+    user = getattr(header, "user_parameters", None)
+    params = getattr(user, "user_parameter_long", None) or [] if user is not None else []
+    for param in params:
+        if param.name == name:
+            return int(param.value)
+    return None
+
+
+def epsi_leading_pad(header: mrd.Header,
+                     acq: mrd.Acquisition,
+                     override: Optional[int] = None) -> Tuple[int, str]:
+    """
+    How far back from discard_pre each echo's window starts, and why.
+
+    The ramp at the head of a switch is not on the flat top, so the usable window opens
+    ceil(tramp / dwell) samples into the switch. discard_pre assumes the discarded points split
+    evenly across both ends instead, and the pad is the difference between the two, which is what
+    apply_line_broadening subtracts from every echo's start.
+    Args:
+        - acq: any acquisition of the readout, read for its dwell time and discard count
+        - override: a pad given on the command line, which wins over the header
+    Returns:
+        - (pad, a one line account of where it came from, for the log)
+    """
+    if override is not None:
+        return override, f"pad {override} from the command line"
+    tramp_us = header_user_long(header, "tramp")
+    if tramp_us is None:
+        return EPSIGRE_DEFAULT_PAD, (f"pad {EPSIGRE_DEFAULT_PAD}, the header records no ramp time; "
+                                     f"convert again to record one")
+    if not acq.head.sample_time_ns:
+        return EPSIGRE_DEFAULT_PAD, f"pad {EPSIGRE_DEFAULT_PAD}, the acquisition records no dwell time"
+    # ceil, because a window opening part way through the last ramp sample still includes it
+    ramp_samples = int(math.ceil(tramp_us * 1000.0 / acq.head.sample_time_ns))
+    discard_pre = acq.head.discard_pre or 0
+    pad = discard_pre - ramp_samples
+    return pad, (f"pad {pad} from tramp={tramp_us}us over a {acq.head.sample_time_ns}ns dwell, "
+                 f"i.e. a {ramp_samples} sample ramp against discard_pre={discard_pre}")
+
+
+def switch_layout(acq: mrd.Acquisition) -> Tuple[int, int, int]:
+    """
+    How one EPSI readout divides into gradient switches.
+
+    The switch count comes from user_int, where the converter records it, because idx.contrast
+    carries the echo index the sequence acquired rather than the switches packed into one readout.
+    user_int holds the whole width of a switch, ramps included; the kept width is what is left of
+    it once the discard points come off both ends.
+    Args:
+        - acq: one acquisition of the readout
+    Returns:
+        - (switches, total points in one switch, points kept per switch)
+    Raises:
+        - ValueError on an acquisition converted before the switch layout was recorded
+    """
+    user_int = list(acq.head.user_int or [])
+    if len(user_int) < 2 or int(user_int[0]) <= 0:
+        raise ValueError("this acquisition records no switch layout in user_int; convert the scan "
+                         "again with the current MRStomrd2")
+    nswitch, totalppswitch = int(user_int[0]), int(user_int[1])
+    kept = totalppswitch - (acq.head.discard_pre or 0) - (acq.head.discard_post or 0)
+    return nswitch, totalppswitch, kept
+
+
 def apply_line_broadening(acq: mrd.Acquisition,
                           line_broadening: float,
                           *,
                           leading_pad: int = 0,
                           zero_lead: int = 0) -> np.ndarray:
     """
-    Split one EPSI readout into its echoes and apply the line broadening apodization.
+    Split one EPSI readout into its switches and apply the line broadening apodization.
 
-    An EPSI readout packs idx.contrast echoes into a single acquisition; each echo carries one
-    point of the spectral dimension, so the apodization decays over echoes, not over the points
-    within an echo.
+    An EPSI readout packs every switch into a single acquisition; each switch carries one point of
+    the spectral dimension, so the apodization decays over switches, not over the points within
+    one of them.
 
-    leading_pad and zero_lead express a leading zero fill without copying the readout: the echo
+    leading_pad and zero_lead express a leading zero fill without copying the readout: the switch
     boundaries are placed as if leading_pad zeros had been prepended, and any sample whose
     position in the original readout is below zero_lead reads as zero. Sampling past the end of
-    the readout, which the shift can cause for the last echo, also reads as zero.
+    the readout, which the shift can cause for the last switch, also reads as zero.
     Args:
         - acq: one acquisition, one phase encode line
         - line_broadening: line broadening factor in Hz
         - leading_pad: zeros notionally prepended to the readout
         - zero_lead: leading samples of the original readout to replace with zero
     Returns:
-        - (nsamples, nechoes) complex array, discard points trimmed off each echo
+        - (kept points, switches) complex array, discard points trimmed off each switch
     """
-    # 64, 12
-    [nswitch, points_per_switch] = acq.head.user_int
-    # 28=1792/64
-    totalppswitch = round(acq.samples() / nechoes)
-    # 12=28-8-8
-    nsamples = totalppswitch - acq.head.discard_pre - acq.head.discard_post
-    result = np.zeros((points_per_switch, nswitch), dtype='complex')
-    offsets = np.arange(points_per_switch)
-    for iecho in range(nechoes):
-        tk = iecho * acq.head.sample_time_ns * totalppswitch / 1.0e+9
-        start = iecho * totalppswitch + acq.head.discard_pre - leading_pad
+    # example data: 64 switches of 28 points over 1792 samples, 12 of each switch kept
+    nswitch, totalppswitch, kept = switch_layout(acq)
+    discard_pre = acq.head.discard_pre or 0
+    result = np.zeros((kept, nswitch), dtype='complex')
+    offsets = np.arange(kept)
+    for iswitch in range(nswitch):
+        tk = iswitch * acq.head.sample_time_ns * totalppswitch / 1.0e+9
+        start = iswitch * totalppswitch + discard_pre - leading_pad
         source = start + offsets
         valid = (source >= zero_lead) & (source < acq.samples())
-        result[valid, iecho] = acq.data[0, source[valid]] * np.exp(-tk * line_broadening)
+        result[valid, iswitch] = acq.data[0, source[valid]] * np.exp(-tk * line_broadening)
     return result
 
 
@@ -319,37 +387,44 @@ def spectral_axis(header: mrd.Header, acq: mrd.Acquisition) -> Tuple[np.ndarray,
     Returns:
         - (xscale in ppm, spectral bandwidth in Hz, spectral bandwidth in ppm)
     """
-    nechoes = acq.head.idx.contrast
-    totalppswitch = round(acq.samples() / nechoes)
+    nswitch, totalppswitch, _ = switch_layout(acq)
     spectral_bw_hz = 1.0e+9 / (acq.head.sample_time_ns * totalppswitch)
     # the converter writes the 13C frequency here despite the field name, since that is the
     # frequency these spectra were actually acquired at
     center_freq_hz = header.experimental_conditions.h1resonance_frequency_hz
     bw_ppm = spectral_bw_hz / center_freq_hz * 1.0e+6
-    nfreq = nechoes * FIDPAD
+    nfreq = nswitch * FIDPAD
     xscale = np.arange(nfreq) / nfreq * bw_ppm
     return xscale, spectral_bw_hz, bw_ppm
 
 
 def iter_repetitions(header: mrd.Header,
                      input: Iterable[mrd.Acquisition],
-                     line_broadening: float) -> Iterable[Tuple[mrd.Acquisition, np.ndarray, list]]:
+                     line_broadening: float,
+                     *,
+                     pad: Optional[int] = None,
+                     zero_lead: Optional[int] = None) -> Iterable[Tuple[mrd.Acquisition, np.ndarray, list]]:
     """
     Assemble EPSI k-space one repetition at a time.
 
     Yields (reference acquisition, kspace, the acquisitions of that repetition), where kspace
     has shape (nviews, nsamples, nechoes * FIDPAD). Holding one repetition's acquisitions lets
     the caller pass them through to its own output without a second read.
+    Args:
+        - pad: sampling window pad, or None to derive it from the recorded ramp time
+        - zero_lead: leading samples to read as zero, or None for the sequence's own default
     """
     enc = header.encoding[0]
     nviews = 1
     if enc.encoding_limits.phase is not None:
         nviews = enc.encoding_limits.phase.maximum + 1
 
-    # zero fill the unusable start of an EVO2 epsigre readout, nothing for any other sequence
-    epsigre = header.measurement_information.sequence_name == "epsigre"
-    leading_pad = EPSIGRE_LEADING_PAD if epsigre else 0
-    zero_lead = EPSIGRE_ZERO_LEAD if epsigre else 0
+    if zero_lead is None:
+        # the 13 unusable points are a quirk of this one sequence, unlike the ramp, which every
+        # EPSI readout has and which the pad already accounts for
+        epsigre = header.measurement_information.sequence_name == "epsigre"
+        zero_lead = EPSIGRE_ZERO_LEAD if epsigre else 0
+    leading_pad = None                  # derived from the first acquisition, which carries the dwell
 
     current_rep = None
     kspace = None
@@ -357,9 +432,14 @@ def iter_repetitions(header: mrd.Header,
     acqs: list = []
 
     for acq in input:
-        nechoes = acq.head.idx.contrast
-        totalppswitch = round(acq.samples() / nechoes)
-        nsamples = totalppswitch - acq.head.discard_pre - acq.head.discard_post
+        nechoes, totalppswitch, nsamples = switch_layout(acq)
+        if leading_pad is None:
+            leading_pad, why = epsi_leading_pad(header, acq, pad)
+            window = acq.head.discard_pre - leading_pad
+            print(f"EPSI sampling window: {why}, so each echo reads positions "
+                  f"{window}..{window + nsamples - 1} of its {totalppswitch} point switch"
+                  + (f", with the first {zero_lead} samples of the readout read as zero"
+                     if zero_lead else ""), file=sys.stderr)
         if acq.head.idx.repetition != current_rep:
             if kspace is not None:
                 yield reference_acq, kspace, acqs
@@ -559,7 +639,9 @@ def fit_phantom(volumes: np.ndarray,
     return phantom_map, (scaling_total or 1.0)
 
 
-def reconstruct_phantom(path: Path, line_broadening: float, wigglefactor: float) -> Tuple[np.ndarray, float]:
+def reconstruct_phantom(path: Path, line_broadening: float, wigglefactor: float,
+                        *, pad: Optional[int] = None,
+                        zero_lead: Optional[int] = None) -> Tuple[np.ndarray, float]:
     """
     Reconstruct a separately converted phantom scan and fit it.
 
@@ -573,7 +655,8 @@ def reconstruct_phantom(path: Path, line_broadening: float, wigglefactor: float)
             volumes = []
             xscale = None
             for reference_acq, kspace, _ in iter_repetitions(
-                    header, acquisition_reader(reader.read_data()), line_broadening):
+                    header, acquisition_reader(reader.read_data()), line_broadening,
+                    pad=pad, zero_lead=zero_lead):
                 if xscale is None:
                     xscale, _, _ = spectral_axis(header, reference_acq)
                 volumes.append(reconstruct_volume(kspace))
@@ -597,7 +680,9 @@ def reconstruct_epsi(header: mrd.Header,
                      rank: int = None,
                      skip_initial_reps: int = 0,
                      phantom_scaling: float = 1.0,
-                     phantom_map: np.ndarray = None) -> Iterable[mrd.StreamItem]:
+                     phantom_map: np.ndarray = None,
+                     pad: Optional[int] = None,
+                     zero_lead: Optional[int] = None) -> Iterable[mrd.StreamItem]:
     """
     Reconstruct an EPSI acquisition into spectra, a global peak fit and metabolite maps.
 
@@ -615,7 +700,7 @@ def reconstruct_epsi(header: mrd.Header,
     last_repetition = 0
 
     for irep, (reference_acq, kspace, acqs) in enumerate(
-            iter_repetitions(header, input, line_broadening)):
+            iter_repetitions(header, input, line_broadening, pad=pad, zero_lead=zero_lead)):
         for acq in acqs:
             yield mrd.StreamItem.Acquisition(acq)
 
@@ -854,7 +939,9 @@ def reconstruct_mrs(input: BinaryIO,
                     rank: int = None,
                     skip_initial_reps: int = 0,
                     phantom_scaling: float = 1.0,
-                    phantom_map: np.ndarray = None) -> None:
+                    phantom_map: np.ndarray = None,
+                    pad: Optional[int] = None,
+                    zero_lead: Optional[int] = None) -> None:
     """Reconstruct one converted file, choosing the reconstruction from its sequence."""
     with mrd.BinaryMrdReader(input) as reader:
         with mrd.BinaryMrdWriter(output) as writer:
@@ -877,7 +964,9 @@ def reconstruct_mrs(input: BinaryIO,
                                      rank=rank,
                                      skip_initial_reps=skip_initial_reps,
                                      phantom_scaling=phantom_scaling,
-                                     phantom_map=phantom_map))
+                                     phantom_map=phantom_map,
+                                     pad=pad,
+                                     zero_lead=zero_lead))
             else:
                 if family != "spectral":
                     print(f"Unrecognized sequence "
@@ -903,6 +992,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-w", "--wigglefactor", type=float, default=1.0, required=False, help="How far peak centers may move from their specified offsets, in ppm")
     parser.add_argument("--phantom", type=Path, default=None, required=False, help="A separately converted phantom .mrd2 to fit for the scaling it provides")
     parser.add_argument("--skip-initial-reps", type=int, default=0, required=False, help="Repetitions to leave out of the per-voxel fits")
+    parser.add_argument("--pad", type=int, default=None, required=False, help="EPSI sampling window, as samples back from discard_pre. Default: derived from the recorded ramp time, use MRSreader.py -w to check it against the data")
+    parser.add_argument("--zero-lead", type=int, default=None, required=False, help="Leading samples of each readout to read as zero, overriding the sequence's own default")
     return parser
 
 
@@ -922,13 +1013,16 @@ if __name__ == "__main__":
         if not args.phantom.is_file():
             raise ValueError(f"{args.phantom} is not a file")
         phantom_map, phantom_scaling = reconstruct_phantom(
-            args.phantom, args.line_broadening, spec.wigglefactor)
+            args.phantom, args.line_broadening, spec.wigglefactor,
+            pad=args.pad, zero_lead=args.zero_lead)
 
     recon_kwargs = dict(line_broadening=args.line_broadening,
                         spec=spec,
                         denoise=args.denoise,
                         rank=args.rank,
                         skip_initial_reps=args.skip_initial_reps,
+                        pad=args.pad,
+                        zero_lead=args.zero_lead,
                         phantom_scaling=phantom_scaling,
                         phantom_map=phantom_map)
 

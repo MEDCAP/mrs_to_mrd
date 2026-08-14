@@ -10,6 +10,47 @@ class PeakParams:
     phases: np.ndarray
     amplitudes: np.ndarray
     baseline: complex = 0j
+    loss: float = np.inf    # residual of the fit that produced these, for hypothesis selection
+
+
+def estimate_width_fwhm(xscale: np.ndarray, spectrum_norm: np.ndarray) -> float:
+    """Estimate a peak width from the FWHM of the largest peak in a normalised spectrum.
+
+    Walks outward from the maximum in both directions until the magnitude drops below
+    half, wrapping around the spectrum, and halves the span.
+    Args:
+        - xscale: the frequency axis, evenly spaced
+        - spectrum_norm: complex spectrum scaled so max(abs()) == 1
+    """
+    npts = len(spectrum_norm)
+    maxidx = int(np.argmax(np.abs(spectrum_norm)))
+    leftidx = -1
+    rightidx = -1
+    for isp in range(npts):
+        if np.abs(spectrum_norm[(maxidx - isp) % npts]) < 0.5 and leftidx == -1:
+            leftidx = -isp
+        if np.abs(spectrum_norm[(maxidx + isp) % npts]) < 0.5 and rightidx == -1:
+            rightidx = isp
+    if leftidx == -1:
+        leftidx = -npts // 2
+    if rightidx == -1:
+        rightidx = npts // 2
+    return float((rightidx - leftidx) * (xscale[1] - xscale[0]) / 2)
+
+
+def candidate_centers(xscale: np.ndarray,
+                      spectrum_norm: np.ndarray,
+                      offsets: np.ndarray,
+                      biggest_idx: int,
+                      bw_ppm: float) -> np.ndarray:
+    """Place the peak centers on the assumption that peak `biggest_idx` is the largest one.
+
+    The peak offsets are a rigid pattern; the only unknown is which of them sits under the
+    tallest point in the spectrum. Anchoring the pattern there and wrapping modulo the
+    spectral width gives one hypothesis per candidate.
+    """
+    anchor = xscale[int(np.argmax(np.abs(spectrum_norm)))]
+    return (anchor - (np.asarray(offsets, dtype=float) - offsets[biggest_idx])) % bw_ppm
 
 
 def _eval_lorentzians(xscale: np.ndarray, BW: float, params: PeakParams) -> np.ndarray:
@@ -47,7 +88,8 @@ class LorentzianFitter:
     def fit_global(self,
                    spectrum: np.ndarray,
                    centers_init: np.ndarray,
-                   widths_init: np.ndarray) -> PeakParams:
+                   widths_init: np.ndarray,
+                   width_bounds: tuple = None) -> PeakParams:
         """Fit all Lorentzian parameters (centers, widths, phases, amplitudes, baseline).
 
         The optimizer vector has 4 values per peak followed by 2 baseline values:
@@ -58,6 +100,9 @@ class LorentzianFitter:
 
         center_t and width_t are arctan-transformed to constrain them near their
         initial values. Stores the result in self.params and returns it.
+
+        width_bounds, if given, is an absolute (lo, hi) width range in xscale units;
+        it is mapped through the same arctan transform and passed to the optimizer.
         """
         npeaks = len(centers_init)
         c0 = np.asarray(centers_init, dtype=float)
@@ -102,10 +147,22 @@ class LorentzianFitter:
         amps_init = np.array([np.abs(spectrum[np.argmin(np.abs(self.xscale - c))]) for c in c0])
         v0 = _pack(PeakParams(c0, w0, phases_init, amps_init, 0j))
 
-        params = _unpack(minimize(_residual, v0).x)
+        bounds = None
+        if width_bounds is not None:
+            lo, hi = width_bounds
+            bounds = [(None, None)] * (4 * npeaks + 2)
+            for j in range(npeaks):
+                # the transform saturates at w0*(1 +- 0.9); clip so tan() stays finite
+                t_lo, t_hi = (np.tan(np.clip(w / w0[j] - 1, -0.89, 0.89) * np.pi / 1.8)
+                              for w in (lo, hi))
+                bounds[4 * j + 1] = (t_lo, t_hi)
+
+        result = minimize(_residual, v0, bounds=bounds)
+        params = _unpack(result.x)
         neg = params.amplitudes < 0
         params.amplitudes[neg] *= -1
         params.phases[neg] += np.pi
+        params.loss = float(result.fun)
 
         self.params = params
         return params

@@ -3,5 +3,6 @@ matplotlib==3.10.8
 scipy==1.16.3
 # the MEDCAP mrd fork, imported as `mrd`. Its setup.py reads the version from $MRD_VERSION_STRING,
 # so install with e.g. MRD_VERSION_STRING=2.0.0 pip install -r requirements.txt
-# mrd2recon.py and fid_recon.py additionally need the NdArray types from feature/add-ndarray
-mrd-python @ git+https://github.com/MEDCAP/mrd-fork.git@9a63b7ff2f18eb468db4d9a4dc4eef0f0af2bd21#subdirectory=python
+# mrd2recon.py writes its reconstruction as NdArrays, which exist only on the dev branch, so the
+# pin below is dev rather than the commit the other scripts were developed against
+mrd-python @ git+https://github.com/MEDCAP/mrd-fork.git@9fe591ddf4a6ee5d53a066dbfda5124e965760d1#subdirectory=python

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from itertools import product
 from pathlib import Path
 from typing import BinaryIO, Iterable, List, Optional, Sequence
 
@@ -42,9 +43,6 @@ from MRSreader import MRSdata
 from mrs_organize import ScanGroup, sequence_family
 from mrs_tar import read_scan_tar
 
-# Time from the start of the excitation pulse to the first sample, in ns. An estimate until the
-# sequence reports it: acquisition starts 180us after a 100us pulse begins
-TE_NS = np.uint64(1.8E+5)
 
 
 def keep_mrs(mrs: MRSdata, name: str, family: str) -> bool:
@@ -72,16 +70,23 @@ def keep_mrs(mrs: MRSdata, name: str, family: str) -> bool:
 
 def generate_acquisition(mrs: MRSdata, rep_base: int, rep_count: int) -> Iterable[mrd.StreamItem]:
     """
-    Emit one acquisition per (repetition, view) of one MRS file.
+    Emit one acquisition per point of the encoding grid of one MRS file.
 
-    Both families walk the same two loops, bounded by the MRSdata field that names each dimension
-    rather than by a position in rawdata.shape. Where the repetitions live is the one thing that
-    varies, and counting them off nrepetitions covers every arrangement seen so far:
+    Every axis of rawdata but the samples one is walked, each bounded by the MRSdata field that
+    names it rather than by a position in rawdata.shape, so a file using an axis converts rather
+    than losing it to a hardcoded index. All the data seen so far leaves four of the five at one:
         - EPSI split one repetition per file:    nrepetitions=1,  nviews=8 ->    8 acquisitions
         - EPSI acquired into a single file:      nrepetitions=N,  nviews=8 ->  N*8 acquisitions
         - spectral, repetitions on the nex axis: nrepetitions=40, nviews=1 ->   40 acquisitions
     rep_base is where this file's repetitions start within the group, so all three number
     identically from the reader's point of view.
+
+    Each axis takes the MRD index that means the same thing
+        nviews       -> kspace_encode_step_1 
+        nsliceviews  -> kspace_encode_step_2
+        nslices      -> slice
+        nechoes      -> contrast
+        nrepetitions -> repetition, offset by rep_base
     Args:
         - mrs: one parsed MRS file, rawdata indexed
                (nsamples, nviews, nsliceviews, nslices, nechoes, nrepetitions)
@@ -96,52 +101,57 @@ def generate_acquisition(mrs: MRSdata, rep_base: int, rep_count: int) -> Iterabl
         # single view arrangement is the one that assumes least about how they were encoded
         print(f"Unrecognized sequence '{mrs.sequence_name}', converting it as single view data",
               file=sys.stderr)
-    TR = np.uint64(mrs.tr * 1.0E+6)                             # mrs.tr in ms, converted to ns
     if family == "epsi":
         # samples hold nswitch echoes, each npoints_per_switch long with a gradient ramp either
-        # side. cirrhrat_43_1: 1792 samples / 64 switches = 28, (28 - 12) / 2 = 8 points per ramp.
+        # side
+        # example cirrhrat_43_1: 1792 samples / 64 switches = 28, (28 - 12) / 2 = 8 points per ramp.
         # nswitch is a divisor both here and in reconstruction, so a file recording 0 switches is
         # read as 1 rather than being allowed to raise part way through a scan
         nswitch = max(mrs.nswitch, 1)
         points_per_switch = mrs.nsamples // nswitch
         discard = (points_per_switch - mrs.npoints_per_switch) // 2
-    for irep in range(mrs.nrepetitions):
-        for iview in range(mrs.nviews):
-            acq = mrd.Acquisition()
-            # MRS acquires on one channel, so add the coil axis: acq.data.shape=(coils=1, samples)
-            acq.data = np.expand_dims(mrs.rawdata[:, iview, 0, 0, 0, irep], axis=0)
-            # one excitation per (repetition, view): EPSI phase encodes one view per TR and
-            # spectral repeats its single view, so counting excitations spaces both correctly
-            excitation = np.uint64(irep * mrs.nviews + iview)
-            pulse_start = np.uint64(mrs.acquisition_timestamp * 100) + excitation * TR
-            acq.head.acquisition_time_stamp_ns = pulse_start + TE_NS
-            acq.head.sample_time_ns = mrs.sample_period * 100    # sample_period in units of 100ns
-            acq.head.idx.average = mrs.naverages
-            acq.head.idx.phase = iview
-            repetition = rep_base + irep
-            acq.head.idx.repetition = repetition
-            acq.head.idx.kspace_encode_step_1 = iview
-            acq.head.scan_counter = repetition * mrs.nviews + iview
-            if repetition == 0 and iview == 0:
-                acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_REPETITION
-            if repetition == rep_count - 1 and iview == mrs.nviews - 1:
-                acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_REPETITION
-            # both hold on a single view acquisition, so these are two ifs rather than if/elif
-            if iview == 0:
-                acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_PHASE
-            if iview == mrs.nviews - 1:
-                acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_PHASE
-            if family == "epsi":
-                acq.head.idx.contrast = nswitch                 # echo number in multi-echo
-                # recon slices a fixed width off both ends of each echo, so these must stay equal
+    # one repetition's worth of acquisitions, which is every axis inside the repetition one. The
+    # product walks them in the order the axes are listed, repetition slowest and view fastest, so a
+    # repetition's acquisitions stay contiguous in the stream and views stay contiguous within it
+    per_repetition = mrs.nechoes * mrs.nslices * mrs.nsliceviews * mrs.nviews
+    grid = product(range(mrs.nrepetitions), range(mrs.nechoes), range(mrs.nslices),
+                   range(mrs.nsliceviews), range(mrs.nviews))
+    for counter, (irep, iecho, islice, isliceview, iview) in enumerate(grid):
+        within = counter % per_repetition           # where this sits inside its own repetition
+        acq = mrd.Acquisition()
+        # MRS acquires on one channel, so add the coil axis: acq.data.shape=(coils=1, samples)
+        acq.data = np.expand_dims(mrs.rawdata[:, iview, isliceview, islice, iecho, irep], axis=0)
+        acq.head.acquisition_time_stamp_ns = np.uint64(mrs.acquisition_timestamp * 100) # 100ns -> ns units
+        acq.head.sample_time_ns = mrs.sample_period * 100    # sample_period in units of 100ns
+        acq.head.idx.average = mrs.naverages    # mrs already collapses averaged samples into single sample
+        repetition = rep_base + irep
+        acq.head.idx.repetition = repetition    # index of repetition
+        acq.head.idx.kspace_encode_step_1 = iview
+        acq.head.idx.kspace_encode_step_2 = isliceview
+        acq.head.idx.slice = islice
+        acq.head.idx.contrast = iecho           # index of echoes
+        # unique and increasing across the whole group, since repetition already carries rep_base
+        acq.head.scan_counter = repetition * per_repetition + within
+        if repetition == 0 and within == 0:
+            acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_REPETITION
+        if repetition == rep_count - 1 and within == per_repetition - 1:
+            acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_REPETITION
+        # both hold on a single view acquisition, so these are two ifs rather than if/elif
+        if iview == 0:
+            acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_PHASE
+        if iview == mrs.nviews - 1:
+            acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_PHASE
+        # the switch layout the discard points were worked out from. Only an EPSI readout has one,
+        # and nswitch and points_per_switch are only defined for one, so this stays inside the
+        # branch. It cannot ride on idx.contrast, which carries the sequence's own echo index
+        if family == "epsi":
+            acq.head.user_int = [nswitch, points_per_switch]
+            # if there is discard, encode it into acq.head
+            if discard:
                 acq.head.discard_pre = discard
                 acq.head.discard_post = discard
-            else:
-                acq.head.idx.contrast = 1
-                acq.head.discard_pre = 0
-                acq.head.discard_post = 0
-                acq.phase = np.zeros(mrs.nsamples, dtype=np.float32)   # phase is not recorded
-            yield mrd.StreamItem.Acquisition(acq)
+        acq.phase = np.zeros(mrs.nsamples, dtype=np.float32)   # phase is not recorded
+        yield mrd.StreamItem.Acquisition(acq)
 
 
 def make_header(mrs: MRSdata, meas_id: str, rep_count: int) -> mrd.Header:
@@ -161,6 +171,11 @@ def make_header(mrs: MRSdata, meas_id: str, rep_count: int) -> mrd.Header:
     subject.patient_id = meas_id            # e.g.) cirrhrat_43_1, KIC_Huh7msps5_08-15-2025.mrs
     header.subject_information = subject
 
+    seqparam = mrd.SequenceParametersType()
+    seqparam.tr = mrs.tr
+    seqparam.te = mrs.te
+    seqparam.flip_angle_deg = mrs.flip_angle
+
     meas = mrd.MeasurementInformationType()
     meas.sequence_name = mrs.sequence_name
     meas.measurement_id = meas_id
@@ -172,17 +187,33 @@ def make_header(mrs: MRSdata, meas_id: str, rep_count: int) -> mrd.Header:
 
     header.experimental_conditions.h1resonance_frequency_hz = mrs.base_frequency
 
+    # tramp is the readout gradient ramp time in us. It is what places the EPSI sampling window:
+    # the ramp is the leading stretch of a switch that is not yet on the gradient plateau, so a
+    # reconstruction needs it to work out which points of each switch are usable. Recorded only when
+    # the file carried it, since writing the 0 default would read as a measured ramp of zero.
+    # UserParameterLongType is this schema's integer parameter, there is no int arm of its own
+    if mrs.tramp:
+        if header.user_parameters is None:
+            header.user_parameters = mrd.UserParametersType()
+        header.user_parameters.user_parameter_long.append(
+            mrd.UserParameterLongType(name="tramp", value=int(mrs.tramp)))
+
     encoded_space = mrd.EncodingSpaceType()
-    encoded_space.matrix_size = mrd.MatrixSizeType(x=mrs.nsamples, y=mrs.nviews, z=mrs.nslices)
+    # the encoded matrix is the k-space one, so its third axis is the second phase encode rather
+    # than the slice count: slices are separate acquisitions carrying an index, not an encoded axis
+    encoded_space.matrix_size = mrd.MatrixSizeType(x=mrs.nsamples, y=mrs.nviews, z=mrs.nsliceviews)
     encoded_space.field_of_view_mm = mrd.FieldOfViewMm(x=mrs.FOV * 1e3, y=mrs.FOV * 1e3, z=0)
 
-    # each limit is the size of one rawdata dimension, as a maximum index
+    # each limit is the size of one rawdata dimension, as a maximum index, and every dimension
+    # generate_acquisition walks has one, so a reader can size any axis it finds indexed
     limits = mrd.EncodingLimitsType()
     limits.kspace_encoding_step_0 = mrd.LimitType(maximum=mrs.nsamples - 1)
     limits.kspace_encoding_step_1 = mrd.LimitType(maximum=mrs.nviews - 1)
+    limits.kspace_encoding_step_2 = mrd.LimitType(maximum=mrs.nsliceviews - 1)
     # reconstruction sizes its k-space off the phase limit, so it has to carry the view count too
     limits.phase = mrd.LimitType(maximum=mrs.nviews - 1)
     limits.slice = mrd.LimitType(maximum=mrs.nslices - 1)
+    limits.contrast = mrd.LimitType(maximum=mrs.nechoes - 1)     
     # clamped, so that a file reporting no repetitions still gets a valid header
     limits.repetition = mrd.LimitType(minimum=0, maximum=max(rep_count - 1, 0))
 
@@ -261,7 +292,8 @@ def report_warnings(groups: Sequence[ScanGroup]) -> None:
             print(f"WARNING {warning}", file=sys.stderr)
 
 
-def convert_folder_to_mrd(folder: Path, dry_run: bool = False) -> bool:
+def convert_folder_to_mrd(folder: Path, dry_run: bool = False,
+                          meas_id_override: str = "") -> bool:
     """
     Walk one experiment folder for .MRD files and convert each scan to its own stream inside it
         spectral: KIC_Huh7msps5_08-15-2025.mrs/KIC_huh7_5.MRD
@@ -273,10 +305,11 @@ def convert_folder_to_mrd(folder: Path, dry_run: bool = False) -> bool:
     Args:
         - folder: the experiment folder to walk
         - dry_run: report the grouping and what looks wrong with it, converting nothing
+        - meas_id_override: measurement id to record instead of the folder's name
     Returns:
         - True when at least one scan was written, or when a dry run found something to convert
     """
-    groups = mrs_organize.organize_folder(folder)
+    groups = mrs_organize.organize_folder(folder, meas_id_override)
     if dry_run:
         mrs_organize.report(groups)
         return bool(groups)
@@ -293,17 +326,20 @@ def convert_folder_to_mrd(folder: Path, dry_run: bool = False) -> bool:
     return written
 
 
-def convert_file_to_mrd(input_path: Path, output_path: Optional[Path] = None) -> bool:
+def convert_file_to_mrd(input_path: Path, output_path: Optional[Path] = None,
+                        meas_id_override: str = "") -> bool:
     """
     Convert a single .MRD file. Spectral fid data arrives this way: one file already holds every
     repetition on its nex axis, so there is nothing to collect or group
     Args:
         - input_path: the .MRD file
         - output_path: where to write, defaulting to the name its scan would have been given
+        - meas_id_override: measurement id to record instead of the directory holding the file,
+          which is what names a file sitting outside any experiment folder
     Returns:
         - True when a stream was written
     """
-    groups = mrs_organize.organize_folder(input_path)
+    groups = mrs_organize.organize_folder(input_path, meas_id_override)
     if not groups:
         print(f"Nothing to convert in {input_path}", file=sys.stderr)
         return False
@@ -406,7 +442,8 @@ def main() -> int:
                         help="file or FIFO to write the MRD2 stream to. Required with --tar "
                              "(default: $OUTPUT_PIPE), optional with --input, unused with --folder")
     parser.add_argument("--meas-id", default="",
-                        help="measurement id to record instead of the folder's root directory name")
+                        help="measurement id to record instead of the name of the folder, tar root "
+                             "or directory the data came from")
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help="with --folder, report how the files group and what looks wrong with "
                              "them, without converting anything")
@@ -421,7 +458,7 @@ def main() -> int:
     elif args.input:
         if not args.input.is_file():
             parser.error(f"{args.input} is not a file")
-        written = convert_file_to_mrd(args.input, args.output)
+        written = convert_file_to_mrd(args.input, args.output, args.meas_id)
     else:
         if not args.folder.is_dir():
             parser.error(f"{args.folder} is not a directory")
@@ -429,7 +466,7 @@ def main() -> int:
             parser.error("--output does not apply to --folder: each scan is written beside its "
                          "own files")
         print(f"Converting folder {args.folder}", file=sys.stderr)
-        written = convert_folder_to_mrd(args.folder, args.dry_run)
+        written = convert_folder_to_mrd(args.folder, args.dry_run, args.meas_id)
 
     if not written:
         print("Nothing was converted", file=sys.stderr)
