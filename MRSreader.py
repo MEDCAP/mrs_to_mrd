@@ -218,6 +218,45 @@ class MRSdata:
         if DEBUG_MRSREADER:
             print(f"   setting base frequency to {self.base_frequency}Hz", file=sys.stderr)
 
+    def shift_samples(self, npoints):
+        """
+        Slide the acquisition along the samples axis, dropping the points that fall off the end and
+        zero filling the ones that open up at the other.
+
+        The recorded FID need not start where the reconstruction assumes it does: a fixed delay
+        between the excitation and the first sample leaves the top of the echo a few points late,
+        and the spectral transform reads that offset as a first order phase ramp across the
+        spectrum. Shifting the samples by the delay puts the echo back where the transform expects
+        it, and zeros are the honest filler because no signal was recorded for those positions.
+
+        The shape is left alone, so nsamples and everything derived from it still describes the
+        array and a shifted acquisition converts exactly as an unshifted one does.
+        Args:
+            - npoints: samples to shift by. Positive drops the last npoints and prepends that many
+              zeros, moving the data later in the readout; negative mirrors it, dropping from the
+              front and padding the end. Zero does nothing
+        Raises:
+            - ValueError when the data block was never read, or when the shift is at least as long
+              as the readout and would leave nothing but zeros behind
+        """
+        if self.rawdata is None:
+            raise ValueError("no data to shift; read_from_file rather than probe_from_file")
+        if not npoints:
+            return
+        nsamples = self.rawdata.shape[0]
+        if abs(npoints) >= nsamples:
+            raise ValueError(f"a shift of {npoints} empties a {nsamples} sample readout")
+        # np.insert flattens the array when it is given no axis, so the fill is built at the full
+        # width of the remaining axes and concatenated along the samples axis instead
+        fill = np.zeros((abs(npoints),) + self.rawdata.shape[1:], dtype=self.rawdata.dtype)
+        if npoints > 0:
+            self.rawdata = np.concatenate((fill, self.rawdata[:-npoints]), axis=0)
+        else:
+            self.rawdata = np.concatenate((self.rawdata[-npoints:], fill), axis=0)
+        if DEBUG_MRSREADER:
+            print(f"   shifted the samples axis by {npoints}, zero filling the {abs(npoints)} "
+                  f"points that opened up", file=sys.stderr)
+
     @staticmethod
     def _parse_parameters(text, fieldname, key=None):
         """
@@ -601,11 +640,37 @@ if __name__ == '__main__':
                         help='phase encode line to profile (default: the brightest)')
     parser.add_argument('--repeat', type=int, default=None,
                         help='single repetition to profile (default: sum over all of them)')
+    parser.add_argument('--shift', type=int, default=0,
+                        help='slide the samples axis by this many points, dropping what falls off '
+                             'the end and zero filling the gap. Positive prepends the zeros, i.e. '
+                             '--shift 5 drops the last 5 points and starts the readout with 5 zeros')
+    parser.add_argument('--plot-fid', action='store_true',
+                        help='plot the FID summed over every axis but the samples one, which is '
+                             'where a --shift shows up')
     parser.add_argument('--save', type=Path, default=None, help='write the figure to this path')
     parser.add_argument('--no-show', action='store_true', help='do not open a plot window')
     args = parser.parse_args()
     mrs = MRSdata()
     mrs.read_from_file(args.input)
+    if args.shift:
+        mrs.shift_samples(args.shift)
+    if args.plot_fid:
+        import matplotlib.pyplot as plt
+        # every axis but the samples one is summed, so one line stands for the whole acquisition
+        fid = mrs.rawdata.sum(axis=tuple(range(1, mrs.rawdata.ndim)))
+        figure, axis = plt.subplots(figsize=(11, 4))
+        axis.plot(np.abs(fid), label='magnitude')
+        axis.plot(np.real(fid), lw=0.8, label='real')
+        axis.set_title(f"{mrs.sequence_name or 'unknown sequence'}: FID summed over all but the "
+                       f"samples axis, shifted by {args.shift}")
+        axis.set_xlabel('sample')
+        axis.legend(fontsize=8)
+        figure.tight_layout()
+        if args.save:
+            figure.savefig(args.save, dpi=110)
+            print(f"wrote {args.save}", file=sys.stderr)
+        if not args.no_show:
+            plt.show()
     if args.window:
         report = mrs.plot_switch_profile(spectral=not args.magnitude, view=args.view,
                                          repeat=args.repeat, savepath=args.save,
