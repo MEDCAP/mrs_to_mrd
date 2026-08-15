@@ -11,7 +11,7 @@ tyger args:
 local run python mrd2recon.py -f {folderpath of data}
 
 With --folder, every .mrd2 that is not itself a _recon.mrd2 is reconstructed to <name>_recon.mrd2
-beside it. 
+beside it.
 
     python mrd2recon.py -i raw.mrd2 -o recon.mrd2 \
         -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
@@ -19,6 +19,14 @@ beside it.
     _s  source peak, the injected substrate
     _t  tiny peak, not a candidate for "which peak is the tallest one"
     _m  a derived metabolite
+
+An EPSI reconstruction fits the summed spectrum once, then fits every voxel again with that line
+shape. How far a voxel is allowed to depart from it is given by three windows, all zero by
+default, which is to say the line shape is pinned and only the amplitudes vary:
+
+    -df   how far a peak center may move from the global fit, in ppm
+    -dw   how far a peak width may move from the global fit, in ppm
+    -dph  how far a peak phase may move from the global fit, in radians
 
 Everything the reconstruction produces is written to the output stream as mrd NdArrays, and the
 raw acquisitions are passed through unchanged.
@@ -63,12 +71,17 @@ EPSIGRE_ZERO_LEAD = 13
 # retired option whose value parses as a float does not fail, it silently becomes a peak and
 # shifts the fit. These are rejected by name instead
 RETIRED_OPTIONS = {
+    "-w": "peak widths are constrained by -dw, per voxel and in ppm",
+    "--wigglefactor": "peak widths are constrained by -dw, per voxel and in ppm",
     "--phantom": "a phantom is reconstructed as its own file rather than folded in here",
     "--pad": "the sampling window is derived from the recorded ramp time; use MRSreader.py -w "
              "to check it against the data",
     "--zero-lead": "the leading samples read as zero are the sequence's own",
     "--skip-initial-reps": "every repetition is fitted",
 }
+# what append_recon_header writes into user_parameter_double that is not a peak
+RECON_HEADER_PARAMS = frozenset({"line_broadening_factor", "fit_df", "fit_dw", "fit_dph"})
+
 
 # ---------- peak specification -------------------------------------------
 
@@ -79,7 +92,6 @@ class PeakSpec:
     names: List[str]
     offsets: np.ndarray     # chemical shifts in ppm, same order as names
     modifiers: List[str]    # the letters after the underscore, same order as names
-    wigglefactor: float = 1.0
 
     def __len__(self) -> int:
         return len(self.names)
@@ -114,12 +126,12 @@ def split_peak_args(argv: Sequence[str], reserved) -> Tuple[PeakSpec, List[str]]
     Args:
         - argv: the arguments, without the program name
         - reserved: the option strings argparse owns, e.g. {'-i', '--input', ...}, which is
-          also what keeps '-w 0.5' from being read as a peak named 'w'
+          also what keeps '-dw 0.1' from being read as a peak named 'dw'
     Returns:
         - (PeakSpec, the arguments argparse should see)
     Raises:
         - ValueError on an option this recon used to have, since a retired one is no longer
-          reserved and would quietly be read as a peak instead
+          reserved and would quietly be read as a peak
     """
     names: List[str] = []
     offsets: List[float] = []
@@ -148,7 +160,6 @@ def split_peak_args(argv: Sequence[str], reserved) -> Tuple[PeakSpec, List[str]]
         remaining.append(token)
         i += 1
 
-    # wigglefactor is one of argparse's own options, so it is filled in by the caller
     spec = PeakSpec(names=names,
                     offsets=np.asarray(offsets, dtype=float),
                     modifiers=modifiers)
@@ -163,22 +174,22 @@ def peak_spec_to_header(header: mrd.Header, spec: PeakSpec) -> None:
         full = f"{name}_{spec.modifiers[i]}" if spec.modifiers[i] else name
         header.user_parameters.user_parameter_double.append(
             mrd.UserParameterDoubleType(name=full, value=float(spec.offsets[i])))
-    header.user_parameters.user_parameter_double.append(
-        mrd.UserParameterDoubleType(name="wigglefactor", value=float(spec.wigglefactor)))
 
 
 def peak_spec_from_header(header: mrd.Header) -> PeakSpec:
-    """Recover the peak list that peak_spec_to_header wrote into header.user_parameters."""
+    """Recover the peak list that peak_spec_to_header wrote into header.user_parameters.
+
+    A peak is named '<name>_<modifiers>', which is the shape of every double this recon
+    records, so what the reconstruction wrote about itself has to be named to be skipped.
+    """
     names: List[str] = []
     offsets: List[float] = []
     modifiers: List[str] = []
-    wigglefactor = 1.0
 
     user = getattr(header, "user_parameters", None)
     params = getattr(user, "user_parameter_double", None) or [] if user is not None else []
     for p in params:
-        if p.name == "wigglefactor":
-            wigglefactor = float(p.value)
+        if p.name in RECON_HEADER_PARAMS:
             continue
         name, _, mods = p.name.partition("_")
         names.append(name)
@@ -187,20 +198,25 @@ def peak_spec_from_header(header: mrd.Header) -> PeakSpec:
 
     return PeakSpec(names=names,
                     offsets=np.asarray(offsets, dtype=float),
-                    modifiers=modifiers,
-                    wigglefactor=wigglefactor)
+                    modifiers=modifiers)
 
 
 def append_recon_header(header: mrd.Header, *,
                         line_broadening: float,
                         spec: PeakSpec,
                         denoise: bool,
-                        rank: Optional[int]) -> mrd.Header:
+                        rank: Optional[int],
+                        fit_df: float = 0.0,
+                        fit_dw: float = 0.0,
+                        fit_dph: float = 0.0) -> mrd.Header:
     """Record what this reconstruction was asked to do on the header it passes through."""
     if header.user_parameters is None:
         header.user_parameters = mrd.UserParametersType()
     header.user_parameters.user_parameter_double.append(
         mrd.UserParameterDoubleType(name="line_broadening_factor", value=float(line_broadening)))
+    for name, value in (("fit_df", fit_df), ("fit_dw", fit_dw), ("fit_dph", fit_dph)):
+        header.user_parameters.user_parameter_double.append(
+            mrd.UserParameterDoubleType(name=name, value=float(value)))
     if denoise and rank is not None:
         header.user_parameters.user_parameter_long.append(
             mrd.UserParameterLongType(name="svd_rank", value=int(rank)))
@@ -545,7 +561,7 @@ def fit_global_multipeak(global_spect: np.ndarray,
     best_fitter = None
     best_idx = candidates[0]
     for icg in candidates:
-        fitter = LorentzianFitter(xscale, spec.wigglefactor)
+        fitter = LorentzianFitter(xscale)
         centers = candidate_centers(xscale, norm, spec.offsets, icg, bw_ppm)
         params = fitter.fit_global(norm, centers, widths_init, width_bounds=width_bounds)
         if best_fitter is None or params.loss < best_fitter.params.loss:
@@ -555,23 +571,31 @@ def fit_global_multipeak(global_spect: np.ndarray,
     return best_fitter, best_idx, width_guess
 
 
-def fit_voxel_amplitudes(volumes: np.ndarray,
-                         fitter: LorentzianFitter,
-                         *,
-                         noise_threshold: float = 0.0) -> np.ndarray:
+def fit_voxel_peaks(volumes: np.ndarray,
+                    fitter: LorentzianFitter,
+                    *,
+                    noise_threshold: float = 0.0,
+                    fit_df: float = 0.0,
+                    fit_dw: float = 0.0,
+                    fit_dph: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Fit peak amplitudes in every voxel with the line shape locked by the global fit.
+    Fit every voxel with its line shape held at, or near, the one the global fit settled on.
 
-    Only the amplitudes and a small baseline are free, so a voxel too noisy to support a full
-    fit still yields a usable amplitude.
+    The windows say how far a voxel may depart from that shape. At their default of zero the
+    line shape is pinned and only the amplitudes and a baseline are free, so a voxel too noisy
+    to support a full fit still yields a usable amplitude. Opening them lets a voxel whose
+    shim, and so whose line, differs from the average of the slice fit its own.
     Args:
         - volumes: (nreps, nviews, nro, nfreq) complex, already phase aligned
+        - fit_df, fit_dw, fit_dph: center, width and phase windows, in ppm, ppm and radians
     Returns:
-        - (npeaks, nreps, nviews, nro) float, peak heights in the units of the input
+        - ((npeaks, nreps, nviews, nro) peak heights,
+           the matching peak areas, each from its own voxel's fitted width)
     """
     npeaks = len(fitter.params.centers)
     nreps, ny, nx, _ = volumes.shape
     amplitudes = np.zeros((npeaks, nreps, ny, nx))
+    areas = np.zeros((npeaks, nreps, ny, nx))
 
     for ide in range(nreps):
         print(f"Fitting voxels for repetition={ide}", file=sys.stderr)
@@ -580,9 +604,11 @@ def fit_voxel_amplitudes(volumes: np.ndarray,
                 spect = volumes[ide, j, k, :]
                 if np.max(np.abs(spect)) < noise_threshold:
                     continue
-                amplitudes[:, ide, j, k] = np.abs(fitter.fit_amplitudes(spect))
+                params = fitter.fit_windowed(spect, df=fit_df, dw=fit_dw, dph=fit_dph)
+                amplitudes[:, ide, j, k] = np.abs(params.amplitudes)
+                areas[:, ide, j, k] = np.abs(params.amplitudes * params.widths)
 
-    return amplitudes
+    return amplitudes, areas
 
 
 # ---------- EPSI reconstruction ------------------------------------------
@@ -594,7 +620,10 @@ def reconstruct_epsi(header: mrd.Header,
                      line_broadening: float,
                      spec: PeakSpec,
                      denoise: bool = False,
-                     rank: int = None) -> Iterable[mrd.StreamItem]:
+                     rank: int = None,
+                     fit_df: float = 0.0,
+                     fit_dw: float = 0.0,
+                     fit_dph: float = 0.0) -> Iterable[mrd.StreamItem]:
     """
     Reconstruct an EPSI acquisition into spectra, a global peak fit and metabolite maps.
 
@@ -722,16 +751,20 @@ def reconstruct_epsi(header: mrd.Header,
                dimension_labels=[mrd.ArrayDimension.SAMPLES],
                description="lorentzian_baseline")
 
-    metabolites = fit_voxel_amplitudes(aligned, fitter,
-                                       noise_threshold=noise_threshold)
-    # peak area rather than peak height. The voxel fit locks the line shape, so the width is
-    # the globally fitted one and this is a per-peak rescaling of the amplitudes
-    areas = metabolites * np.abs(params.widths)[:, None, None, None]
+    # peak height and peak area. The area is each voxel's own amplitude times its own fitted
+    # width, so with the width window closed it is a per-peak rescaling of the amplitudes and
+    # with it open it is a genuinely per-voxel integral
+    metabolites, areas = fit_voxel_peaks(aligned, fitter,
+                                         noise_threshold=noise_threshold,
+                                         fit_df=fit_df, fit_dw=fit_dw, fit_dph=fit_dph)
 
     map_meta = dict(peak_names=spec.names,
                     peak_offsets_ppm=spec.offsets,
                     source_peak_index=spec.source_idx,
-                    metabolite_indices=spec.metabolite_idx or None)
+                    metabolite_indices=spec.metabolite_idx or None,
+                    fit_df_ppm=fit_df,
+                    fit_dw_ppm=fit_dw,
+                    fit_dph_rad=fit_dph)
     for description, values in (("metabolite_amplitude", metabolites),
                                 ("metabolite_area", areas)):
         yield emit(values,
@@ -848,7 +881,10 @@ def reconstruct_mrs(input: BinaryIO,
                     line_broadening: float,
                     spec: PeakSpec,
                     denoise: bool = False,
-                    rank: int = None) -> None:
+                    rank: int = None,
+                    fit_df: float = 0.0,
+                    fit_dw: float = 0.0,
+                    fit_dph: float = 0.0) -> None:
     """Reconstruct one converted file, choosing the reconstruction from its acquisitions."""
     with mrd.BinaryMrdReader(input) as reader:
         with mrd.BinaryMrdWriter(output) as writer:
@@ -857,7 +893,10 @@ def reconstruct_mrs(input: BinaryIO,
                                 line_broadening=line_broadening,
                                 spec=spec,
                                 denoise=denoise,
-                                rank=rank)
+                                rank=rank,
+                                fit_df=fit_df,
+                                fit_dw=fit_dw,
+                                fit_dph=fit_dph)
             writer.write_header(header)
             acquisitions = acquisition_reader(reader.read_data())
             first = next(acquisitions, None)
@@ -869,7 +908,10 @@ def reconstruct_mrs(input: BinaryIO,
                                      line_broadening=line_broadening,
                                      spec=spec,
                                      denoise=denoise,
-                                     rank=rank))
+                                     rank=rank,
+                                     fit_df=fit_df,
+                                     fit_dw=fit_dw,
+                                     fit_dph=fit_dph))
             else:
                 writer.write_data(
                     reconstruct_spectral(header, acquisitions,
@@ -888,7 +930,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-lb", "--line-broadening", type=float, default=42, required=False, help="Line broadening factor in Hz")
     parser.add_argument("-d", "--denoise", action="store_true", help="Apply truncated-SVD denoising before the transform")
     parser.add_argument("-r", "--rank", type=int, default=None, required=False, help="Number of singular values to retain (default: auto via Gavish-Donoho)")
-    parser.add_argument("-w", "--wigglefactor", type=float, default=1.0, required=False, help="How far peak centers may move from their specified offsets, in ppm")
+    parser.add_argument("-df", "--fit-df", type=float, default=0.0, required=False, help="How far a peak center may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
+    parser.add_argument("-dw", "--fit-dw", type=float, default=0.0, required=False, help="How far a peak width may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
+    parser.add_argument("-dph", "--fit-dph", type=float, default=0.0, required=False, help="How far a peak phase may move from the global fit during the per-voxel fit, in radians. Default 0, i.e. held at the global fit")
     return parser
 
 if __name__ == "__main__":
@@ -898,13 +942,14 @@ if __name__ == "__main__":
     reserved = {option for action in parser._actions for option in action.option_strings}
     spec, remaining = split_peak_args(sys.argv[1:], reserved)
     args = parser.parse_args(remaining)
-    spec = PeakSpec(names=spec.names, offsets=spec.offsets, modifiers=spec.modifiers,
-                    wigglefactor=args.wigglefactor)
 
     recon_kwargs = dict(line_broadening=args.line_broadening,
                         spec=spec,
                         denoise=args.denoise,
-                        rank=args.rank)
+                        rank=args.rank,
+                        fit_df=args.fit_df,
+                        fit_dw=args.fit_dw,
+                        fit_dph=args.fit_dph)
 
     if args.folder and args.input:
         raise ValueError("Cannot specify both --folder and --input")
