@@ -16,10 +16,13 @@ directories inside only for their scan ids. Which files belong to one scan it de
 sequence and the acquisition matrix. All three converge on convert_group_to_mrd, so header choice
 and repetition numbering have exactly one implementation.
 
-Nothing here reads a parameter as meaning more than it says: every file converts to acquisitions the
-same way, and a file that mrs_organize did not combine with anything is simply a scan of its own.
-Whether a scan is calibration data is a question about the scan, answered where that matters rather
-than by flagging acquisitions differently on the way in.
+One experiment converts to one stream, because one stream is what a Tyger job can write: it is given
+a single output buffer. A file that could not concatenate onto the experiment's acquisition rides in
+the same stream, flagged IS_NOISE_MEASUREMENT and left out of the repetition numbering.
+
+Nothing here reads a parameter as meaning more than it says. A file is a noise measurement because
+its acquisition dimensions disagree with the rest, which is a fact about the array, never because
+naverages or any other parameter was taken to announce it.
 
 Errors are raised only in main(). Past that point a file that cannot be converted is reported on
 stderr and skipped, so one unreadable or stray file does not lose the rest of the scan.
@@ -68,7 +71,8 @@ def keep_mrs(mrs: MRSdata, name: str, family: str) -> bool:
     return True
 
 
-def generate_acquisition(mrs: MRSdata, rep_base: int, rep_count: int) -> Iterable[mrd.StreamItem]:
+def generate_acquisition(mrs: MRSdata, rep_base: int, rep_count: int,
+                         is_noise: bool = False) -> Iterable[mrd.StreamItem]:
     """
     Emit one acquisition per point of the encoding grid of one MRS file.
 
@@ -87,11 +91,17 @@ def generate_acquisition(mrs: MRSdata, rep_base: int, rep_count: int) -> Iterabl
         nslices      -> slice
         nechoes      -> contrast
         nrepetitions -> repetition, offset by rep_base
+
+    A file mrs_organize could not concatenate onto the acquisition is converted the same way, but
+    flagged IS_NOISE_MEASUREMENT and left out of the two indices that place data in the encoded
+    grid, since it was recorded at a matrix the header does not describe
     Args:
         - mrs: one parsed MRS file, rawdata indexed
                (nsamples, nviews, nsliceviews, nslices, nechoes, nrepetitions)
         - rep_base: repetition index this file's first repetition maps to
         - rep_count: repetitions in the whole group, for the LAST_IN_REPETITION flag
+        - is_noise: whether this file rides in the stream as a noise measurement rather than as
+          repetitions of the acquisition. rep_base and rep_count are then unused
     Returns:
         - Iterable of mrd.StreamItem.Acquisition
     """
@@ -124,18 +134,26 @@ def generate_acquisition(mrs: MRSdata, rep_base: int, rep_count: int) -> Iterabl
         acq.head.acquisition_time_stamp_ns = np.uint64(mrs.acquisition_timestamp * 100) # 100ns -> ns units
         acq.head.sample_time_ns = mrs.sample_period * 100    # sample_period in units of 100ns
         acq.head.idx.average = mrs.naverages    # mrs already collapses averaged samples into single sample
-        repetition = rep_base + irep
-        acq.head.idx.repetition = repetition    # index of repetition
-        acq.head.idx.kspace_encode_step_1 = iview
         acq.head.idx.kspace_encode_step_2 = isliceview
         acq.head.idx.slice = islice
         acq.head.idx.contrast = iecho           # index of echoes
-        # unique and increasing across the whole group, since repetition already carries rep_base
-        acq.head.scan_counter = repetition * per_repetition + within
-        if repetition == 0 and within == 0:
-            acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_REPETITION
-        if repetition == rep_count - 1 and within == per_repetition - 1:
-            acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_REPETITION
+        # a noise measurement is none of the acquisition's repetitions, so it carries neither a
+        # repetition index nor a k-space line: the header describes the acquisition's matrix and
+        # this file was recorded at another, so a reader placing these by index would write past the
+        # end of it. Which line each one is stays recoverable from the order they are written in and
+        # the FIRST/LAST_IN_PHASE flags below
+        if is_noise:
+            acq.head.flags |= mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT
+        else:
+            repetition = rep_base + irep
+            acq.head.idx.repetition = repetition    # index of repetition
+            acq.head.idx.kspace_encode_step_1 = iview
+            # unique and increasing across the whole group, since repetition already carries rep_base
+            acq.head.scan_counter = repetition * per_repetition + within
+            if repetition == 0 and within == 0:
+                acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_REPETITION
+            if repetition == rep_count - 1 and within == per_repetition - 1:
+                acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_REPETITION
         # both hold on a single view acquisition, so these are two ifs rather than if/elif
         if iview == 0:
             acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_PHASE
@@ -245,27 +263,37 @@ def read_mrs_group(filepaths: Sequence[str], family: str = "") -> List[MRSdata]:
     return mrs_list
 
 
-def convert_group_to_mrd(mrs_list: Sequence[MRSdata], meas_id: str, output: BinaryIO) -> bool:
+def convert_group_to_mrd(mrs_list: Sequence[MRSdata], meas_id: str, output: BinaryIO,
+                         noise_list: Sequence[MRSdata] = ()) -> bool:
     """
-    Write one scan's worth of parsed MRS files as a single MRD v2 stream.
+    Write one experiment as a single MRD v2 stream.
 
     Repetitions are counted off nrepetitions and summed across the group, which covers EPSI split
     one repetition per file, EPSI acquired with all its repetitions in one file, and spectral
     holding them on the nex axis, without the caller having to say which of the three it has. A
     group of one file is the same thing with one term in the sum.
+
+    Whatever was filed in the experiment but could not concatenate onto the acquisition follows in
+    the same stream, flagged. One experiment is one stream because that is what a Tyger job can
+    write, and it is given a single output buffer
     Args:
-        - mrs_list: parsed files in acquisition order
+        - mrs_list: the acquisition's files, in acquisition order
         - meas_id: measurement id recorded in the header
         - output: writable binary stream. Must be a file object, not a path: BinaryMrdWriter
                   special-cases str only, so a Path would be mistaken for a stream
+        - noise_list: files to write as noise measurements after the acquisition
     Returns:
         - True when a stream was written
     """
     if not mrs_list:
         print(f"Nothing to convert for {meas_id}", file=sys.stderr)
         return False
+    # only the acquisition has repetitions. The noise measurements are not repetitions of it, which
+    # is why they are noise measurements, so they neither count here nor move the header's limit
     rep_count = sum(mrs.nrepetitions for mrs in mrs_list)
-    print(f"Converting {meas_id}: {len(mrs_list)} files, {rep_count} repetitions", file=sys.stderr)
+    noise = f", {len(noise_list)} as noise measurements" if noise_list else ""
+    print(f"Converting {meas_id}: {len(mrs_list)} files, {rep_count} repetitions{noise}",
+          file=sys.stderr)
     # the writer must be closed to emit the end-of-stream sentinel, hence the with block
     with mrd.BinaryMrdWriter(output) as writer:
         writer.write_header(make_header(mrs_list[0], meas_id, rep_count))
@@ -273,6 +301,10 @@ def convert_group_to_mrd(mrs_list: Sequence[MRSdata], meas_id: str, output: Bina
         for mrs in mrs_list:
             writer.write_data(generate_acquisition(mrs, rep_base, rep_count))
             rep_base += mrs.nrepetitions
+        # written after the acquisition, so a reader that stops at the last repetition has already
+        # seen everything the header describes
+        for mrs in noise_list:
+            writer.write_data(generate_acquisition(mrs, 0, rep_count, is_noise=True))
     return True
 
 
@@ -295,13 +327,14 @@ def report_warnings(groups: Sequence[ScanGroup]) -> None:
 def convert_folder_to_mrd(folder: Path, dry_run: bool = False,
                           meas_id_override: str = "") -> bool:
     """
-    Walk one experiment folder for .MRD files and convert each scan to its own stream inside it
+    Walk one experiment folder for .MRD files and convert it to one stream inside it, the same
+    stream -t writes out of a tar of the same folder
         spectral: KIC_Huh7msps5_08-15-2025.mrs/KIC_huh7_5.MRD
             -> KIC_Huh7msps5_08-15-2025.mrs/KIC_Huh7msps5_08-15-2025.mrs_1puls_extrf_KIC.mrd2
-        EPSI:     cirrhrat_43_1/epsi/24804/24804_000_0.MRD, one repetition per scan directory
-            -> cirrhrat_43_1/cirrhrat_43_1_epsigre_combined.mrd2
-        EPSI:     cirrhrat_43_1/epsi/24792/24792_000_0.MRD, acquired at another matrix
-            -> cirrhrat_43_1/cirrhrat_43_1_24792.mrd2
+        EPSI:     cirrhrat_43_1/epsi/24804/…, one repetition per scan directory, and
+                  cirrhrat_43_1/epsi/24792/…, acquired at another matrix so it cannot be one of them
+            -> cirrhrat_43_1/cirrhrat_43_1_epsigre.mrd2, holding both, the second flagged
+               IS_NOISE_MEASUREMENT
     Args:
         - folder: the experiment folder to walk
         - dry_run: report the grouping and what looks wrong with it, converting nothing
@@ -320,9 +353,10 @@ def convert_folder_to_mrd(folder: Path, dry_run: bool = False,
         if not mrs_list:
             print(f"No usable files in {group.meas_id}, skipping", file=sys.stderr)
             continue
+        noise_list = read_mrs_group(group.noise_paths, group.family)
         print(f"Writing {group.output_path}", file=sys.stderr)
         with open(group.output_path, "wb") as output:
-            written |= convert_group_to_mrd(mrs_list, group.meas_id, output)
+            written |= convert_group_to_mrd(mrs_list, group.meas_id, output, noise_list)
     return written
 
 
@@ -350,9 +384,10 @@ def convert_file_to_mrd(input_path: Path, output_path: Optional[Path] = None,
     if not mrs_list:
         print(f"Nothing to convert in {input_path}", file=sys.stderr)
         return False
+    noise_list = read_mrs_group(group.noise_paths, group.family)
     print(f"Converting {input_path} to {destination}", file=sys.stderr)
     with open(destination, "wb") as output:
-        return convert_group_to_mrd(mrs_list, group.meas_id, output)
+        return convert_group_to_mrd(mrs_list, group.meas_id, output, noise_list)
 
 
 def convert_tar_to_mrd(tar_path: Path, output_path: Path, meas_id_override: str = "") -> bool:
@@ -364,14 +399,16 @@ def convert_tar_to_mrd(tar_path: Path, output_path: Path, meas_id_override: str 
     EOF, the .SPR sidecar can follow the .MRD members in tar order, and the header needs the whole
     group before the first acquisition can be written.
 
-    A Tyger job has one output buffer, so this writes one stream. The members are grouped exactly
-    as a folder is, which turns "the caller tarred one scan" from an assumption into a checked
-    precondition: more than one scan in the archive is an error, unless --output names a directory
-    to write them all into
+    A Tyger job has one output buffer, so this writes one stream. The members are grouped exactly as
+    a folder is, and grouping folds an experiment into a single stream, so a tar of one experiment
+    matches the one buffer it has to write down. An archive holding more than one experiment is
+    reported and the largest converted, unless --output names a directory to write them all into.
+    Nothing here raises: the input has already been read by then, and a Tyger job that fails without
+    opening its output leaves the buffer's reader waiting rather than seeing an empty stream
     Args:
-        - tar_path: tar archive of one scan directory, or a FIFO carrying one
+        - tar_path: tar archive of one experiment folder, or a FIFO carrying one
         - output_path: where to write the stream, which may also be a FIFO, or a directory when the
-          archive holds more than one scan
+          archive holds more than one experiment
         - meas_id_override: measurement id to record instead of the tar's root directory name
     Returns:
         - True when a stream was written
@@ -387,26 +424,39 @@ def convert_tar_to_mrd(tar_path: Path, output_path: Path, meas_id_override: str 
         print("No base frequency from a .SPR sidecar in the tar", file=sys.stderr)
 
     payloads = dict(members)
-    groups = mrs_organize.organize_members(members, fallback_meas_id=fallback)
-    report_warnings(groups)
-    into_directory = output_path.is_dir()
-    if len(groups) > 1 and not into_directory:
-        raise ValueError(f"the tar holds {len(groups)} scans "
-                         f"({', '.join(group.output_name for group in groups)}) but --output names "
-                         f"a single stream: tar one scan directory, or point --output at a "
-                         f"directory")
 
-    written = False
-    for group in groups:
-        mrs_list: List[MRSdata] = []
-        for name in group.files:
+    def parse(names: Sequence[str], family: str) -> List[MRSdata]:
+        """Parse tar members already in memory, the way read_mrs_group parses them from disk"""
+        parsed: List[MRSdata] = []
+        for name in names:
             mrs = MRSdata()
             mrs.parse_from_buffer(payloads[name])
             # the .MRD may defer its frequency to the sidecar, as read_from_file does on disk
             mrs.set_base_frequency(spr_frequency)
-            if not keep_mrs(mrs, name, group.family):
+            if not keep_mrs(mrs, name, family):
                 continue
-            mrs_list.append(mrs)
+            parsed.append(mrs)
+        return parsed
+
+    groups = mrs_organize.organize_members(members, fallback_meas_id=fallback)
+    report_warnings(groups)
+    into_directory = output_path.is_dir()
+    if len(groups) > 1 and not into_directory:
+        # grouping folds an experiment into one stream, so several here means the archive holds
+        # several experiments or several families. Only one stream fits down one output, and on
+        # Tyger that output is the job's only buffer: convert the largest and say what was left out,
+        # rather than failing a job that has already read its whole input
+        groups = sorted(groups, key=lambda g: (g.nrepetitions, len(g.scan_files)), reverse=True)
+        print(f"The tar holds {len(groups)} scans and --output names one stream: converting "
+              f"{groups[0].output_name}, leaving "
+              f"{', '.join(group.output_name for group in groups[1:])}. Point --output at a "
+              f"directory to write them all", file=sys.stderr)
+        groups = groups[:1]
+
+    written = False
+    for group in groups:
+        mrs_list = parse(group.files, group.family)
+        noise_list = parse(group.noise_paths, group.family)
         # meas_id_override names the scan itself, so it wins over what grouping inferred
         meas_id = meas_id_override or group.meas_id or fallback
         destination = output_path / group.output_name if into_directory else output_path
@@ -414,7 +464,7 @@ def convert_tar_to_mrd(tar_path: Path, output_path: Path, meas_id_override: str 
         # it empty is what tells the sidecar the job produced nothing, rather than leaving it
         # blocked on a stream that never opens
         with open(destination, "wb") as output:
-            written |= convert_group_to_mrd(mrs_list, meas_id, output)
+            written |= convert_group_to_mrd(mrs_list, meas_id, output, noise_list)
     if not groups and not into_directory:
         with open(output_path, "wb"):       # nothing grouped, but the buffer still has to close
             pass
@@ -465,7 +515,8 @@ def main() -> int:
         if args.output:
             parser.error("--output does not apply to --folder: each scan is written beside its "
                          "own files")
-        print(f"Converting folder {args.folder}", file=sys.stderr)
+        print(f"{'Grouping' if args.dry_run else 'Converting'} folder {args.folder}",
+              file=sys.stderr)
         written = convert_folder_to_mrd(args.folder, args.dry_run, args.meas_id)
 
     if not written:

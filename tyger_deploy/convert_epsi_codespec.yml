@@ -1,27 +1,35 @@
-# Convert a tar of one EPSI scan directory to an MRD2 stream.
+# Convert a tar of one EPSI experiment folder to an MRD2 stream.
 #
-#   tar cf - -C /data cirrhrat_0_1 \
-#     | tyger run exec -f tyger_deploy/convert_epsi_codespec.yml > raw.mrd2
+#   tar cf - -C /data cirrhrat_43_1 \
+#     | tyger run exec -f tyger_deploy/convert_epsi_codespec.yml > cirrhrat_43_1_epsigre.mrd2
 #
-# Tyger turns each declared buffer into a named FIFO and passes its path in <NAME>_PIPE, so the
-# entrypoint's --input/--output defaults would pick these up on their own; they are spelled out
-# here so the wiring is visible in the codespec.
+# Tyger turns each declared buffer into a named FIFO and passes its path in <NAME>_PIPE. --tar has
+# to be spelled out, since it is what selects the input mode; --output would default to
+# $OUTPUT_PIPE on its own but is spelled out here so the wiring is visible in the codespec.
+#
+# One experiment converts to one stream, which is what the single output buffer below can carry.
+# The calibration scans filed beside the acquisition ride in that stream flagged
+# IS_NOISE_MEASUREMENT rather than becoming streams of their own.
+#
+# The image is shared with convert_spectral_codespec.yml: MRStomrd2.py reads the sequence name out
+# of each .MRD and converts EPSI or spectral accordingly. This codespec differs only in the memory
+# it asks for, since an EPSI experiment is many files rather than one.
 job:
   codespec:
-    image: ghcr.io/medcap/mrs-convert-epsi:latest
+    image: ghcr.io/medcap/mrs-convert:latest
     buffers:
       inputs: ["input"]
       outputs: ["output"]
     args:
-      - --input
+      - --tar
       - $(INPUT_PIPE)
       - --output
       - $(OUTPUT_PIPE)
     resources:
       requests:
         cpu: 1
-        # the whole scan is held in memory: the format's parameter block sits after the data at
-        # EOF, and the header needs the phantom count across every file before the first write
+        # the whole experiment is held in memory: the format's parameter block sits after the data
+        # at EOF, and grouping needs every file before the first acquisition can be written
         memory: 2G
 
   tags:

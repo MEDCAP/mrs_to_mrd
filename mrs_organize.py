@@ -20,9 +20,11 @@ experiment folder combine when their arrays can concatenate on the repetition ax
 every dimension of the acquisition agrees
 
 Edge case:
-If there is a file that does not match the dimension, it will be converted on its own
-e.g. a calibration scan recorded at another matrix size, or an acquisition
-that already holds its repetitions on the nrepetitions axis 
+A file that does not match the dimension cannot be a repetition of the acquisition beside it, e.g. a
+calibration scan recorded at another matrix size, or an acquisition that already holds its
+repetitions on the nrepetitions axis. It still belongs to the experiment, so it is carried in the
+same stream as a noise measurement rather than converting to a stream of its own. One experiment is
+one stream, which is what a Tyger job can write: it is given a single output buffer.
 
 experiment_name is not read out of the path, it is what the caller pointed at: -f names one
 experiment folder and a tar holds one, so its root is the experiment. Whatever sits between the
@@ -34,6 +36,8 @@ Only -i names a lone file with no folder to take, and then the path is walked up
 the scanner always writes. If nothing above it names the experiment, use the tar filename
 
 Each group is named for what it holds:
+    <experiment>_<sequence>.mrd2            the one stream an experiment writes
+and where an experiment still writes more than one, they say which is which:
     <experiment>_<sequence>_combined.mrd2   files that combined into one acquisition
     <experiment>_<sequence>_<scan_id>.mrd2  a file converting on its own out of a scan directory
 """
@@ -241,12 +245,21 @@ class ScanGroup:
     experiment_dir: str
     output_dir: str
     scan_files: List[ScanFile] = field(default_factory=list)
+    # files filed in this experiment that could not join the acquisition, because their dimensions
+    # do not match it. They ride in the same stream, as noise measurements. Membership here is the
+    # whole of what marks a file as one, so there is no flag to keep in step with it
+    noise_files: List[ScanFile] = field(default_factory=list)
     output_name: str = ""
 
     @property
     def files(self) -> List[str]:
-        """The paths, in acquisition order"""
+        """The paths of the acquisition, in acquisition order"""
         return [scan_file.path for scan_file in self.scan_files]
+
+    @property
+    def noise_paths(self) -> List[str]:
+        """The paths of the noise measurements, in acquisition order"""
+        return [scan_file.path for scan_file in self.noise_files]
 
     @property
     def is_combined(self) -> bool:
@@ -334,7 +347,7 @@ def check_group(group: ScanGroup) -> List[str]:
     warnings: List[str] = []
 
     # the scan ids of one acquisition run consecutively, so a hole is a file that never arrived. A
-    # calibration scan sits outside the run, and is already in a group of its own by then
+    # calibration scan sits outside the run and is in noise_files by now, so it is not looked at here
     acquired = sorted(f.scan_id for f in group.scan_files if f.scan_id is not None)
     if len(acquired) > 1:
         missing = [scan_id for previous, scan_id in zip(acquired, acquired[1:])
@@ -347,6 +360,15 @@ def check_group(group: ScanGroup) -> List[str]:
     sequence_names = {f.sequence_name for f in group.scan_files}
     if len(sequence_names) > 1:
         warnings.append(f"{group.meas_id} mixes sequences {sorted(sequence_names)}")
+
+    # an experiment is an acquisition with a calibration scan or two filed beside it, so more files
+    # left out of the acquisition than in it means this is not one experiment. That is what pointing
+    # -f at a folder of experiments looks like: the largest series wins and every other experiment
+    # is folded into it. Worth saying, because the result is one plausible looking stream
+    if len(group.noise_files) > len(group.scan_files):
+        warnings.append(f"{group.meas_id} carries {len(group.noise_files)} noise measurement(s) "
+                        f"against an acquisition of {len(group.scan_files)} file(s), which is the "
+                        f"shape of several experiments in one folder rather than one experiment")
     return warnings
 
 
@@ -434,8 +456,10 @@ def group_files(paths: Sequence[str],
                         output_dir=_clamp(scan_files[0].experiment_dir, root_dir),
                         scan_files=scan_files)
               for scan_files in members]
-    # tree order, which is what a reader walking the folder alongside the report expects
-    groups.sort(key=lambda group: natural_key(group.scan_files[0].path))
+    # an experiment converts to one stream, so what could not combine into its acquisition rides
+    # along inside it as noise measurements. fold_noise leaves what remains in tree order, which is
+    # what a reader walking the folder alongside the report expects
+    groups = fold_noise(groups)
     assign_output_names(groups)
     return groups
 
@@ -479,6 +503,79 @@ def _combine(buckets: Dict[tuple, List[ScanFile]]) -> List[List[ScanFile]]:
     return members
 
 
+def _acquisition_of(siblings: Sequence[ScanGroup]) -> Optional[ScanGroup]:
+    """
+    The group in one experiment that the others were filed beside: the acquisition the experiment was
+    run for, which is the one holding the most repetitions. Same reasoning _combine uses to pick what
+    combines, so the two always agree on which group that is.
+
+    Distinct from reference_group, which answers the reporting question and names a group even when
+    the answer is unclear. This one only answers when it is certain, because its answer decides what
+    gets folded away rather than what gets printed:
+        - only families that record one repetition per file have calibration filed beside them
+        - two groups tied for the most repetitions are two series, not an acquisition and its
+          calibration, and check_groups reports that as a misfiled upload
+    Args:
+        - siblings: the groups of one experiment
+    Returns:
+        - the acquisition, or None when this experiment has no single unambiguous one
+    """
+    candidates = [group for group in siblings if group.family in UNIFIED_FAMILIES]
+    if len(candidates) < 2:                     # nothing filed beside it, so nothing to fold
+        return None
+    def weight(group: ScanGroup) -> tuple:
+        return (group.nrepetitions, len(group.scan_files))
+    acquisition = max(candidates, key=weight)
+    if sum(1 for group in candidates if weight(group) == weight(acquisition)) > 1:
+        return None
+    return acquisition
+
+
+def fold_noise(groups: Sequence[ScanGroup]) -> List[ScanGroup]:
+    """
+    Fold the files that could not join their experiment's acquisition into it as noise measurements.
+
+    One experiment converts to one stream, because one stream is what a Tyger job can write: it is
+    given a single output buffer, so an experiment that produced several streams could not run there
+    at all. The files that stayed out are the ones whose dimensions disagree with the acquisition - a
+    calibration scan recorded at another matrix, a test scan run before the acquisition started - and
+    they are worth keeping, so they travel in the same stream and are marked there instead.
+
+    What decides this is still only the shape of the data. A file is a noise measurement because it
+    could not concatenate onto the acquisition, never because a parameter was read as saying so
+    Args:
+        - groups: every group from one run, as _combine left them
+    Returns:
+        - the groups that remain, each carrying the ones folded into it
+    """
+    by_experiment: Dict[tuple, List[ScanGroup]] = {}
+    for group in groups:
+        by_experiment.setdefault((group.experiment_dir, group.meas_id), []).append(group)
+
+    remaining: List[ScanGroup] = []
+    for siblings in by_experiment.values():
+        acquisition = _acquisition_of(siblings)
+        if acquisition is None:
+            remaining.extend(siblings)
+            continue
+        for group in siblings:
+            if group is acquisition:
+                continue
+            # another family in the same folder is another acquisition, not calibration for this one
+            if group.family not in UNIFIED_FAMILIES:
+                remaining.append(group)
+                continue
+            acquisition.noise_files.extend(group.scan_files)
+            print(f"{group.meas_id}: {len(group.scan_files)} file(s) from "
+                  f"{_posix(group.scan_files[0].path).parent} ride in "
+                  f"{acquisition.meas_id} as noise measurements", file=sys.stderr)
+        acquisition.noise_files.sort(key=lambda scan_file: natural_key(scan_file.path))
+        remaining.append(acquisition)
+
+    remaining.sort(key=lambda group: natural_key(group.scan_files[0].path))
+    return remaining
+
+
 def _clamp(experiment_dir: str, root_dir: str) -> str:
     """
     Keep output inside the directory the caller pointed at. Pointing -f at a scan directory resolves
@@ -491,22 +588,29 @@ def _clamp(experiment_dir: str, root_dir: str) -> str:
     return root_dir
 
 
-def base_name(group: ScanGroup) -> str:
+def base_name(group: ScanGroup, sole: bool = False) -> str:
     """
     What to call a group's stream, before ties are broken.
 
-    A group is named for what it holds, and every name carries the sequence. Files that combined say
-    so, since no one scan id names the set. A file converting on its own adds its scan id, which is
+    A group is named for what it holds, and every name carries the sequence. An experiment that
+    converts to one stream needs nothing beyond that: whatever else was filed there is folded into
+    the same stream as a noise measurement, so there is no sibling to tell it apart from.
+
+    An experiment that still writes several streams says which is which. Files that combined say so,
+    since no one scan id names the set. A file converting on its own adds its scan id, which is
     unique within an experiment and is what distinguishes it from the series beside it - the sequence
     name alone would not, because a calibration scan runs the same ppl as the acquisition it
     calibrates. A file with no scan id to add, which is how spectral data arrives, is the sequence on
     its own
     Args:
         - group: a grouped scan with at least one file
+        - sole: whether this is the only stream its experiment writes
     Returns:
         - the name without its suffix
     """
     name = f"{sanitize(group.meas_id)}_{sanitize(group.sequence_name)}"
+    if sole:
+        return name
     if group.is_combined:
         return f"{name}_combined"
     scan_id = group.scan_files[0].scan_id
@@ -524,9 +628,16 @@ def assign_output_names(groups: Sequence[ScanGroup]) -> None:
     Args:
         - groups: assigned in place
     """
+    # an experiment writing one stream names it for the experiment and sequence alone, so count the
+    # streams each experiment writes before naming any of them
+    written: Dict[tuple, int] = {}
+    for group in groups:
+        key = (group.output_dir, group.meas_id)
+        written[key] = written.get(key, 0) + 1
     proposed: Dict[tuple, List[ScanGroup]] = {}
     for group in groups:
-        proposed.setdefault((group.output_dir, base_name(group)), []).append(group)
+        sole = written[(group.output_dir, group.meas_id)] == 1
+        proposed.setdefault((group.output_dir, base_name(group, sole)), []).append(group)
     for (_, name), colliding in proposed.items():
         if len(colliding) == 1:
             colliding[0].output_name = name + OUTPUT_SUFFIX
@@ -618,10 +729,10 @@ def report(groups: Sequence[ScanGroup]) -> int:
     """
     Print the grouping and its integrity warnings.
 
-    A file that converts on its own is the part of a report worth explaining, because the folder it
-    sits in says it belongs with the rest and only its dimensions say otherwise. Each one is printed
-    against the acquisition it did not join, naming the dimensions that differ, so the reason it was
-    left out is on the page rather than something to go and work out
+    A file carried as a noise measurement is the part of a report worth explaining, because the
+    folder it sits in says it belongs with the rest and only its dimensions say otherwise. Each one
+    is printed against the acquisition it did not join, naming the dimensions that differ, so the
+    reason it is flagged is on the page rather than something to go and work out
     Args:
         - groups: as returned by organize_folder or organize_members
     Returns:
@@ -650,6 +761,12 @@ def report(groups: Sequence[ScanGroup]) -> int:
         print(f"  first     {first.path}")
         if len(group.scan_files) > 1:
             print(f"  last      {group.scan_files[-1].path}")
+        # the part worth explaining: the folder these came out of says they belong with the rest and
+        # only their dimensions say otherwise, so why each one rides along flagged is on the page
+        # rather than something to go and work out
+        for scan_file in group.noise_files:
+            print(f"  noise     {scan_file.path}")
+            print(f"            {scan_file.differs_from(first) or 'same dimensions'}")
         print(f"  output    {group.output_path}")
         for warning in check_group(group):
             total += 1

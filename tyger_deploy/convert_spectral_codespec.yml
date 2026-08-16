@@ -1,26 +1,35 @@
-# Convert a tar of one spectral (1pul/fid) scan directory to an MRD2 stream.
+# Convert a tar of one spectral (1pul/one_pulse/fid) experiment folder to an MRD2 stream.
 #
-#   tar cf - -C /data PYR_HepG22.mrs \
-#     | tyger run exec -f tyger_deploy/convert_spectral_codespec.yml > raw.mrd2
+#   tar cf - -C /data KIC_Huh7msps5_08-15-2025.mrs \
+#     | tyger run exec -f tyger_deploy/convert_spectral_codespec.yml \
+#     > KIC_Huh7msps5_08-15-2025.mrs_1puls_extrf_KIC.mrd2
 #
-# Tyger turns each declared buffer into a named FIFO and passes its path in <NAME>_PIPE, so the
-# entrypoint's --input/--output defaults would pick these up on their own; they are spelled out
-# here so the wiring is visible in the codespec.
+# Tyger turns each declared buffer into a named FIFO and passes its path in <NAME>_PIPE. --tar has
+# to be spelled out, since it is what selects the input mode; --output would default to
+# $OUTPUT_PIPE on its own but is spelled out here so the wiring is visible in the codespec.
+#
+# A spectral scan is a single file holding every repetition on its nex axis, so a tar of one of
+# these holds one file and converts to one stream. Handing over that file directly, with --input,
+# does the same thing without the tar.
+#
+# The image is shared with convert_epsi_codespec.yml: MRStomrd2.py reads the sequence name out of
+# each .MRD and converts EPSI or spectral accordingly. This codespec differs only in the memory it
+# asks for.
 job:
   codespec:
-    image: ghcr.io/medcap/mrs-convert-spectral:latest
+    image: ghcr.io/medcap/mrs-convert:latest
     buffers:
       inputs: ["input"]
       outputs: ["output"]
     args:
-      - --input
+      - --tar
       - $(INPUT_PIPE)
       - --output
       - $(OUTPUT_PIPE)
     resources:
       requests:
         cpu: 1
-        # a spectral scan is one file, so this is roomier than it needs to be
+        # one file, held whole because the parameter block sits after the data at EOF
         memory: 1G
 
   tags:
