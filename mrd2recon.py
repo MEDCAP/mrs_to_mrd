@@ -33,9 +33,16 @@ default, which is to say the line shape is pinned and only the amplitudes vary:
     -dw   how far a peak width may move from the global fit, in ppm
     -dph  how far a peak phase may move from the global fit, in radians
 
+MRStomrd2 writes one experiment as one stream, so the calibration scans of an EPSI experiment ride
+in the same file as its series, flagged IS_NOISE_MEASUREMENT. They are no part of the series and
+are kept out of it; an EPSI reconstruction fits them for the phantom scaling instead, which is what
+--phantom used to be given a separately converted file for. The flag records that a file's
+dimensions disagree with the acquisition, not that it holds noise, so these do not feed the noise
+estimate: that still comes from the decayed last repetition of the series.
+
 Everything the reconstruction produces is written to the output stream as mrd NdArrays, and the
-raw acquisitions are passed through unchanged. Nothing is plotted and nothing is written outside
-the output file; use mrdplot.py to look at the result.
+raw acquisitions are passed through unchanged, the flagged ones included. Nothing is plotted and
+nothing is written outside the output file; use mrdplot.py to look at the result.
 
 Requires the mrd python package on the `dev` branch of mrd-fork, which is where the NdArray
 types live.
@@ -222,6 +229,10 @@ def append_recon_header(header: mrd.Header, *,
     for name, value in (("fit_df", fit_df), ("fit_dw", fit_dw), ("fit_dph", fit_dph)):
         header.user_parameters.user_parameter_double.append(
             mrd.UserParameterDoubleType(name=name, value=float(value)))
+    # only the scaling of a phantom named with --phantom, which was fitted before the run started.
+    # A calibration scan carried in the input is not fitted until its series has been read, by
+    # which point this header has been written, so that scaling is recorded on the arrays it
+    # applies to instead: the PHANTOM array and the metabolite maps
     if phantom_scaling != 1.0:
         header.user_parameters.user_parameter_double.append(
             mrd.UserParameterDoubleType(name="phantom_scaling", value=float(phantom_scaling)))
@@ -674,15 +685,102 @@ def fit_phantom(volumes: np.ndarray,
     return phantom_map, (scaling_total or 1.0)
 
 
+def split_noise(acqs: Iterable[mrd.Acquisition],
+                sink: List[mrd.Acquisition]) -> Iterable[mrd.Acquisition]:
+    """
+    Yield the acquisitions of the series, collecting the flagged ones into sink.
+
+    MRStomrd2 writes one experiment as one stream, so a file it could not concatenate onto the
+    acquisition rides in the same one flagged IS_NOISE_MEASUREMENT. Such a file was recorded at a
+    matrix the header does not describe and carries neither a repetition index nor a k-space line,
+    so it has to come out before anything places acquisitions in the encoded grid.
+
+    Wrapping the input rather than partitioning it up front keeps the reconstruction streaming: the
+    flagged acquisitions are written after every repetition, so sink is complete once the caller
+    has drained this, and nothing has to be buffered to find that out.
+    """
+    for acq in acqs:
+        if acq.head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT:
+            sink.append(acq)
+            continue
+        yield acq
+
+
+def noise_scan_runs(noise_acqs: Sequence[mrd.Acquisition]) -> List[List[mrd.Acquisition]]:
+    """
+    Split the flagged acquisitions into the scans they were acquired as.
+
+    A flagged acquisition records no k-space line, so which line it is has to come from the order
+    they were written in: the converter walks views fastest and flags the first and last of each
+    pass, so a scan is a run starting at FIRST_IN_PHASE and the line is the position within it.
+    A run that never opened with one is kept anyway, since dropping data is worse than reading it
+    in the order it arrived.
+    """
+    runs: List[List[mrd.Acquisition]] = []
+    for acq in noise_acqs:
+        if acq.head.flags & mrd.AcquisitionFlags.FIRST_IN_PHASE or not runs:
+            runs.append([])
+        runs[-1].append(acq)
+    return runs
+
+
+def noise_scan_volumes(header: mrd.Header,
+                       noise_acqs: Sequence[mrd.Acquisition],
+                       line_broadening: float,
+                       *, pad: Optional[int] = None,
+                       zero_lead: Optional[int] = None) -> Tuple[Optional[np.ndarray],
+                                                                 Optional[np.ndarray]]:
+    """
+    Reconstruct the calibration scans the converter carried in the stream as noise measurements.
+
+    Each scan is transformed on its own switch layout rather than the header's, because the header
+    describes the acquisition and these were recorded at another matrix. That also gives them their
+    own frequency axis, so scans whose shape disagrees with the first cannot be stacked with it.
+    Args:
+        - noise_acqs: every flagged acquisition of the stream, in the order it was written
+    Returns:
+        - ((nscans, nviews, nro, nfreq) complex, the xscale of those scans), or (None, None)
+    """
+    if not noise_acqs:
+        return None, None
+    if zero_lead is None:
+        # the same sequence as the series, so the same leading samples are unusable
+        epsigre = header.measurement_information.sequence_name == "epsigre"
+        zero_lead = EPSIGRE_ZERO_LEAD if epsigre else 0
+
+    volumes: List[np.ndarray] = []
+    xscale = None
+    for run in noise_scan_runs(noise_acqs):
+        nechoes, _, nsamples = switch_layout(run[0])
+        leading_pad, _ = epsi_leading_pad(header, run[0], pad)
+        kspace = np.zeros((len(run), nsamples, nechoes * FIDPAD), dtype='complex')
+        for view, acq in enumerate(run):
+            kspace[view, :, :nechoes] = apply_line_broadening(acq, line_broadening,
+                                                              leading_pad=leading_pad,
+                                                              zero_lead=zero_lead)
+        volume = reconstruct_volume(kspace)
+        if volumes and volume.shape != volumes[0].shape:
+            print(f"Skipping a calibration scan of {volume.shape}, which cannot share a frequency "
+                  f"axis with the {volumes[0].shape} one before it", file=sys.stderr)
+            continue
+        if xscale is None:
+            xscale, _, _ = spectral_axis(header, run[0])
+        volumes.append(volume)
+
+    if not volumes:
+        return None, None
+    return np.stack(volumes), xscale
+
+
 def reconstruct_phantom(path: Path, line_broadening: float,
                         *, pad: Optional[int] = None,
                         zero_lead: Optional[int] = None) -> Tuple[np.ndarray, float]:
     """
     Reconstruct a separately converted phantom scan and fit it.
 
-    The phantom is named explicitly on the command line rather than detected in the stream: the
-    converter deliberately does not mark acquisitions as phantom data, since whether a scan is
-    calibration is a question about the scan and not about its acquisitions.
+    This is the phantom of a file converted before MRStomrd2 wrote one experiment to one stream,
+    when a calibration scan became a .mrd2 of its own. A file converted since carries its
+    calibration scans flagged instead, and reconstruct_epsi fits those without being told.
     """
     with open(path, "rb") as stream:
         with mrd.BinaryMrdReader(stream) as reader:
@@ -728,8 +826,15 @@ def reconstruct_epsi(header: mrd.Header,
     transformed and emitted as it arrives, so a consumer sees repetition n before n+1 is read.
     The analysis then runs once over the whole series, because aligning voxels against the
     brightest spectrum and fitting a summed spectrum both need every repetition in hand.
+
+    A calibration scan carried in the stream as a noise measurement is none of the series'
+    repetitions and is kept out of it, then fitted for the phantom scaling once the series is in
+    hand, unless phantom_map says a separately converted phantom was named instead. It is not read
+    as noise: the flag says its dimensions disagree with the acquisition, not that it holds noise,
+    and the noise floor still comes from the decayed last repetition of the series.
     """
     volumes: List[np.ndarray] = []
+    noise_acqs: List[mrd.Acquisition] = []
     xscale = None
     spectral_bw_hz = None
     current_max = -np.inf
@@ -738,7 +843,8 @@ def reconstruct_epsi(header: mrd.Header,
     last_repetition = 0
 
     for irep, (reference_acq, kspace, acqs) in enumerate(
-            iter_repetitions(header, input, line_broadening, pad=pad, zero_lead=zero_lead)):
+            iter_repetitions(header, split_noise(input, noise_acqs), line_broadening,
+                             pad=pad, zero_lead=zero_lead)):
         for acq in acqs:
             yield mrd.StreamItem.Acquisition(acq)
 
@@ -784,6 +890,14 @@ def reconstruct_epsi(header: mrd.Header,
                    **{"receiver bandwidth(Hz)": spectral_bw_hz,
                       "line broadening(Hz)": line_broadening})
 
+    # passed through like every other acquisition: this reconstruction rewrites nothing it reads
+    if noise_acqs:
+        print(f"{len(noise_acqs)} acquisitions are flagged as noise measurements, in "
+              f"{len(noise_scan_runs(noise_acqs))} calibration scan(s), and are no part of the "
+              f"series", file=sys.stderr)
+        for acq in noise_acqs:
+            yield mrd.StreamItem.Acquisition(acq)
+
     if not volumes:
         return
 
@@ -806,6 +920,17 @@ def reconstruct_epsi(header: mrd.Header,
                max_repetition=max_location[0],
                max_y=max_location[1],
                max_x=max_location[2])
+
+    # a phantom named on the command line wins: it says which scan to calibrate against, where the
+    # stream only says which of its scans were not the acquisition
+    if phantom_map is None and noise_acqs:
+        phantom_volumes, phantom_xscale = noise_scan_volumes(header, noise_acqs, line_broadening,
+                                                             pad=pad, zero_lead=zero_lead)
+        if phantom_volumes is not None:
+            print(f"Fitting {phantom_volumes.shape[0]} calibration scan(s) from the stream",
+                  file=sys.stderr)
+            phantom_map, phantom_scaling = fit_phantom(phantom_volumes, phantom_xscale)
+            print(f"Phantom scaling = {phantom_scaling}", file=sys.stderr)
 
     if phantom_map is not None:
         yield emit(phantom_map,
@@ -912,10 +1037,18 @@ def reconstruct_spectral(header: mrd.Header,
     transformed. Denoising acts on the raw complex signal, so no phase correction is needed
     beforehand.
 
+    A file the converter carried in the stream as a noise measurement is not a time point of this
+    experiment, so it is passed through but left out of the matrix. There is no phantom fit on this
+    path for it to feed instead.
+
     Yields the raw acquisitions, one complex spectrum per time point, and, when denoising, the
     singular values so the knee can be inspected and an explicit --rank chosen.
     """
-    acqs = list(input)
+    noise_acqs: List[mrd.Acquisition] = []
+    acqs = list(split_noise(input, noise_acqs))
+    if noise_acqs:
+        print(f"{len(noise_acqs)} acquisitions are flagged as noise measurements and are no time "
+              f"point of this series", file=sys.stderr)
     if not acqs:
         return
     fids = [extract_fid(acq) for acq in acqs]
@@ -943,6 +1076,8 @@ def reconstruct_spectral(header: mrd.Header,
     apod = np.exp(-np.pi * line_broadening * t)
 
     for acq in acqs:
+        yield mrd.StreamItem.Acquisition(acq)
+    for acq in noise_acqs:              # passed through, having taken no part in the transform
         yield mrd.StreamItem.Acquisition(acq)
 
     if singular_values is not None:
@@ -1043,7 +1178,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-df", "--fit-df", type=float, default=0.0, required=False, help="How far a peak center may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
     parser.add_argument("-dw", "--fit-dw", type=float, default=0.0, required=False, help="How far a peak width may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
     parser.add_argument("-dph", "--fit-dph", type=float, default=0.0, required=False, help="How far a peak phase may move from the global fit during the per-voxel fit, in radians. Default 0, i.e. held at the global fit")
-    parser.add_argument("--phantom", type=Path, default=None, required=False, help="A separately converted phantom .mrd2 to fit for the scaling it provides")
+    parser.add_argument("--phantom", type=Path, default=None, required=False, help="A separately converted phantom .mrd2 to fit for the scaling it provides. Only needed for a file converted before MRStomrd2 wrote one experiment to one stream; since then the calibration scans ride in the input and are fitted without being named. Given, it wins over them")
     parser.add_argument("--skip-initial-reps", type=int, default=0, required=False, help="Repetitions to leave out of the per-voxel fits")
     parser.add_argument("--pad", type=int, default=None, required=False, help="EPSI sampling window, as samples back from discard_pre. Default: derived from the recorded ramp time, use MRSreader.py -w to check it against the data")
     parser.add_argument("--zero-lead", type=int, default=None, required=False, help="Leading samples of each readout to read as zero, overriding the sequence's own default")
