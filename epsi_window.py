@@ -14,7 +14,12 @@ hide it. The drift along the switch train is reported once for all of them toget
 is the granularity it can be measured at: a single repetition does not carry the signal to place
 the echo per switch, and the drift is the same in every repetition anyway. That is why grouping is
 deliberately not run here: every file the input resolves to is read and reported on independently,
-which is what lets an echo that moves between scan directories show up. Nothing is corrected here.
+which is what lets an echo that moves between scan directories show up.
+
+This command corrects nothing, but the correction lives in this module: roll_switches and
+shift_rawdata take a measured drift out of a readout, and MRStomrd2 -w is what walks the datasets of
+an experiment and applies them. The measurement, the roll and the plots stay here as module
+functions so that both sides - this report per file, MRStomrd2 per scan - work from one arithmetic.
 """
 
 from __future__ import annotations
@@ -274,13 +279,73 @@ def pooled_switch_cube(mrs_list: Sequence[MRSdata]) -> np.ndarray:
     return cubes[0] if len(cubes) == 1 else np.concatenate(cubes, axis=3)
 
 
+def roll_switches(block: np.ndarray, shifts: Sequence[int]) -> np.ndarray:
+    """
+    Move each switch of a readout by its own shift.
+
+    The only arrangement a drift fits in. Every other way of addressing the readout - discard_pre,
+    a --pad, the ramp time a reconstruction derives its window from - names one offset for the whole
+    readout, and a drift is precisely the case where one offset cannot be right in every switch.
+
+    The loop runs over switches rather than over the positions inside one, since that is where the
+    shift varies: within a switch it is a single number, and rolling the switch by it moves every
+    position together. Positions are cyclic within a switch, so this wraps rather than padding -
+    what leaves one end of a switch arrives at the other, which is where the neighbouring switch's
+    samples sat anyway
+    Args:
+        - block: (nswitch, positions within a switch, ...), a switch_cube or a reshaped readout
+        - shifts: integer shift per switch, from switch_shifts, positive moving samples later
+    Returns:
+        - a new array of the same shape, switch i rolled by shifts[i]
+    """
+    rolled = np.empty_like(block)
+    for iswitch, shift in enumerate(shifts):
+        rolled[iswitch] = np.roll(block[iswitch], int(shift), axis=0)
+    return rolled
+
+
+def shift_rawdata(mrs: MRSdata, shifts: Sequence[int]) -> None:
+    """
+    Take a measured drift out of one file's readout, in place.
+
+    The raw side twin of mrd2shift.roll_acquisition, which does this to a converted stream. Working
+    on rawdata rather than on a cube is what makes the correction outlive the measurement: every
+    axis is kept, so the file goes on converting, plotting and reconstructing exactly as it did,
+    only with its echoes lined up.
+
+    Samples past the last whole switch are left where they are, the same truncation switch_cube and
+    the conversion already apply: nsamples // nswitch leaves a remainder on some sequences, and
+    those trailing points belong to no switch to be rolled with
+    Args:
+        - mrs: one parsed MRS file of the epsi family, read rather than probed
+        - shifts: integer shift per switch, from switch_shifts
+    Returns:
+        - None; mrs.rawdata is rewritten
+    Raises:
+        - ValueError when called on a file whose data block was never read
+    """
+    if mrs.rawdata is None:
+        raise ValueError("no data to shift; read_from_file rather than probe_from_file")
+    nswitch, total, _ = switch_layout(mrs)
+    used = nswitch * total
+    tail = mrs.rawdata.shape[1:]
+    # reshaped through the sample axis, which comes first, so this is the switch-major order the
+    # samples were acquired in - the same split switch_cube reads the echo position from. Assigned
+    # back through a slice rather than rolled in place, since the reshape may be a copy
+    body = mrs.rawdata[:used].reshape((nswitch, total) + tail)
+    mrs.rawdata[:used] = roll_switches(body, shifts).reshape((used,) + tail)
+
+
 def drift_sharpness(cube: np.ndarray, nswitch: int, slope: float, view: Optional[int]) -> float:
     """
     How well defined the echo is once a drift of `slope` is taken out of the switch train.
 
     Scored by peak over median of the readout profile, which is what the echo drifting smears: every
     switch contributes to that profile, so an echo that sits at one position in all of them gives a
-    sharp peak and one that walks across the switch gives something close to flat
+    sharp peak and one that walks across the switch gives something close to flat.
+
+    Scored through the same roll that is finally applied, so the sharpening measure_echo_drift
+    promises is the sharpening the corrected data has
     Args:
         - cube: (switch, position, view, repeats), as pooled_switch_cube returns
         - nswitch: switches in the readout, i.e. cube.shape[0]
@@ -289,9 +354,7 @@ def drift_sharpness(cube: np.ndarray, nswitch: int, slope: float, view: Optional
     Returns:
         - peak over median of the profile after the candidate correction
     """
-    rolled = np.empty_like(cube)
-    for iswitch, shift in enumerate(switch_shifts(nswitch, cube.shape[1], slope)):
-        rolled[iswitch] = np.roll(cube[iswitch], int(shift), axis=0)
+    rolled = roll_switches(cube, switch_shifts(nswitch, cube.shape[1], slope))
     return spectral_peak(rolled, view=view)[1]
 
 
@@ -399,6 +462,64 @@ def switch_shifts(nswitch: int, total: int, slope: float) -> np.ndarray:
     return (shifts + total // 2) % total - total // 2
 
 
+def measure_group_drift(mrs_list: Sequence[MRSdata]
+                       ) -> Optional[Tuple[dict, Tuple[int, int, int]]]:
+    """
+    Measure the echo drift of one dataset, from every repetition of every file of it pooled.
+
+    One call for the three steps a drift measurement always takes together - pool, read the switch
+    layout, search the correction - so that a caller walking datasets stays a loop and every caller
+    measures the same way. The layout comes back with the measurement because the shifts that take
+    the drift out depend on it: the same slope lands on different integers in a 28 point switch than
+    in a 20 point one.
+
+    What goes into one call is the caller's decision and it is not a free one. The drift is a
+    property of the gradient timing, so it is the same in every repetition of a scan and pooling
+    them is what gives it enough signal to be found; an averaged prescan pooled in with 25
+    repetitions of real data measures neither of them
+    Args:
+        - mrs_list: the parsed files of one dataset, read rather than probed
+    Returns:
+        - (the measurement from measure_echo_drift, (nswitch, total, kept)), or None when the list
+          held no EPSI readout to pool
+    """
+    epsi = [mrs for mrs in mrs_list if is_epsi(mrs) and mrs.rawdata is not None]
+    if not epsi:
+        return None
+    cube = pooled_switch_cube(epsi)
+    if cube is None:
+        return None
+    nswitch, total, kept = switch_layout(epsi[0])
+    return measure_echo_drift(cube, nswitch, total), (nswitch, total, kept)
+
+
+def shift_report(drift: dict, layout: Tuple[int, int, int], label: str = "") -> None:
+    """
+    Print what a drift measurement found, and what taking it out would cost.
+
+    The shift range is printed against the discarded ramp on purpose: rolling a switch brings in the
+    samples of its neighbour, which are ramp points rather than signal, so once the shift exceeds
+    the ramp the ends of the train have nothing valid left to move in. That is the number that says
+    whether a measured drift can be corrected by moving whole samples at all
+    Args:
+        - drift: the measurement from measure_echo_drift
+        - layout: (nswitch, total, kept), from measure_group_drift
+        - label: what to call this dataset, e.g. a meas_id
+    Returns:
+        - None; everything goes to stdout beside the figures
+    """
+    nswitch, total, kept = layout
+    print(f"\necho drift of {label or 'the pooled readout'}, {drift['reps']} repetitions pooled")
+    print(f"  {'drift' if drift['usable'] else 'no usable drift'}: {drift['reason']}")
+    print(f"  best slope {drift['slope']:+.4f} samples per switch, a switch period of "
+          f"{drift['period']:.2f} samples where nsamples/{nswitch} records {total}")
+    if drift['usable']:
+        shifts = switch_shifts(nswitch, total, drift['slope'])
+        discard = (total - kept) // 2
+        print(f"  taking it out moves each switch by {int(shifts.min())} to {int(shifts.max())} "
+              f"samples, against {discard} discarded ramp points either side")
+
+
 def read_inputs(args) -> Iterable[Tuple[str, MRSdata]]:
     """
     Every .MRD the input resolves to, parsed, in acquisition order.
@@ -463,26 +584,11 @@ def report_windows(named_files: Iterable[Tuple[str, MRSdata]]) -> int:
               f"in with the repetitions would measure neither", file=sys.stderr)
 
     # one measurement for the whole input, from every repetition of every unaveraged file pooled
-    if not data:
+    measured = measure_group_drift([mrs for _, mrs in data]) if data else None
+    if measured is None:
         print("\nno unaveraged EPSI readout to measure the echo drift from", file=sys.stderr)
-        drift = None
     else:
-        cube = pooled_switch_cube([mrs for _, mrs in data])
-        nswitch, total, kept = switch_layout(data[0][1])
-        drift = measure_echo_drift(cube, nswitch, total)
-    if drift is not None:
-        print(f"\necho drift over {len(data)} file(s), {drift['reps']} repetitions pooled")
-        print(f"  {'drift' if drift['usable'] else 'no usable drift'}: {drift['reason']}")
-        print(f"  best slope {drift['slope']:+.4f} samples per switch, a switch period of "
-              f"{drift['period']:.2f} samples where {data[0][1].nsamples}/{nswitch} records {total}")
-        if drift['usable']:
-            # how far the echo actually moves, against the room a switch has to spare. Once this
-            # exceeds the discarded ramp the drift cannot be taken out by moving whole samples
-            # within a switch at all, since the ends of the train have no valid sample to move there
-            shifts = switch_shifts(nswitch, total, drift['slope'])
-            discard = (total - kept) // 2
-            print(f"  taking it out would need each switch moved by {int(shifts.min())} to "
-                  f"{int(shifts.max())} samples, against {discard} discarded ramp points")
+        shift_report(*measured, label=f"{len(data)} file(s)")
 
     reported = 0
     for name, mrs in epsi:
