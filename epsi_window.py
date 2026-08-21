@@ -462,8 +462,61 @@ def switch_shifts(nswitch: int, total: int, slope: float) -> np.ndarray:
     return (shifts + total // 2) % total - total // 2
 
 
+def expected_echo_position(mrs: MRSdata) -> Optional[int]:
+    """
+    Where the sequence says the gradient echo sits inside a switch, from its own parameters.
+
+    Not a measurement: the readout loop runs ramp -> points_per_switch -> ramp -> ramp -> ramp and
+    repeats, the ramp is tramp / sample_period samples long, and the echo is the middle of the flat
+    top, so the position follows from the sequence card
+
+        expected = tramp / sample_period + points_per_switch / 2
+
+    On cirrhrat the loop closes exactly: tramp 112 over a 28 us sample period is a 4 sample ramp, and
+    4 ramps of 4 plus the 12 kept points fill a 28 point switch, putting the echo at 10. On the kidney
+    data tramp 100 over 40 us is 2.5 samples, four of which overshoot the 8 non-flat samples a 20
+    point switch has, and the echo comes out at 8.5 - truncated here to 8, which is the nearest whole
+    sample a roll can move to anyway.
+
+    Read only off a sequence the formula was established against, by exact name: a variant that lays
+    its ramps out differently would be moved onto a position that is not its own, and being left
+    alone is the better failure. That is why ischemia_121_1, which records epsigre43_FB_13C, is
+    de-drifted but never moved
+    Args:
+        - mrs: one parsed or probed MRS file of the epsi family
+    Returns:
+        - the position within a switch, or None when this file carries no established formula
+    """
+    if mrs.sequence_name != 'epsigre' or not mrs.tramp or not mrs.sample_period:
+        return None
+    _, _, kept = switch_layout(mrs)
+    sample_period_us = mrs.sample_period / 10.0     # sample_period is recorded in units of 100 ns
+    return int(mrs.tramp / sample_period_us + kept / 2)
+
+
+def aligned_echo_position(cube: np.ndarray, view: Optional[int] = None) -> Tuple[int, float]:
+    """
+    Where the echo actually sits inside a switch, over the switches given.
+
+    Read off the coherent profile spectral_peak builds rather than off a magnitude sum, because this
+    position is what a constant move is measured against and so it has to be the sharper of the two
+    estimators: on ischemia_179 the coherent profile reaches 13.26 peak over median where the
+    magnitude sum manages 1.84, and a position read off the flatter one is a position read off noise.
+
+    The sharpness comes back with it so that a move resting on a smeared profile is visible in the
+    report rather than silent
+    Args:
+        - cube: (switch, position, view, repeats), already rolled straight if it is going to be
+        - view: the view to read, or None for the one carrying the most signal
+    Returns:
+        - (position within the switch, peak over median of the profile it was read from)
+    """
+    profile, sharpness, _ = spectral_peak(cube, view=view)
+    return int(np.argmax(profile)), sharpness
+
+
 def measure_group_drift(mrs_list: Sequence[MRSdata]
-                       ) -> Optional[Tuple[dict, Tuple[int, int, int]]]:
+                       ) -> Optional[Tuple[dict, Tuple[int, int, int], np.ndarray]]:
     """
     Measure the echo drift of one dataset, from every repetition of every file of it pooled.
 
@@ -477,11 +530,14 @@ def measure_group_drift(mrs_list: Sequence[MRSdata]
     property of the gradient timing, so it is the same in every repetition of a scan and pooling
     them is what gives it enough signal to be found; an averaged prescan pooled in with 25
     repetitions of real data measures neither of them
+    The pooled cube comes back with the measurement rather than being built and dropped, because
+    every caller reads the echo position out of it straight afterwards and pooling 25 repetitions of
+    12 views twice to answer two questions about the same samples is work for nothing
     Args:
         - mrs_list: the parsed files of one dataset, read rather than probed
     Returns:
-        - (the measurement from measure_echo_drift, (nswitch, total, kept)), or None when the list
-          held no EPSI readout to pool
+        - (the measurement from measure_echo_drift, (nswitch, total, kept), the pooled cube), or None
+          when the list held no EPSI readout to pool
     """
     epsi = [mrs for mrs in mrs_list if is_epsi(mrs) and mrs.rawdata is not None]
     if not epsi:
@@ -490,34 +546,103 @@ def measure_group_drift(mrs_list: Sequence[MRSdata]
     if cube is None:
         return None
     nswitch, total, kept = switch_layout(epsi[0])
-    return measure_echo_drift(cube, nswitch, total), (nswitch, total, kept)
+    return measure_echo_drift(cube, nswitch, total), (nswitch, total, kept), cube
 
 
-def shift_report(drift: dict, layout: Tuple[int, int, int], label: str = "") -> None:
+def echo_alignment(mrs_list: Sequence[MRSdata]) -> Optional[dict]:
     """
-    Print what a drift measurement found, and what taking it out would cost.
+    Everything needed to put one dataset's echo where it belongs: the drift to take out, and the
+    constant move that lands the result on the position the sequence asks for.
+
+    Two corrections, worked out together and returned as one shift per switch, so applying them is a
+    single roll and neither can be applied without the other:
+
+      - the drift, which is the echo walking along the switch train. Removed by switch_shifts, whose
+        middle-of-the-train anchor is left exactly as it is: the anchor decides nothing here, since
+        the constant below moves the aligned echo onto its target whatever the anchor chose, and
+        measure_echo_drift's accept gates are calibrated against the scores that anchor produces.
+      - the constant, which is the whole readout sitting at the wrong position within the switch.
+        expected_echo_position says where the echo belongs, aligned_echo_position measures where it
+        is, and the difference is the move.
+
+    The two are independent, so the constant is worked out whether or not the drift was usable: a
+    scan whose echo does not walk still has it somewhere other than where the sequence puts it. What
+    says whether that move can be trusted is the profile sharpness reported beside it.
+
+    On the two datasets this was established against the constant reproduces, from the sequence
+    parameters alone, the per-tramp prepend the conversion path hard-codes: switch 0 comes out moved
+    by +5 on the tramp 100 kidney data and +7 on tramp 112 cirrhrat
+    Args:
+        - mrs_list: the parsed files of one dataset, read rather than probed
+    Returns:
+        - dict of the drift, the layout, the expected and measured positions, the constant, the total
+          shift per switch and where the echo ends up, or None when there was nothing to pool
+    """
+    measured = measure_group_drift(mrs_list)
+    if measured is None:
+        return None
+    drift, layout, cube = measured
+    nswitch, total, kept = layout
+    reference = next(mrs for mrs in mrs_list if is_epsi(mrs) and mrs.rawdata is not None)
+
+    # zeros rather than a skip when there is no usable drift, so that the constant below is applied
+    # to a readout that was left alone as readily as to one that was straightened
+    shifts = (switch_shifts(nswitch, total, drift['slope']) if drift['usable']
+              else np.zeros(nswitch, dtype=int))
+    aligned, sharpness = aligned_echo_position(roll_switches(cube, shifts))
+
+    expected = expected_echo_position(reference)
+    # reduced the short way round the switch, since a position is cyclic within one: moving an echo
+    # from 18 to 2 of 20 is 4 samples later, not 16 earlier
+    constant = int((expected - aligned + total // 2) % total - total // 2) if expected is not None else 0
+    shifts = shifts + constant
+
+    discard_pre = (total - kept) // 2
+    landed = (aligned + constant) % total
+    return dict(drift=drift, layout=layout, shifts=shifts, cube=cube,
+                expected=expected, aligned=aligned, sharpness=sharpness, constant=constant,
+                landed=landed, discard_pre=discard_pre,
+                inside=bool(((landed - discard_pre) % total) < kept),
+                sequence_name=reference.sequence_name, tramp=reference.tramp,
+                sample_period=reference.sample_period)
+
+
+def shift_report(alignment: dict, label: str = "") -> None:
+    """
+    Print what a dataset's echo does, and what correcting it comes to.
 
     The shift range is printed against the discarded ramp on purpose: rolling a switch brings in the
     samples of its neighbour, which are ramp points rather than signal, so once the shift exceeds
     the ramp the ends of the train have nothing valid left to move in. That is the number that says
     whether a measured drift can be corrected by moving whole samples at all
     Args:
-        - drift: the measurement from measure_echo_drift
-        - layout: (nswitch, total, kept), from measure_group_drift
+        - alignment: the dict echo_alignment returns
         - label: what to call this dataset, e.g. a meas_id
     Returns:
         - None; everything goes to stdout beside the figures
     """
-    nswitch, total, kept = layout
-    print(f"\necho drift of {label or 'the pooled readout'}, {drift['reps']} repetitions pooled")
+    drift, (nswitch, total, kept) = alignment['drift'], alignment['layout']
+    shifts, expected = alignment['shifts'], alignment['expected']
+
+    print(f"\necho of {label or 'the pooled readout'}, {drift['reps']} repetitions pooled")
     print(f"  {'drift' if drift['usable'] else 'no usable drift'}: {drift['reason']}")
     print(f"  best slope {drift['slope']:+.4f} samples per switch, a switch period of "
           f"{drift['period']:.2f} samples where nsamples/{nswitch} records {total}")
-    if drift['usable']:
-        shifts = switch_shifts(nswitch, total, drift['slope'])
-        discard = (total - kept) // 2
-        print(f"  taking it out moves each switch by {int(shifts.min())} to {int(shifts.max())} "
-              f"samples, against {discard} discarded ramp points either side")
+    if expected is None:
+        print(f"  no expected position for sequence '{alignment['sequence_name']}', so the echo is "
+              f"left where it was acquired: the ramp layout is only established for epsigre")
+    else:
+        ramp_us = alignment['sample_period'] / 10.0
+        print(f"  the sequence puts the echo at {expected} = tramp {alignment['tramp']}us / "
+              f"{ramp_us:.0f}us sample period + {kept}/2, and it measures at "
+              f"{alignment['aligned']} with peak/median {alignment['sharpness']:.2f}")
+        print(f"  so the whole readout moves {alignment['constant']:+d}, landing the echo at "
+              f"{alignment['landed']}, {'inside' if alignment['inside'] else 'OUTSIDE'} the "
+              f"{alignment['discard_pre']}..{alignment['discard_pre'] + kept - 1} kept window")
+    discard = (total - kept) // 2
+    print(f"  correcting it moves switch 0 by {int(shifts[0]):+d} and switch {nswitch - 1} by "
+          f"{int(shifts[-1]):+d}, a range of {int(shifts.min())} to {int(shifts.max())} samples "
+          f"against {discard} discarded ramp points either side")
 
 
 def read_inputs(args) -> Iterable[Tuple[str, MRSdata]]:
@@ -584,11 +709,11 @@ def report_windows(named_files: Iterable[Tuple[str, MRSdata]]) -> int:
               f"in with the repetitions would measure neither", file=sys.stderr)
 
     # one measurement for the whole input, from every repetition of every unaveraged file pooled
-    measured = measure_group_drift([mrs for _, mrs in data]) if data else None
-    if measured is None:
+    alignment = echo_alignment([mrs for _, mrs in data]) if data else None
+    if alignment is None:
         print("\nno unaveraged EPSI readout to measure the echo drift from", file=sys.stderr)
     else:
-        shift_report(*measured, label=f"{len(data)} file(s)")
+        shift_report(alignment, label=f"{len(data)} file(s)")
 
     reported = 0
     for name, mrs in epsi:
