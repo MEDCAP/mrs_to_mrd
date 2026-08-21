@@ -348,7 +348,10 @@ def convert_group_to_mrd(group: ScanGroup, output: BinaryIO,
         # first convert raw data
         for filepath in group.rawdata_file_list:
             mrs = MRSdata()                     # one at a time, released once written
-            mrs.read_from_file(filepath)
+            # through the loader rather than off disk directly, which is the seam the whole function
+            # is built around: tar mode passes one that parses an in-memory buffer, and -w passes one
+            # that applies its echo correction as each file is read
+            load(mrs, filepath)
 
             if writer is None:
                 writer = mrd.BinaryMrdWriter(output)
