@@ -394,24 +394,26 @@ def shift_echo_position(mrs_list: List[MRSdata], name: str = "") -> Optional[dic
     # epsi_window imports is_epsi and switch_layout from here, so this import is function-level to
     # keep that from being circular. matplotlib is deferred for the reason it is everywhere else in
     # this file: converting needs no plotting stack
-    from epsi_window import switch_cube
+    import epsi_window
     import matplotlib.pyplot as plt
 
     label = name or "scan"
-    signal, layout, pooled = None, None, 0
+    signal, layout, pooled, reference = None, None, 0, None
     # loop through raw data mrs_list to identify the peak
     for mrs in mrs_list:
         # switch_cube maps rawdata (nsamples, nviews, ...) to (nswitch, nsamples // nswitch, nviews,
         # everything else), e.g. 1280 samples of 12 views -> 64 switches of 20 positions, the 20
         # including the gradient ramp either side of the flat top. Summed to magnitude over the views
         # and repetitions, since one repetition of one view is mostly noise
-        cube = np.abs(switch_cube(mrs)).sum(axis=(2, 3))         # (nswitch, total)
+        cube = np.abs(epsi_window.switch_cube(mrs)).sum(axis=(2, 3))         # (nswitch, total)
         if signal is not None and cube.shape != signal.shape:
             print(f"WARNING leaving a {cube.shape} readout of {label} out of a {signal.shape} "
                   f"pool", file=sys.stderr)
             continue
         signal = cube if signal is None else signal + cube
         layout = layout or switch_layout(mrs)
+        # any pooled file describes the sequence, since they all share the acquisition matrix
+        reference = reference or mrs
         pooled += 1
     if signal is None:
         print(f"No EPSI readout in {label} to find an echo position in", file=sys.stderr)
@@ -421,10 +423,21 @@ def shift_echo_position(mrs_list: List[MRSdata], name: str = "") -> Optional[dic
     discard_pre = (total - kept) // 2       # the window generate_acquisition writes into the header
     peaks = np.argmax(signal, axis=1)
     switches = np.arange(nswitch)
-    # whether each switch peaks inside the span a conversion keeps, counted the same cyclic way
-    # generate_acquisition addresses it, so a window running off the end of the switch is not
-    # mistaken for one that peaks outside it
-    inside = int((((peaks - discard_pre) % total) < kept).sum())
+    # the window the sequence actually samples: from the end of the leading ramp through the flat top.
+    # That is what the peaks are worth reading against, since it is where the signal was meant to be,
+    # and it is not where a conversion currently keeps its points - the difference between the two is
+    # the mrd2recon --pad that would move a reconstruction onto the plateau
+    window = epsi_window.sequence_window(reference) if reference is not None else None
+    start = window[0] if window else discard_pre
+    # counted the same cyclic way generate_acquisition addresses a window, so one running off the end
+    # of the switch is not mistaken for one that peaks outside it
+    inside = int((((peaks - start) % total) < kept).sum())
+    # which of the two echoes each switch peaked on. A switch peaks on whichever of them was brightest
+    # in it, so without this split the marks read as scatter on a train that is perfectly orderly
+    families = epsi_window.peak_families(signal, 0.0)
+    on_readout = np.abs((peaks - families['readout_mode'] + total / 2) % total - total / 2)
+    on_second = np.abs((peaks - families['second_mode'] + total / 2) % total - total / 2)
+    readout_family = on_readout <= on_second
     # the readout profile, which is every switch summed on top of each other, and how sharp it is.
     # This is what a drifting echo smears and what rolling the drift out restores, and it is the
     # number that moves when the per switch argmax does not: an argmax can land on a second feature
@@ -433,11 +446,15 @@ def shift_echo_position(mrs_list: List[MRSdata], name: str = "") -> Optional[dic
     median = np.median(profile)
     sharpness = float(profile.max() / median) if median else float('inf')
 
-    print(f"\n{label}: {pooled} file(s) pooled, {nswitch} switches of {total} positions, keeping "
-          f"{kept} at {discard_pre}..{discard_pre + kept - 1}")
+    sampled = (f"the sequence samples {start}..{start + kept - 1}" if window
+               else f"a conversion keeps {start}..{start + kept - 1}")
+    print(f"\n{label}: {pooled} file(s) pooled, {nswitch} switches of {total} positions, "
+          f"{sampled}")
     print(f"  the peaks visit positions {int(peaks.min())} to {int(peaks.max())}, at {int(peaks[0])} "
-          f"in the first switch and {int(peaks[-1])} in the last")
-    print(f"  {inside} of {nswitch} switches peak inside the kept window, and pooled over every "
+          f"in the first switch and {int(peaks[-1])} in the last, "
+          f"{int(readout_family.sum())} of them on the readout echo and "
+          f"{int((~readout_family).sum())} on the second")
+    print(f"  {inside} of {nswitch} switches peak inside that window, and pooled over every "
           f"switch the profile peaks at {int(np.argmax(profile))} with peak/median "
           f"{sharpness:.2f}")
     # no slope is printed on purpose. A position is cyclic within a switch and the argmax jumps
@@ -450,11 +467,24 @@ def shift_echo_position(mrs_list: List[MRSdata], name: str = "") -> Optional[dic
     figure, axes = plt.subplots(figsize=(9, 7))
     axes.imshow(signal, aspect='auto', origin='lower', interpolation='nearest',
                 extent=(-0.5, total - 0.5, -0.5, nswitch - 0.5))
-    # the points a conversion keeps, so the peaks are read against the window rather than in the
-    # abstract: a peak outside this span is signal the reconstruction currently throws away
-    axes.axvspan(discard_pre - 0.5, discard_pre + kept - 0.5, color='w', alpha=0.15,
-                 label=f"kept window {discard_pre}..{discard_pre + kept - 1}")
-    axes.plot(peaks, switches, 'x', color='C3', ms=6, label='peak of each switch')
+    # the span the sequence samples, so the peaks are read against where the signal was meant to be
+    # rather than in the abstract
+    axes.axvspan(start - 0.5, start + kept - 0.5, color='w', alpha=0.15,
+                 label=f"{'sequence samples' if window else 'kept window'} "
+                       f"{start}..{start + kept - 1}")
+    if window and discard_pre != start:
+        # where a conversion keeps its points instead, and so what a --pad would have to make up
+        for edge in (discard_pre, discard_pre + kept - 1):
+            axes.axvline(edge, color='w', ls=':', lw=1, alpha=0.6)
+        axes.plot([], [], color='w', ls=':', lw=1, alpha=0.6,
+                  label=f"a conversion keeps {discard_pre}..{discard_pre + kept - 1}, "
+                        f"--pad {discard_pre - start}")
+    # split by echo, so an outlying mark reads as "that is the rephasing echo" rather than as scatter
+    axes.plot(peaks[readout_family], switches[readout_family], 'x', color='C3', ms=6,
+              label=f"readout echo ({int(readout_family.sum())} switches)")
+    if not readout_family.all():
+        axes.plot(peaks[~readout_family], switches[~readout_family], '+', color='C1', ms=7,
+                  label=f"second echo ({int((~readout_family).sum())} switches)")
     axes.set_xlabel(f"position within the {total} point switch")
     axes.set_ylabel("switch")
     axes.set_title(f"{label}: echo position per switch, {pooled} file(s) pooled")
@@ -464,23 +494,26 @@ def shift_echo_position(mrs_list: List[MRSdata], name: str = "") -> Optional[dic
     plt.show()
     return dict(signal=signal, peaks=peaks, nswitch=nswitch, total=total, kept=kept,
                 discard_pre=discard_pre, pooled=pooled, inside=inside, profile=profile,
-                sharpness=sharpness)
+                sharpness=sharpness, window=window, families=families,
+                readout_family=readout_family)
 
 
 def correct_echo_position(group: Optional[ScanGroup],
-                          load: Optional[Callable[[MRSdata, str], None]] = None) -> int:
+                          load: Optional[Callable[[MRSdata, str], None]] = None,
+                          slope: Optional[float] = None) -> int:
     """
-    Show where the echo sits in each gradient switch of the datasets one experiment resolves to, and
-    what correcting it does: the drift along the switch train taken out, and the readout moved onto
-    the position the sequence puts the echo at. Converts nothing.
+    Show where the echo sits in each gradient switch of one experiment's data, and what correcting it
+    does: the drift along the switch train taken out, and the readout moved onto the position the
+    sequence puts the echo at. Converts nothing.
 
-    A group is one experiment and holds two datasets, its real data and the averaged prescan beside
-    it, and this walks them as such. That is the same grouping a conversion works from, so the
-    repetitions that pool into one measurement are the repetitions that would have pooled into one
-    stream, and the prescan is measured on its own for the reason it is a separate list: averaged
-    data placed beside 27 repetitions measures neither of them. Each dataset gets two blocks and two
-    figures, the readout as acquired and the readout rolled straight, so the correction is read as a
-    before and after rather than as a claim.
+    Only the real data of the group. The averaged prescan beside it calibrates a reconstruction rather
+    than being reconstructed, so where its echo sits is nobody's question - and it could not have
+    been pooled in with the data anyway, since averaged samples placed beside 27 repetitions measure
+    neither of them.
+
+    Every repetition of every file goes into one measurement, which is what gives the drift enough
+    signal to be found, and the dataset gets two blocks and two figures - the readout as acquired and
+    the readout corrected - so the correction reads as a before and after rather than as a claim.
 
     The roll happens on the parsed files in memory and goes no further. Nothing is written, and the
     conversion path reads its own copy of each .MRD, so a scan reported on here converts from the
@@ -492,58 +525,57 @@ def correct_echo_position(group: Optional[ScanGroup],
     Args:
         - group: the experiment to report on, from mrs_organize, or None when nothing grouped
         - load: how to turn one of a group's paths into a parsed MRSdata; see read_mrs_group
+        - slope: roll rate in samples per switch to apply instead of the measured one, from --slope,
+          for correcting a scan case by case. Zero takes no drift out but still makes the constant
+          move; None leaves the measurement in charge
     Returns:
-        - how many datasets were reported on
+        - 1 when the data was reported on, 0 when there was nothing to report on
     """
     # imported here rather than at module scope for two reasons: epsi_window imports this module, so
     # a module scope import back would be circular, and it pulls in a plotting stack that converting
     # has no need of
     import epsi_window
 
-    if group is None:
+    if group is None or not group.rawdata_file_list:
         return 0
-    reported = 0
-    # the two lists of a group are two datasets, measured apart, never pooled
-    for files, label in ((group.rawdata_file_list, group.meas_id),
-                         (group.prescan_file_list, f"{group.meas_id} prescan")):
-        if not files:
-            continue
-        # every file of the dataset is held at once, because the drift is measured from all of their
-        # repetitions pooled: one repetition of 12 views cannot place the echo per switch
-        mrs_list = read_mrs_group(files, load)
-        # nothing is applied before this figure: it is the readout exactly as the scanner wrote it
-        if shift_echo_position(mrs_list, f"{label} as acquired, no correction applied") is None:
-            continue
-        reported += 1
+    label = group.meas_id
+    # every file is held at once, because the drift is measured from all of their repetitions pooled:
+    # one repetition of 12 views cannot place the echo per switch
+    mrs_list = read_mrs_group(group.rawdata_file_list, load)
+    # nothing is applied before this figure: it is the readout exactly as the scanner wrote it
+    if shift_echo_position(mrs_list, f"{label} as acquired, no correction applied") is None:
+        return 0
 
-        # the drift to take out and the constant move that lands the result on the position the
-        # sequence asks for, as one shift per switch. Whether the drift is worth acting on is
-        # measure_echo_drift's decision and nothing here second-guesses it; the constant move is
-        # independent of it, so a readout with no drift is still put where it belongs
-        alignment = epsi_window.echo_alignment(mrs_list)
-        if alignment is None:
-            continue
-        epsi_window.shift_report(alignment, label=label)
-        shifts = alignment['shifts']
-        if not np.any(shifts):
-            continue
+    # the drift to take out and the constant move that lands the result on the position the sequence
+    # asks for, as one shift per switch. Whether the drift is worth acting on is measure_echo_drift's
+    # decision and nothing here second-guesses it; the constant move is independent of it, so a
+    # readout with no drift is still put where it belongs
+    alignment = epsi_window.echo_alignment(mrs_list, slope=slope)
+    if alignment is None:
+        return 1
+    epsi_window.shift_report(alignment, label=label)
+    shifts = alignment['shifts']
+    if not np.any(shifts):
+        return 1
 
-        for mrs in mrs_list:
-            if is_epsi(mrs):
-                epsi_window.shift_rawdata(mrs, shifts)
-        # the same measurement over the same files, so the peaks, the count inside the kept window
-        # and the profile peak/median are read against the block printed above
-        drift, expected = alignment['drift'], alignment['expected']
-        corrected = (f"{label} corrected: drift {drift['slope']:+.4f} per switch"
-                     + (f", echo moved onto {expected}" if expected is not None else ""))
-        shift_echo_position(mrs_list, corrected)
-    return reported
+    for mrs in mrs_list:
+        if is_epsi(mrs):
+            epsi_window.shift_rawdata(mrs, shifts)
+    # the same measurement over the same files, so the peaks, the count inside the sampled window and
+    # the profile peak/median are read against the block printed above
+    expected = alignment['expected']
+    corrected = (f"{label} corrected: {alignment['applied']:+.4f} per switch"
+                 + (f" {'given' if alignment['given'] else 'measured'}")
+                 + (f", echo moved onto {expected}" if expected is not None else ""))
+    shift_echo_position(mrs_list, corrected)
+    return 1
 
 
 def convert_folder_to_mrd(folder: Path,
                           meas_id_override: str = "",
                           dry_run: bool = False,
-                          window_check: bool = False) -> bool:
+                          window_check: bool = False,
+                          slope: Optional[float] = None) -> bool:
 
     """
     Walk one experiment folder for .MRD files and convert each scan to its own stream inside it
@@ -558,7 +590,9 @@ def convert_folder_to_mrd(folder: Path,
         - folder: the experiment folder to walk
         - meas_id_override: measurement id to record instead of the folder's name
         - dry_run: report the grouping and what looks wrong with it, converting nothing
-        - window_check: report sampling window and try shifting the echo position
+        - window_check: report the sampling window and correct the echo position, converting nothing
+        - slope: with window_check, the roll rate in samples per switch to apply instead of the
+          measured one
     Returns:
         - True when at least one scan was written, or when a dry run found something to convert
     """
@@ -570,7 +604,7 @@ def convert_folder_to_mrd(folder: Path,
     # -w is a question about the scans rather than a conversion, so it answers and returns: the roll
     # it applies lives in the parsed files it read, and nothing downstream of here sees it
     if window_check:
-        return bool(correct_echo_position(groups))
+        return bool(correct_echo_position(groups, slope=slope))
     written = False
     
     # convert .MRD file in groups to mrd.acquisition
@@ -713,6 +747,10 @@ def main() -> int:
                         help="with --folder only: plot where the echo peaks in each gradient switch, "
                              "then take the drift out, move the readout onto the position the "
                              "sequence puts the echo at, and plot it again, converting nothing")
+    parser.add_argument("--slope", type=float, default=None, metavar="PER_SWITCH",
+                        help="with -w only: roll every switch at this rate in samples per switch, "
+                             "instead of the rate measured from the data. 0 takes no drift out but "
+                             "still moves the readout onto the sequence's echo position")
     args = parser.parse_args()
 
     if args.tar and not args.tar.exists():
@@ -723,11 +761,14 @@ def main() -> int:
         parser.error(f"{args.folder} is not a directory")
     if args.tar and (args.window or args.dry_run):
         parser.error(f"-t can only used to convert file")
+    if args.slope is not None and not args.window:
+        parser.error("--slope sets the roll rate -w applies, so it needs -w")
 
     if args.folder:
         # convert folder allows
         print(f"Converting folder of single experiment folder {args.folder}", file=sys.stderr)
-        written = convert_folder_to_mrd(args.folder, args.meas_id, args.dry_run, args.window)
+        written = convert_folder_to_mrd(args.folder, args.meas_id, args.dry_run, args.window,
+                                        args.slope)
     elif args.tar:
         output = args.output or Path(os.environ.get("OUTPUT_PIPE", ""))
         if not str(output):

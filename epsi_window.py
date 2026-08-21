@@ -214,6 +214,12 @@ def plot_switch_profile(mrs: MRSdata) -> dict:
     figure.suptitle(title)
 
     axes[0].plot(positions, profile, 'o-', color='C0')
+    # the sequence's own answer to where the window goes, on the same axes as the two measured ones:
+    # from the end of the leading ramp through the flat top, which is where the signal was meant to be
+    window = sequence_window(mrs)
+    if window:
+        axes[0].axvspan(window[0] - 0.5, window[1] + 0.5, color='C7', alpha=0.15,
+                        label=f"the sequence samples {window[0]}..{window[1]}")
     axes[0].axvline(report['peak'], color='C1', lw=2, label=f"echo peak at {report['peak']}")
     for start, pad, colour, name in ((report['by_signal'], report['pad_by_signal'], 'C2', 'most signal'),
                                      (report['by_centre'], report['pad_by_centre'], 'C3', 'echo centred')):
@@ -462,21 +468,41 @@ def switch_shifts(nswitch: int, total: int, slope: float) -> np.ndarray:
     return (shifts + total // 2) % total - total // 2
 
 
-def expected_echo_position(mrs: MRSdata) -> Optional[int]:
+def ramp_samples(mrs: MRSdata) -> Optional[float]:
     """
-    Where the sequence says the gradient echo sits inside a switch, from its own parameters.
+    How many samples the readout gradient spends on one ramp, or None when the file cannot say.
 
-    Not a measurement: the readout loop runs ramp -> points_per_switch -> ramp -> ramp -> ramp and
-    repeats, the ramp is tramp / sample_period samples long, and the echo is the middle of the flat
-    top, so the position follows from the sequence card
+    tramp is recorded in microseconds and sample_period in units of 100 ns, hence the /10. The result
+    is deliberately left fractional: the kidney sequences run a 2.5 sample ramp, and rounding it here
+    would push both the echo position and the sampling window half a sample off before anything has
+    used them
+    """
+    if not mrs.tramp or not mrs.sample_period:
+        return None
+    return mrs.tramp / (mrs.sample_period / 10.0)
 
-        expected = tramp / sample_period + points_per_switch / 2
+
+def expected_echo_positions(mrs: MRSdata) -> Optional[Tuple[int, int]]:
+    """
+    Where the sequence says its two echoes sit inside a switch, from its own parameters.
+
+    Not a measurement. The readout loop runs ramp -> points_per_switch -> ramp -> ramp -> ramp and
+    repeats, so the switch holds the readout echo at the middle of the flat top and, after the
+    gradient rephases, a second crossing of k-space centre
+
+        readout   = tramp / sample_period + points_per_switch / 2
+        rephasing = 2 * tramp / sample_period + points_per_switch
 
     On cirrhrat the loop closes exactly: tramp 112 over a 28 us sample period is a 4 sample ramp, and
-    4 ramps of 4 plus the 12 kept points fill a 28 point switch, putting the echo at 10. On the kidney
-    data tramp 100 over 40 us is 2.5 samples, four of which overshoot the 8 non-flat samples a 20
-    point switch has, and the echo comes out at 8.5 - truncated here to 8, which is the nearest whole
-    sample a roll can move to anyway.
+    4 ramps of 4 plus the 12 kept points fill a 28 point switch, putting the readout echo at 10 and
+    the rephasing one at 20. On the kidney data tramp 100 over 40 us is 2.5 samples, four of which
+    overshoot the 8 non-flat samples a 20 point switch has, and the two come out at 8.5 and 17 -
+    truncated here, since a roll moves whole samples.
+
+    The first index is the one to trust. Measured against the data the readout echo lands where this
+    says it does, but the rephasing echo reads a sample later than 17 on ischemia_179 and the two peak
+    families sit 9 to 13.5 positions apart where this predicts 8.5 to 10, so the second index is a
+    check to report rather than a position to move anything onto.
 
     Read only off a sequence the formula was established against, by exact name: a variant that lays
     its ramps out differently would be moved onto a position that is not its own, and being left
@@ -485,13 +511,42 @@ def expected_echo_position(mrs: MRSdata) -> Optional[int]:
     Args:
         - mrs: one parsed or probed MRS file of the epsi family
     Returns:
-        - the position within a switch, or None when this file carries no established formula
+        - (readout echo, rephasing echo) within a switch, or None when this file carries no
+          established formula
     """
-    if mrs.sequence_name != 'epsigre' or not mrs.tramp or not mrs.sample_period:
+    ramp = ramp_samples(mrs)
+    if mrs.sequence_name != 'epsigre' or ramp is None:
         return None
     _, _, kept = switch_layout(mrs)
-    sample_period_us = mrs.sample_period / 10.0     # sample_period is recorded in units of 100 ns
-    return int(mrs.tramp / sample_period_us + kept / 2)
+    return int(ramp + kept / 2), int(2 * ramp + kept)
+
+
+def sequence_window(mrs: MRSdata) -> Optional[Tuple[int, int]]:
+    """
+    The stretch of a switch the sequence actually samples on the gradient plateau.
+
+    From the first position clear of the leading ramp through the end of the flat top, so
+    ceil(tramp / sample_period) .. that + points_per_switch - 1. Rounded up rather than down because
+    the sample the ramp is still running through is not a plateau sample: on the kidney layout that
+    puts the window at 3..14, whose centre is the 8.5 expected_echo_positions reports, where rounding
+    down would centre it on 7.5.
+
+    This is not the window a conversion writes. generate_acquisition centres its discard_pre in the
+    switch instead - 4..15 on the kidney layout, 8..19 on cirrhrat - and window_report's pads are all
+    anchored to that. The difference between the two is exactly the mrd2recon --pad that would move
+    the reconstruction onto the plateau: 1 sample on the kidney data, 4 on cirrhrat, where the centred
+    window sits well past the flat top
+    Args:
+        - mrs: one parsed or probed MRS file of the epsi family
+    Returns:
+        - (first position, last position) inclusive, or None when the file carries no ramp time
+    """
+    ramp = ramp_samples(mrs)
+    if mrs.sequence_name != 'epsigre' or ramp is None:
+        return None
+    _, _, kept = switch_layout(mrs)
+    start = int(np.ceil(ramp))
+    return start, start + kept - 1
 
 
 def aligned_echo_position(cube: np.ndarray, view: Optional[int] = None) -> Tuple[int, float]:
@@ -513,6 +568,94 @@ def aligned_echo_position(cube: np.ndarray, view: Optional[int] = None) -> Tuple
     """
     profile, sharpness, _ = spectral_peak(cube, view=view)
     return int(np.argmax(profile)), sharpness
+
+
+def peak_families(signal: np.ndarray, slope: float) -> dict:
+    """
+    Sort the per-switch peaks into the two echoes a switch carries.
+
+    The brightest position in one switch is whichever of its two echoes happened to win, so a plot of
+    those peaks looks like scatter when the echo is in fact perfectly orderly: on ischemia_179 they
+    read 3,4,5... and 14,15,16..., two families each stepping one position every ~4.3 switches exactly
+    as its +0.232 drift should. Splitting them is what makes that legible, and it is why nothing here
+    needs a switch to peak on the readout echo - a switch peaking on the rephasing echo still says
+    where the train is.
+
+    Done against the line of the slope being applied, so the residuals are what is left after the
+    correction and the two families show up as two modes of them. The slope refitted by folding those
+    residuals on the separation comes back as an independent estimate: it reads +0.187 on
+    ischemia_179 where the coherent search reads +0.232, and no fold period reconciles the two, so it
+    is reported beside the applied slope rather than used instead of it
+    Args:
+        - signal: (switch, position) magnitude summed over views and repetitions
+        - slope: the drift still present in `signal`, in samples per switch, which the residuals are
+          measured against so the two families separate into two modes. Zero for a readout already
+          corrected. It does not touch the refitted slope, which is searched from the peaks alone
+    Returns:
+        - dict of the per-switch peaks, the two modes and their populations, the separation between
+          them and the slope that separation refits to
+    """
+    nswitch, total = signal.shape
+    peaks = np.argmax(signal, axis=1)
+    switches = np.arange(nswitch)
+    residual = (peaks - slope * switches) % total
+
+    # counted on whole positions, since that is the resolution an argmax has anyway
+    census = np.zeros(total, dtype=int)
+    for value in residual:
+        census[int(round(value)) % total] += 1
+    readout_mode = int(np.argmax(census))
+    # the second mode has to be clear of the first, or the flank of one peak reads as the other
+    apart = [position for position in range(total)
+             if min((position - readout_mode) % total, (readout_mode - position) % total) >= 3]
+    second_mode = max(apart, key=lambda position: census[position]) if apart else readout_mode
+    separation = (second_mode - readout_mode) % total
+
+    # which family each switch fell in, by whichever mode its peak sits nearer to
+    to_readout = np.abs((residual - readout_mode + total / 2) % total - total / 2)
+    to_second = np.abs((residual - second_mode + total / 2) % total - total / 2)
+    on_readout = int((to_readout <= to_second).sum())
+
+    # refit by folding on the separation, which merges the two families into one population: a peak
+    # from either echo then constrains the same line
+    fold = separation or total
+    candidates = np.arange(-DRIFT_SLOPE_LIMIT, DRIFT_SLOPE_LIMIT + DRIFT_FINE_STEP / 2,
+                           DRIFT_FINE_STEP)
+    concentration = [abs(np.exp(1j * 2 * np.pi * ((peaks - candidate * switches) % fold) / fold).mean())
+                     for candidate in candidates]
+    best = int(np.argmax(concentration))
+    return dict(peaks=peaks, census=census, readout_mode=readout_mode, second_mode=second_mode,
+                separation=int(separation), on_readout=on_readout,
+                on_second=nswitch - on_readout, fold=fold,
+                fitted_slope=float(candidates[best]), concentration=float(concentration[best]))
+
+
+def rephasing_peak(profile: np.ndarray, readout: int, gap: int) -> Tuple[int, float]:
+    """
+    The strongest position of the readout profile that is not the readout echo.
+
+    Searched outside readout +- gap so the answer cannot be the flank of the echo it is being compared
+    against. The amplitude comes back as a fraction of the readout peak rather than being tested
+    against a threshold, because that fraction is what tells a real second echo from a plateau: it
+    reads 0.36 on ischemia_179 and 0.52 on ischemia_121_1, both a clear peak half a switch away from
+    the readout one, against 0.83 on cirrhrat_43_1 - which is not a second echo at all but the
+    shoulder of a profile too smeared to have two of anything
+    Args:
+        - profile: signal per position within the switch, as spectral_peak returns
+        - readout: the position of the readout echo
+        - gap: how far either side of it to exclude
+    Returns:
+        - (position, its amplitude as a fraction of the profile's peak)
+    """
+    total = len(profile)
+    searchable = np.ones(total, dtype=bool)
+    for offset in range(-gap, gap + 1):
+        searchable[(readout + offset) % total] = False
+    if not searchable.any():
+        return readout, 1.0
+    positions = np.arange(total)[searchable]
+    found = int(positions[np.argmax(profile[searchable])])
+    return found, float(profile[found] / profile.max()) if profile.max() else 0.0
 
 
 def measure_group_drift(mrs_list: Sequence[MRSdata]
@@ -549,7 +692,7 @@ def measure_group_drift(mrs_list: Sequence[MRSdata]
     return measure_echo_drift(cube, nswitch, total), (nswitch, total, kept), cube
 
 
-def echo_alignment(mrs_list: Sequence[MRSdata]) -> Optional[dict]:
+def echo_alignment(mrs_list: Sequence[MRSdata], slope: Optional[float] = None) -> Optional[dict]:
     """
     Everything needed to put one dataset's echo where it belongs: the drift to take out, and the
     constant move that lands the result on the position the sequence asks for.
@@ -574,9 +717,13 @@ def echo_alignment(mrs_list: Sequence[MRSdata]) -> Optional[dict]:
     by +5 on the tramp 100 kidney data and +7 on tramp 112 cirrhrat
     Args:
         - mrs_list: the parsed files of one dataset, read rather than probed
+        - slope: roll rate in samples per switch to apply instead of the measured one, for correcting
+          a scan case by case. Zero is a real answer, meaning take no drift out but still make the
+          constant move; None leaves the measurement in charge
     Returns:
         - dict of the drift, the layout, the expected and measured positions, the constant, the total
-          shift per switch and where the echo ends up, or None when there was nothing to pool
+          shift per switch, where the echo ends up, the two peak families, the rephasing check and
+          the sequence's own sampling window, or None when there was nothing to pool
     """
     measured = measure_group_drift(mrs_list)
     if measured is None:
@@ -585,24 +732,52 @@ def echo_alignment(mrs_list: Sequence[MRSdata]) -> Optional[dict]:
     nswitch, total, kept = layout
     reference = next(mrs for mrs in mrs_list if is_epsi(mrs) and mrs.rawdata is not None)
 
-    # zeros rather than a skip when there is no usable drift, so that the constant below is applied
-    # to a readout that was left alone as readily as to one that was straightened
-    shifts = (switch_shifts(nswitch, total, drift['slope']) if drift['usable']
+    # a slope given by hand wins over the measured one, and the measurement still runs and is still
+    # reported: the operator correcting a scan case by case wants to see what the data said next to
+    # what they asked for. Given zero is a real answer and not a missing one, hence the `is not None`
+    given = slope is not None
+    # zero, not the measured slope, when the measurement refused it: what is applied has to be what
+    # the shifts below actually carry, or every number reported against it describes something else
+    applied = float(slope) if given else (drift['slope'] if drift['usable'] else 0.0)
+    # zeros rather than a skip when there is no drift to take out, so that the constant below is
+    # applied to a readout that was left alone as readily as to one that was straightened
+    shifts = (switch_shifts(nswitch, total, applied) if applied
               else np.zeros(nswitch, dtype=int))
-    aligned, sharpness = aligned_echo_position(roll_switches(cube, shifts))
+    straightened = roll_switches(cube, shifts)
+    aligned, sharpness = aligned_echo_position(straightened)
 
-    expected = expected_echo_position(reference)
+    positions = expected_echo_positions(reference)
+    expected, expected_rephasing = positions if positions else (None, None)
     # reduced the short way round the switch, since a position is cyclic within one: moving an echo
     # from 18 to 2 of 20 is 4 samples later, not 16 earlier
     constant = int((expected - aligned + total // 2) % total - total // 2) if expected is not None else 0
     shifts = shifts + constant
 
+    # the two echoes as the data shows them. Read off the readout as acquired, with the applied slope
+    # taken out of the residuals rather than out of the samples: that is what makes the two families
+    # separate into two modes, and it leaves the slope this refits an estimate from the peaks alone
+    # rather than one the correction has already been baked into
+    corrected = roll_switches(cube, shifts) if constant else straightened
+    families = peak_families(np.abs(cube).sum(axis=(2, 3)), applied)
+    rephasing, rephasing_amplitude = (rephasing_peak(spectral_peak(corrected)[0],
+                                                     (aligned + constant) % total,
+                                                     max((expected_rephasing - expected) // 2, 1))
+                                      if expected is not None else (None, 0.0))
+
     discard_pre = (total - kept) // 2
     landed = (aligned + constant) % total
+    # judged against the window the sequence samples where there is one, since that is where the echo
+    # was meant to land; a conversion's centred window is the fallback and the --pad above is the gap
+    window = sequence_window(reference)
+    window_start = window[0] if window else discard_pre
     return dict(drift=drift, layout=layout, shifts=shifts, cube=cube,
-                expected=expected, aligned=aligned, sharpness=sharpness, constant=constant,
+                applied=applied, given=given,
+                expected=expected, expected_rephasing=expected_rephasing,
+                aligned=aligned, sharpness=sharpness, constant=constant,
+                rephasing=rephasing, rephasing_amplitude=rephasing_amplitude,
+                families=families, window=window, window_start=window_start,
                 landed=landed, discard_pre=discard_pre,
-                inside=bool(((landed - discard_pre) % total) < kept),
+                inside=bool(((landed - window_start) % total) < kept),
                 sequence_name=reference.sequence_name, tramp=reference.tramp,
                 sample_period=reference.sample_period)
 
@@ -623,11 +798,26 @@ def shift_report(alignment: dict, label: str = "") -> None:
     """
     drift, (nswitch, total, kept) = alignment['drift'], alignment['layout']
     shifts, expected = alignment['shifts'], alignment['expected']
+    families = alignment['families']
 
     print(f"\necho of {label or 'the pooled readout'}, {drift['reps']} repetitions pooled")
     print(f"  {'drift' if drift['usable'] else 'no usable drift'}: {drift['reason']}")
     print(f"  best slope {drift['slope']:+.4f} samples per switch, a switch period of "
           f"{drift['period']:.2f} samples where nsamples/{nswitch} records {total}")
+    if alignment['given']:
+        print(f"  applying {alignment['applied']:+.4f} per switch as asked for, where the search "
+              f"measured {drift['slope']:+.4f}")
+    # the same train read a second way: peaks per switch, sorted into the two echoes a switch holds
+    print(f"  per switch peaks: {families['on_readout']} of {nswitch} on the readout echo and "
+          f"{families['on_second']} on the second, {families['separation']} positions apart, which "
+          f"refits a slope of {families['fitted_slope']:+.4f} (concentration "
+          f"{families['concentration']:.2f}) against the {alignment['applied']:+.4f} applied")
+    if alignment['window']:
+        start, end = alignment['window']
+        pad = alignment['discard_pre'] - start
+        print(f"  the sequence samples {start}..{end} of the switch, where a conversion keeps "
+              f"{alignment['discard_pre']}..{alignment['discard_pre'] + kept - 1}: mrd2recon --pad "
+              f"{pad} reads the plateau rather than a window {pad} sample(s) past it")
     if expected is None:
         print(f"  no expected position for sequence '{alignment['sequence_name']}', so the echo is "
               f"left where it was acquired: the ramp layout is only established for epsigre")
@@ -636,9 +826,22 @@ def shift_report(alignment: dict, label: str = "") -> None:
         print(f"  the sequence puts the echo at {expected} = tramp {alignment['tramp']}us / "
               f"{ramp_us:.0f}us sample period + {kept}/2, and it measures at "
               f"{alignment['aligned']} with peak/median {alignment['sharpness']:.2f}")
+        start = alignment['window_start']
         print(f"  so the whole readout moves {alignment['constant']:+d}, landing the echo at "
               f"{alignment['landed']}, {'inside' if alignment['inside'] else 'OUTSIDE'} the "
-              f"{alignment['discard_pre']}..{alignment['discard_pre'] + kept - 1} kept window")
+              f"{start}..{start + kept - 1} the sequence samples")
+        # the second echo checks the first rather than moving anything: the readout echo is what the
+        # constant above was measured from, and this says whether the switch looks like the sequence
+        # says it should once that move is made
+        off = alignment['rephasing'] - alignment['expected_rephasing']
+        print(f"  the rephasing echo lands at {alignment['rephasing']} against the "
+              f"{alignment['expected_rephasing']} the sequence puts it at, {off:+d} off, at "
+              f"{alignment['rephasing_amplitude']:.2f} of the readout peak")
+        if abs(off) > 1:
+            print(f"WARNING the rephasing echo of {label or 'this readout'} sits {off:+d} samples "
+                  f"from where the sequence puts it, so the ramp layout this correction was worked "
+                  f"out from does not describe this scan; the move was applied anyway",
+                  file=sys.stderr)
     discard = (total - kept) // 2
     print(f"  correcting it moves switch 0 by {int(shifts[0]):+d} and switch {nswitch - 1} by "
           f"{int(shifts[-1]):+d}, a range of {int(shifts.min())} to {int(shifts.max())} samples "
