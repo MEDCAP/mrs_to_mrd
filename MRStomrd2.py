@@ -4,22 +4,36 @@ Convert MR Solutions .MRD raw data to MRD v2.
 Three input modes, one per way a scan arrives:
 
     -t/--tar     Single experiment epsi folder wrapped in a tar file, where each subdirectory folder 
-                 represent single repetition. 
+                 represent single repetition and pre-scan data that do not have the same dimension 
+                 as rawdata. 
 
     -i/--input   A single .MRD filepath, which is how spectral fid data usually arrives: one file
                  already holds every repetition, so there is nothing to collect or group
     
     -f/--folder  Legacy method for local testing. One experiment folder, walked for its .MRD files
 
-Both -t and -f are given one experiment and take their name from it, so mrs_organize reads the
+Both -t and -f represent one experiment and take their name from it, so mrs_organize reads the
 directories inside only for their scan ids. Which files belong to one scan it decides from the
 sequence and the acquisition matrix. All three converge on convert_group_to_mrd, so header choice
 and repetition numbering have exactly one implementation.
 
-Nothing here reads a parameter as meaning more than it says: every file converts to acquisitions the
-same way, and a file that mrs_organize did not combine with anything is simply a scan of its own.
-Whether a scan is calibration data is a question about the scan, answered where that matters rather
-than by flagging acquisitions differently on the way in.
+Every file converts to acquisitions the same way whatever kind of scan it is. mrs_organize decides
+which files make up a stream and whether that stream is data or an averaged prescan, and that answer
+shows in the output name rather than in how the acquisitions are flagged on the way in.
+
+A group hands over paths rather than parsed files, so convert_group_to_mrd reads one .MRD at a time
+and releases it before the next. The repetition count the header needs comes from the group, which
+recorded it when it probed the files to group them.
+
+Where the usable sampling window sits inside an EPSI gradient switch, and whether the echo drifts
+along the switch train, is reported by epsi_window.py rather than here - a diagnostic companion
+that converts nothing, sharing is_epsi and switch_layout so its window is the same arithmetic as
+what a real conversion writes.
+
+-w stays here, because it is a question about a scan rather than about a file: it plots where the
+echo peaks inside each gradient switch, from every repetition of one group pooled, so a peak that
+walks along the switch train shows up against the window a conversion would keep. It groups its
+input exactly as a conversion does and converts nothing.
 
 Errors are raised only in main(). Past that point a file that cannot be converted is reported on
 stderr and skipped, so one unreadable or stray file does not lose the rest of the scan.
@@ -32,7 +46,7 @@ import os
 import sys
 from itertools import product
 from pathlib import Path
-from typing import BinaryIO, Iterable, List, Optional, Sequence
+from typing import BinaryIO, Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -40,31 +54,74 @@ import numpy as np
 import mrd
 import mrs_organize
 from MRSreader import MRSdata
-from mrs_organize import ScanGroup, sequence_family
+from mrs_organize import ScanGroup, is_prescan
 from mrs_tar import read_scan_tar
 
 
+def is_epsi(mrs: MRSdata) -> bool:
+    """
+    Whether a file's readout is split into gradient switches, read directly off the header rather
+    than matched against the sequence name: no_switches only appears in the parameter block of a
+    sequence that actually switched, so a file recording more than the unswitched default of one
+    is what makes this a generic, name-agnostic check
+    """
+    return mrs.nswitch > 1
 
-def keep_mrs(mrs: MRSdata, name: str, family: str) -> bool:
+
+def switch_layout(mrs: MRSdata) -> Tuple[int, int, int]:
+    """
+    How one EPSI readout divides into gradient switches.
+
+    no_switches and no_pts_switch are recorded separately from the sample count, so the acquisition
+    holds more points per switch than the sequence calls usable: the extra ones are the gradient
+    ramps either side of the flat top. nswitch is a divisor both here and in reconstruction, so a
+    file recording 0 switches is read as 1 rather than being allowed to raise part way through a
+    scan, and a file recording no usable width is read as keeping the whole switch rather than half
+    of it
+    Args:
+        - mrs: one parsed MRS file of the epsi family
+    Returns:
+        - (nswitch, total points in one switch, points the sequence keeps per switch)
+    """
+    nswitch = max(mrs.nswitch, 1)
+    total = mrs.nsamples // nswitch
+    return nswitch, total, (mrs.npoints_per_switch or total)
+
+
+def keep_mrs(mrs: MRSdata, name: str, accepted: Sequence[MRSdata] = ()) -> bool:
     """
     Whether a parsed file can join a group. Reported rather than raised, so that one bad file does
-    not cost the rest of the scan
+    not cost the rest of the scan.
+
+    Grouping ran off a header-only probe, so this is where the full parse gets to disagree with it.
+    A group holds two kinds of file - real data and the prescan that calibrates it - so the
+    comparison has to be against a file of the same kind: a prescan disagreeing with the real data
+    beside it is the group working as designed, not a mismatch to report
     Args:
         - mrs: the parsed file
         - name: what to call it on stderr, a path or a tar member name
-        - family: the family established for this group, or '' if this is the first file
+        - accepted: files already accepted into this group, to find one of the same kind to compare
+          dimensions against; empty for the first file of either kind
     Returns:
-        - True when the file parsed and belongs to the group's family
+        - True when the file parsed
     """
     # MRSdata.read_from_file reports a parse failure and returns with rawdata left unset
     if mrs.rawdata is None or mrs.rawdata.size == 0:
         print(f"Skipping {name}: no raw data was read", file=sys.stderr)
         return False
-    this_family = sequence_family(mrs.sequence_name)
-    # grouping ran off a header-only probe, so this is where the full parse gets to disagree with it
-    if family and this_family and this_family != family:
-        print(f"Skipping {name}: {this_family} file in a {family} scan", file=sys.stderr)
-        return False
+    prescan = is_prescan(mrs.naverages, mrs.nrepetitions)
+    reference = next((accepted_mrs for accepted_mrs in accepted
+                      if is_prescan(accepted_mrs.naverages, accepted_mrs.nrepetitions) == prescan),
+                     None)
+    if reference is not None:
+        # the fields grouping bucketed on, so a difference here is a difference grouping did not see
+        differences = ", ".join(
+            f"{attribute} {getattr(mrs, attribute)} vs {getattr(reference, attribute)}"
+            for attribute in mrs_organize.SIGNATURE_FIELDS
+            if getattr(mrs, attribute) != getattr(reference, attribute))
+        if differences:
+            print(f"WARNING {name} was grouped on a header reading {differences}, which its data "
+                  f"block does not agree with; converting it anyway", file=sys.stderr)
     return True
 
 
@@ -74,7 +131,7 @@ def generate_acquisition(mrs: MRSdata, rep_base: int, rep_count: int) -> Iterabl
 
     Every axis of rawdata but the samples one is walked, each bounded by the MRSdata field that
     names it rather than by a position in rawdata.shape, so a file using an axis converts rather
-    than losing it to a hardcoded index. All the data seen so far leaves four of the five at one:
+    tha
         - EPSI split one repetition per file:    nrepetitions=1,  nviews=8 ->    8 acquisitions
         - EPSI acquired into a single file:      nrepetitions=N,  nviews=8 ->  N*8 acquisitions
         - spectral, repetitions on the nex axis: nrepetitions=40, nviews=1 ->   40 acquisitions
@@ -95,21 +152,16 @@ def generate_acquisition(mrs: MRSdata, rep_base: int, rep_count: int) -> Iterabl
     Returns:
         - Iterable of mrd.StreamItem.Acquisition
     """
-    family = sequence_family(mrs.sequence_name)
-    if not family:
-        # converted rather than dropped: an unknown sequence still holds acquisitions, and the
-        # single view arrangement is the one that assumes least about how they were encoded
-        print(f"Unrecognized sequence '{mrs.sequence_name}', converting it as single view data",
-              file=sys.stderr)
-    if family == "epsi":
+    epsi = is_epsi(mrs)
+    prescan = is_prescan(mrs.naverages, mrs.nrepetitions)
+    if epsi:
         # samples hold nswitch echoes, each npoints_per_switch long with a gradient ramp either
         # side
         # example cirrhrat_43_1: 1792 samples / 64 switches = 28, (28 - 12) / 2 = 8 points per ramp.
-        # nswitch is a divisor both here and in reconstruction, so a file recording 0 switches is
-        # read as 1 rather than being allowed to raise part way through a scan
-        nswitch = max(mrs.nswitch, 1)
-        points_per_switch = mrs.nsamples // nswitch
-        discard = (points_per_switch - mrs.npoints_per_switch) // 2
+        # switch_layout is what -w reports against, so the window written here and the window that
+        # report describes are the same arithmetic
+        nswitch, points_per_switch, kept = switch_layout(mrs)
+        discard = (points_per_switch - kept) // 2
     # one repetition's worth of acquisitions, which is every axis inside the repetition one. The
     # product walks them in the order the axes are listed, repetition slowest and view fastest, so a
     # repetition's acquisitions stay contiguous in the stream and views stay contiguous within it
@@ -144,12 +196,16 @@ def generate_acquisition(mrs: MRSdata, rep_base: int, rep_count: int) -> Iterabl
         # the switch layout the discard points were worked out from. Only an EPSI readout has one,
         # and nswitch and points_per_switch are only defined for one, so this stays inside the
         # branch. It cannot ride on idx.contrast, which carries the sequence's own echo index
-        if family == "epsi":
+        if epsi:
             acq.head.user_int = [nswitch, points_per_switch]
             # if there is discard, encode it into acq.head
             if discard:
                 acq.head.discard_pre = discard
                 acq.head.discard_post = discard
+        # prescan acquisitions stay in the same stream as the data they calibrate rather than a
+        # file of their own, told apart downstream by this flag
+        if prescan:
+            acq.head.flags |= mrd.AcquisitionFlags.IS_NAVIGATION_DATA
         acq.phase = np.zeros(mrs.nsamples, dtype=np.float32)   # phase is not recorded
         yield mrd.StreamItem.Acquisition(acq)
 
@@ -171,10 +227,15 @@ def make_header(mrs: MRSdata, meas_id: str, rep_count: int) -> mrd.Header:
     subject.patient_id = meas_id            # e.g.) cirrhrat_43_1, KIC_Huh7msps5_08-15-2025.mrs
     header.subject_information = subject
 
-    seqparam = mrd.SequenceParametersType()
-    seqparam.tr = mrs.tr
-    seqparam.te = mrs.te
-    seqparam.flip_angle_deg = mrs.flip_angle
+    # t_r, t_e and flip_angle_deg are lists in this schema, one entry per value the sequence used,
+    # and an MRS scan records a single one of each. Recorded only where the file carried a value,
+    # for the reason tramp is below: writing the 0 default would read as a measured TR of zero
+    # rather than as a record the file never held, and te is genuinely 0 on these sequences
+    measured = {name: [float(value)]
+                for name, value in (("t_r", mrs.tr), ("t_e", mrs.te),
+                                    ("flip_angle_deg", mrs.flip_angle)) if value}
+    if measured:
+        header.sequence_parameters = mrd.SequenceParametersType(**measured)
 
     meas = mrd.MeasurementInformationType()
     meas.sequence_name = mrs.sequence_name
@@ -224,106 +285,255 @@ def make_header(mrs: MRSdata, meas_id: str, rep_count: int) -> mrd.Header:
     return header
 
 
-def read_mrs_group(filepaths: Sequence[str], family: str = "") -> List[MRSdata]:
+def read_mrs_group(filepaths: Sequence[str],
+                   load: Optional[Callable[[MRSdata, str], None]] = None) -> List[MRSdata]:
     """
-    Parse a group of .MRD files from disk, dropping the ones that cannot contribute
+    Parse a group of .MRD files, dropping the ones that cannot contribute
     Args:
-        - filepaths: paths in acquisition order
-        - family: the family mrs_organize established for the group, so that the full parse is
-          checked against the header-only probe grouping ran on
+        - filepaths: paths (or tar member names) in acquisition order
+        - load: fills one MRSdata from one entry of filepaths; defaults to reading from disk, tar
+          mode passes one that parses an in-memory buffer instead
     Returns:
         - parsed MRSdata in the same order, possibly shorter than filepaths
     """
+    load = load or (lambda mrs, filepath: mrs.read_from_file(filepath))
     mrs_list: List[MRSdata] = []
     for filepath in filepaths:
         mrs = MRSdata()                                 # one instance per file, they are all kept
-        mrs.read_from_file(filepath)
-        if not keep_mrs(mrs, str(filepath), family):
+        load(mrs, filepath)
+        if not keep_mrs(mrs, str(filepath), mrs_list):
             continue
-        family = family or sequence_family(mrs.sequence_name)
         mrs_list.append(mrs)
     return mrs_list
 
 
-def convert_group_to_mrd(mrs_list: Sequence[MRSdata], meas_id: str, output: BinaryIO) -> bool:
+def convert_group_to_mrd(group: ScanGroup, output: BinaryIO,
+                         load: Optional[Callable[[MRSdata, str], None]] = None) -> bool:
     """
-    Write one scan's worth of parsed MRS files as a single MRD v2 stream.
+    Write one group - the real data of one experiment plus the prescans beside it - as one MRD
+    stream.
 
-    Repetitions are counted off nrepetitions and summed across the group, which covers EPSI split
-    one repetition per file, EPSI acquired with all its repetitions in one file, and spectral
-    holding them on the nex axis, without the caller having to say which of the three it has. A
-    group of one file is the same thing with one term in the sum.
+    One file is parsed at a time and released before the next is read. 
+
+    The rawdata paths convert first, so the header is built from an acquisition rather than from a
+    prescan, and the prescans follow into the same stream numbered after them. Nothing in the
+    acquisitions says which list a file came from - they are told apart by IS_NAVIGATION_DATA
     Args:
-        - mrs_list: parsed files in acquisition order
-        - meas_id: measurement id recorded in the header
+        - group: the files to convert (real data and prescan) and the meas_id to record
         - output: writable binary stream. Must be a file object, not a path: BinaryMrdWriter
                   special-cases str only, so a Path would be mistaken for a stream
+        - load: fills one MRSdata from one of the group's paths; defaults to reading from disk, tar
+          mode passes one that parses an in-memory buffer instead
     Returns:
         - True when a stream was written
     """
-    if not mrs_list:
-        print(f"Nothing to convert for {meas_id}", file=sys.stderr)
-        return False
-    rep_count = sum(mrs.nrepetitions for mrs in mrs_list)
-    print(f"Converting {meas_id}: {len(mrs_list)} files, {rep_count} repetitions", file=sys.stderr)
-    # the writer must be closed to emit the end-of-stream sentinel, hence the with block
-    with mrd.BinaryMrdWriter(output) as writer:
-        writer.write_header(make_header(mrs_list[0], meas_id, rep_count))
-        rep_base = 0
-        for mrs in mrs_list:
+    load = load or (lambda mrs, filepath: mrs.read_from_file(filepath))
+    filepaths = group.rawdata_file_list + group.prescan_file_list
+    rep_count = group.stream_repetitions
+    print(f"Converting {group.meas_id}: {len(filepaths)} files, {rep_count} repetitions",
+          file=sys.stderr)
+
+    # opened on the first file that parses rather than up front, since a writer closed without a
+    # header would leave an unreadable stream behind. Closing it is what emits the end-of-stream
+    # sentinel, hence the finally
+    writer: Optional[mrd.BinaryMrdWriter] = None
+    rep_base = 0
+    try:
+        # first convert raw data
+        for filepath in group.rawdata_file_list:
+            mrs = MRSdata()                     # one at a time, released once written
+            mrs.read_from_file(filepath)
+
+            if writer is None:
+                writer = mrd.BinaryMrdWriter(output)
+                writer.write_header(make_header(mrs, group.meas_id, rep_count))
             writer.write_data(generate_acquisition(mrs, rep_base, rep_count))
             rep_base += mrs.nrepetitions
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        print(f"No data to convert for {group.meas_id}", file=sys.stderr)
+        return False
     return True
 
 
-def report_warnings(groups: Sequence[ScanGroup]) -> None:
+def shift_echo_position(mrs_list: List[MRSdata], name: str = "") -> Optional[dict]:
     """
-    Print what mrs_organize noticed about the shape of the input: a file from another session, a
-    scan id that never arrived, two series in one experiment. These are warnings rather than errors,
-    because a scan with a file missing still converts, and saying so beside the converted stream is
-    more use than refusing to write one
+    Where the echo peaks inside each gradient switch, for one scan's repetitions pooled.
+
+    nsamples of an EPSI readout is nswitch stretches of nsamples // nswitch points, and the
+    gradient echo sits at one position of each stretch. The reconstruction reads every switch at
+    the same offset, so the question this answers is whether that one offset can be right: a peak
+    that sits at the same position in all nswitch switches says yes, a peak that walks along the
+    train says no single window suits the whole readout.
+
+    Signal is summed over the views and over every repetition of every file in the group, which is
+    what gives one switch enough to peak on: one repetition of one view is mostly noise. That
+    pooling is also why this takes a list rather than a file, and why an averaged phantom is
+    reported as a scan of its own rather than added in - it would be pooling a different scan.
+
+    Nothing is corrected here and nothing is written. For the sampling window itself, and for the
+    drift measured rather than read off an argmax, see epsi_window.py
     Args:
-        - groups: every group in this run
+        - mrs_list: the parsed files of one scan, read rather than probed, in acquisition order
+        - name: what to call this scan in the printed block and the figure title, e.g. a meas_id
+    Returns:
+        - dict of the pooled signal, the peak position per switch and the switch layout, or None
+          when the list held no EPSI readout to profile
     """
-    for warning in mrs_organize.check_groups(groups):
-        print(f"WARNING {warning}", file=sys.stderr)
+    # epsi_window imports is_epsi and switch_layout from here, so this import is function-level to
+    # keep that from being circular. matplotlib is deferred for the reason it is everywhere else in
+    # this file: converting needs no plotting stack
+    from epsi_window import switch_cube
+    import matplotlib.pyplot as plt
+
+    label = name or "scan"
+    signal, layout, pooled = None, None, 0
+    # loop through raw data mrs_list to identify the peak
+    for mrs in mrs_list:  
+        # Map mrs.rawdata shape (nsamples, nviews, ...) to (nswitches, nsamples/nswitches, nviews, ...)
+        # e.g.) 1280 samples, 12 views -> 64 switches, 20 total_points_per_switch (includes ramp), 12 views
+        total_pts_per_switch = mrs.nsamples // mrs.nswitches
+        
+
+        cube = np.abs(switch_cube(mrs)).sum(axis=(2, 3))         # (nswitch, total)
+        if signal is not None and cube.shape != signal.shape:
+            print(f"WARNING leaving a {cube.shape} readout of {label} out of a {signal.shape} "
+                  f"pool", file=sys.stderr)
+            continue
+        signal = cube if signal is None else signal + cube
+        layout = layout or switch_layout(mrs)
+        pooled += 1
+    if signal is None:
+        print(f"No EPSI readout in {label} to find an echo position in", file=sys.stderr)
+        return None
+
+    nswitch, total, kept = layout
+    discard_pre = (total - kept) // 2       # the window generate_acquisition writes into the header
+    peaks = np.argmax(signal, axis=1)
+    switches = np.arange(nswitch)
+    # whether each switch peaks inside the span a conversion keeps, counted the same cyclic way
+    # generate_acquisition addresses it, so a window running off the end of the switch is not
+    # mistaken for one that peaks outside it
+    inside = int((((peaks - discard_pre) % total) < kept).sum())
+
+    print(f"\n{label}: {pooled} file(s) pooled, {nswitch} switches of {total} positions, keeping "
+          f"{kept} at {discard_pre}..{discard_pre + kept - 1}")
+    print(f"  the peaks visit positions {int(peaks.min())} to {int(peaks.max())}, at {int(peaks[0])} "
+          f"in the first switch and {int(peaks[-1])} in the last")
+    print(f"  {inside} of {nswitch} switches peak inside the kept window, and pooled over every "
+          f"switch the profile peaks at {int(np.argmax(signal.sum(axis=0)))}")
+    # no slope is printed on purpose. A position is cyclic within a switch and the argmax jumps
+    # between whichever features are momentarily strongest - on cirrhrat_43_1 two of them 14 apart -
+    # so a line through these points describes neither. epsi_window.measure_echo_drift searches the
+    # correction and scores it, which is the measurement worth quoting
+    print(f"  epsi_window.py measures the drift and places the window; this only marks the peaks")
+
+    figure, axes = plt.subplots(figsize=(9, 7))
+    axes.imshow(signal, aspect='auto', origin='lower', interpolation='nearest',
+                extent=(-0.5, total - 0.5, -0.5, nswitch - 0.5))
+    # the points a conversion keeps, so the peaks are read against the window rather than in the
+    # abstract: a peak outside this span is signal the reconstruction currently throws away
+    axes.axvspan(discard_pre - 0.5, discard_pre + kept - 0.5, color='w', alpha=0.15,
+                 label=f"kept window {discard_pre}..{discard_pre + kept - 1}")
+    axes.plot(peaks, switches, 'x', color='C3', ms=6, label='peak of each switch')
+    axes.set_xlabel(f"position within the {total} point switch")
+    axes.set_ylabel("switch")
+    axes.set_title(f"{label}: echo position per switch, {pooled} file(s) pooled")
+    axes.legend(fontsize=8, loc='upper right')
+    figure.colorbar(axes.images[0], ax=axes, label='signal summed over views and repetitions')
+    figure.tight_layout()
+    plt.show()
+    return dict(signal=signal, peaks=peaks, nswitch=nswitch, total=total, kept=kept,
+                discard_pre=discard_pre, pooled=pooled)
+
+
+def report_echo_positions(groups: Sequence[ScanGroup],
+                          load: Optional[Callable[[MRSdata, str], None]] = None) -> int:
+    """
+    Plot the echo position per switch for every scan the input resolves to, converting nothing.
+
+    Grouped exactly as a conversion would group it, so the repetitions that pool into one figure
+    are the repetitions that would have pooled into one stream. The phantom of a group is plotted
+    separately for the reason it is excluded from the pool: averaged data placed beside 27
+    repetitions measures neither of them
+    Args:
+        - groups: the scans to report on, from group_inputs
+        - load: how to turn one of a group's paths into a parsed MRSdata; see read_mrs_group
+    Returns:
+        - how many figures were produced
+    """
+    reported = 0
     for group in groups:
-        for warning in mrs_organize.check_group(group):
-            print(f"WARNING {warning}", file=sys.stderr)
+        for files, label in ((group.rawdata_file_list, group.meas_id),
+                             (group.prescan_file_list, f"{group.meas_id} prescan")):
+            if not files:
+                continue
+            if shift_echo_position(read_mrs_group(files, load), label) is not None:
+                reported += 1
+    return reported
 
 
-def convert_folder_to_mrd(folder: Path, dry_run: bool = False,
-                          meas_id_override: str = "") -> bool:
+def convert_folder_to_mrd(folder: Path,
+                          meas_id_override: str = "",
+                          dry_run: bool = False,
+                          window_check: bool = False) -> bool:
+
     """
     Walk one experiment folder for .MRD files and convert each scan to its own stream inside it
-        spectral: KIC_Huh7msps5_08-15-2025.mrs/KIC_huh7_5.MRD
+        spectral: {experiment_folder}/{KIC_Huh7msps5_08-15-2025.MRD}
             -> KIC_Huh7msps5_08-15-2025.mrs/KIC_Huh7msps5_08-15-2025.mrs_1puls_extrf_KIC.mrd2
-        EPSI:     cirrhrat_43_1/epsi/24804/24804_000_0.MRD, one repetition per scan directory
+        EPSI:     {experiment_folder}/{modal}/{scan_id}/{24804_000_0.MRD}, one repetition per scan directory
             -> cirrhrat_43_1/cirrhrat_43_1_epsigre_combined.mrd2
-        EPSI:     cirrhrat_43_1/epsi/24792/24792_000_0.MRD, acquired at another matrix
-            -> cirrhrat_43_1/cirrhrat_43_1_24792.mrd2
+        EPSI:     a subdirectory among those has navg>1 and nrep=1 instead - an averaged prescan,
+                  converted into the same stream as the data it calibrates rather than a file of
+                  its own, its acquisitions flagged IS_NAVIGATION_DATA
     Args:
         - folder: the experiment folder to walk
-        - dry_run: report the grouping and what looks wrong with it, converting nothing
         - meas_id_override: measurement id to record instead of the folder's name
+        - dry_run: report the grouping and what looks wrong with it, converting nothing
+        - window_check: report sampling window and try shifting the echo position
     Returns:
         - True when at least one scan was written, or when a dry run found something to convert
     """
+    # scan subfolders of provided folder and group them into rawdata and prescan data as object ScanGroup
     groups = mrs_organize.organize_folder(folder, meas_id_override)
     if dry_run:
         mrs_organize.report(groups)
         return bool(groups)
-    report_warnings(groups)
     written = False
-    for group in groups:
-        mrs_list = read_mrs_group(group.files, group.family)
-        if not mrs_list:
-            print(f"No usable files in {group.meas_id}, skipping", file=sys.stderr)
-            continue
-        print(f"Writing {group.output_path}", file=sys.stderr)
-        with open(group.output_path, "wb") as output:
-            written |= convert_group_to_mrd(mrs_list, group.meas_id, output)
-    return written
+    
+    # convert .MRD file in groups to mrd.acquisition
+    rawdata_across_repetition = None 
+    for i, filepath in enumerate(groups.rawdata_file_list):
+        mrs = MRSdata()
+        mrs.read_from_file(filepath)
+        # shift the echo center for EVO2 EPSI sequences only as the gradient is on before the first sample point
+        # discard last n points and prepend n zeropoints at the beginning of nsamples dimension
+        if mrs.sequence_name == 'epsigre':
+            # If EVO2 epsi on tramp=100us, readout grad started 7points before the first sample e.g.) kidney data
+            if mrs.tramp == 100:
+                print(f'Detected EVO2{mrs.sequence_name} and tramp={mrs.tramp}, prepending 5 zeros', file=sys.stderr)
+                nprepend_zeros = 5
+            # If EVO2 epsi on tramp=112us, readout grad started 5points before the first sample e.g.) cirrhrat data
+            elif mrs.tramp == 112:
+                print(f'Detected EVO2{mrs.sequence_name} and tramp={mrs.tramp}, prepending 7 zeros', file=sys.stderr)
+                nprepend_zeros = 7
+            if nprepend_zeros:
+                mrs.rawdata = np.concatenate((np.zeros(((nprepend_zeros,) + mrs.rawdata.shape[1:])),mrs.rawdata[:-nprepend_zeros,...]),axis=0)
+                print(f"shape after prepend zeros={mrs.rawdata.shape}")
+
+    return True
+    
+def correct_echo_position(groups):
+    # loop through each mrs file in group and plot the pre-shifted echo position from epsi_window
+
+    # derive the shift of points based of slope from epsi_window
+
+    # use the derived slope to shift for each ntotal_points_per_switch = nsamples/nswitch
+    for i in range(ntotal_points_per_switch):
+        np.roll(
 
 
 def convert_file_to_mrd(input_path: Path, output_path: Optional[Path] = None,
@@ -344,15 +554,10 @@ def convert_file_to_mrd(input_path: Path, output_path: Optional[Path] = None,
         print(f"Nothing to convert in {input_path}", file=sys.stderr)
         return False
     group = groups[0]
-    report_warnings(groups)
     destination = output_path or Path(group.output_path)
-    mrs_list = read_mrs_group(group.files, group.family)
-    if not mrs_list:
-        print(f"Nothing to convert in {input_path}", file=sys.stderr)
-        return False
     print(f"Converting {input_path} to {destination}", file=sys.stderr)
     with open(destination, "wb") as output:
-        return convert_group_to_mrd(mrs_list, group.meas_id, output)
+        return convert_group_to_mrd(group, output)
 
 
 def convert_tar_to_mrd(tar_path: Path, output_path: Path, meas_id_override: str = "") -> bool:
@@ -396,39 +601,38 @@ def convert_tar_to_mrd(tar_path: Path, output_path: Path, meas_id_override: str 
                          f"a single stream: tar one scan directory, or point --output at a "
                          f"directory")
 
+    def load(mrs: MRSdata, name: str) -> None:
+        mrs.parse_from_buffer(payloads[name])
+        mrs.set_base_frequency(spr_frequency)   # the .MRD may defer its frequency to the sidecar
+
     written = False
     for group in groups:
-        mrs_list: List[MRSdata] = []
-        for name in group.files:
-            mrs = MRSdata()
-            mrs.parse_from_buffer(payloads[name])
-            # the .MRD may defer its frequency to the sidecar, as read_from_file does on disk
-            mrs.set_base_frequency(spr_frequency)
-            if not keep_mrs(mrs, name, group.family):
-                continue
-            mrs_list.append(mrs)
         # meas_id_override names the scan itself, so it wins over what grouping inferred
-        meas_id = meas_id_override or group.meas_id or fallback
+        group.meas_id = meas_id_override or group.meas_id or fallback
         destination = output_path / group.output_name if into_directory else output_path
         # opened even with nothing to write: on Tyger this is the output buffer's FIFO, and closing
         # it empty is what tells the sidecar the job produced nothing, rather than leaving it
         # blocked on a stream that never opens
         with open(destination, "wb") as output:
-            written |= convert_group_to_mrd(mrs_list, meas_id, output)
+            written |= convert_group_to_mrd(group, output, load=load)
     if not groups and not into_directory:
         with open(output_path, "wb"):       # nothing grouped, but the buffer still has to close
             pass
     return written
 
 
+
+
 def main() -> int:
     """
-    Convert MRS data to MRD2, in exactly one of three input modes.
+    Convert MRS data to MRD2, in exactly one of three input modes, or with -w report where the echo
+    peaks inside each gradient switch of what those modes resolve to and convert nothing.
 
     Every check that can stop the run lives here. Past this point a file that cannot be converted is
     reported and skipped, so the run ends with a status rather than a traceback
     Returns:
-        - 0 when at least one stream was written, 1 when nothing was
+        - 0 when at least one stream was written, or one scan was reported on with -w. 1 when
+          nothing was
     """
     parser = argparse.ArgumentParser(description="Convert MR Solutions MRS data to MRD2 format")
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -445,29 +649,33 @@ def main() -> int:
                         help="measurement id to record instead of the name of the folder, tar root "
                              "or directory the data came from")
     parser.add_argument("-n", "--dry-run", action="store_true",
-                        help="with --folder, report how the files group and what looks wrong with "
-                             "them, without converting anything")
+                        help="with --folder only: report how the files group them, without converting")
+    parser.add_argument("-w", "--window", action="store_true",
+                        help="with --folder only: report where echo peaks position for each swittch")
     args = parser.parse_args()
 
-    if args.tar:
-        output = args.output or os.environ.get("OUTPUT_PIPE")
-        if not output:
-            parser.error("--output is required with --tar when $OUTPUT_PIPE is unset")
-        print(f"Converting tarred scan {args.tar} to {output}", file=sys.stderr)
-        written = convert_tar_to_mrd(args.tar, Path(output), args.meas_id)
-    elif args.input:
-        if not args.input.is_file():
-            parser.error(f"{args.input} is not a file")
-        written = convert_file_to_mrd(args.input, args.output, args.meas_id)
-    else:
-        if not args.folder.is_dir():
-            parser.error(f"{args.folder} is not a directory")
-        if args.output:
-            parser.error("--output does not apply to --folder: each scan is written beside its "
-                         "own files")
-        print(f"Converting folder {args.folder}", file=sys.stderr)
-        written = convert_folder_to_mrd(args.folder, args.dry_run, args.meas_id)
+    if args.tar and not args.tar.exists():
+        parser.error(f"{args.tar} does not exist")
+    if args.input and not args.input.is_file():
+        parser.error(f"{args.input} is not a file")
+    if args.folder and not args.folder.is_dir():
+        parser.error(f"{args.folder} is not a directory")
+    if args.tar and (args.window or args.dry_run):
+        parser.error(f"-t can only used to convert file")
 
+    if args.folder:
+        # convert folder allows
+        print(f"Converting folder of single experiment folder {args.folder}", file=sys.stderr)
+        written = convert_folder_to_mrd(args.folder, args.meas_id, args.dry_run, args.window)
+    elif args.tar:
+        output = args.output or Path(os.environ.get("OUTPUT_PIPE", ""))
+        if not str(output):
+            parser.error("--tar needs --output, or $OUTPUT_PIPE set")
+        print(f"Converting tar of single experiment folder {args.tar}", file=sys.stderr)
+        written = convert_tar_to_mrd(args.tar, output, args.meas_id)
+    else:
+        print(f"Converting single file {args.input}", file=sys.stderr)
+        written = convert_file_to_mrd(args.input, args.output, args.meas_id)
     if not written:
         print("Nothing was converted", file=sys.stderr)
         return 1

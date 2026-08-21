@@ -14,15 +14,50 @@ holding <id>_000_0.MRD next to its .SPR, .dat and .SQL. What sits above that dir
     spectral    KIC_Huh7msps5_08-15-2025.mrs/KIC_huh7_5.MRD
                 one file holding all its repetitions on the nrepetitions axis, no scan directory
 
-How to combine:
-Combining is the only thing decided here, and it is decided structurally: EPSI files in one
-experiment folder combine when their arrays can concatenate on the repetition axis, which means
-every dimension of the acquisition agrees
+There is nothing here that reads which of those two shapes a file arrived in: every file in one
+experiment folder that shares a sequence name converts into one stream together, whatever kind of
+scan it is. That's what makes the converter generic rather than needing to special case EPSI.
 
-Edge case:
-If there is a file that does not match the dimension, it will be converted on its own
-e.g. a calibration scan recorded at another matrix size, or an acquisition
-that already holds its repetitions on the nrepetitions axis 
+How to combine:
+Every input names exactly one experiment - -f is pointed at one folder, a tar holds one, -i is a
+lone file - so there is one group to return rather than a list of them. Nothing is keyed on to
+decide which group a file joins, because there is only ever the one: a file is either real
+acquisition data that concatenates on the repetition axis, or the averaged prescan beside it, and
+both convert into the same stream.
+
+That is why group_experiment returns a single ScanGroup, holding two lists of paths:
+rawdata_file_list, the real acquisition data, and prescan_file_list, the averaged calibration scan
+beside it (naverages>1 at a single repetition, MR Solutions' way of recording a scan that was
+averaged rather than repeated). convert_group_to_mrd converts rawdata_file_list first, so it builds
+the header from real data, and prescan_file_list after it into the same stream rather than a file of
+their own - they're told apart downstream by IS_NAVIGATION_DATA, not by which list or file they came
+from.
+
+Pointing -f at a folder of several experiments therefore converts them into one stream rather than
+one each, which is what the guards below are for: it is the caller's job to name one experiment.
+
+A group holds paths and the few scalars a conversion needs, never parsed files: the dimensions are
+read once by a header-only probe to decide the grouping, and everything past that point re-reads
+one file at a time. That is what lets a 27 file series convert without ever holding more than one
+of them in memory, and it is why nrepetitions is recorded here rather than recomputed downstream.
+rawdata_shape is recorded for the same reason: the probe already knows the axes one file is reshaped
+onto, so the shape the whole series comes to is known before a single file is read back.
+
+Which files are real data and which are prescan is decided structurally, by the acquisition matrix.
+The two shapes a scan arrives in are told apart by nothing more than how many paths the rawdata list
+ends up holding:
+
+    case 1  many files, each nrepetitions=1, one per scan directory - the EPSI series, combined
+    case 2  one file whose nrepetitions axis already holds them all - spectral, and EPSI acquired
+            into a single file
+
+Every rawdata file must share one acquisition matrix, since the whole point of the group is that
+they concatenate on the repetition axis; a second distinct matrix among them is misfiled data and
+group_experiment raises rather than silently lengthening the series with it. That raise is the check
+standing where the grouping key used to: with one group per input there is nowhere for an odd file
+to go, so it has to be said rather than absorbed. The prescan list carries no such rule - a scan can
+be calibrated by any number of differently shaped prescans, and none of them is concatenated onto
+anything.
 
 experiment_name is not read out of the path, it is what the caller pointed at: -f names one
 experiment folder and a tar holds one, so its root is the experiment. Whatever sits between the
@@ -33,9 +68,10 @@ contrast and no list of those names stays complete.
 Only -i names a lone file with no folder to take, and then the path is walked up past the scan id
 the scanner always writes. If nothing above it names the experiment, use the tar filename
 
-Each group is named for what it holds:
-    <experiment>_<sequence>_combined.mrd2   files that combined into one acquisition
-    <experiment>_<sequence>_<scan_id>.mrd2  a file converting on its own out of a scan directory
+The stream is named for what it holds:
+    <experiment>_<sequence>_prescan.mrd2    every file in the group is an averaged prescan
+    <experiment>_<sequence>_combined.mrd2   more than one file converted into one acquisition
+    <experiment>_<sequence>_<scan_id>.mrd2  a single file converting on its own
 """
 
 from __future__ import annotations
@@ -46,43 +82,77 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from MRSreader import MRSdata
 
 MRD_SUFFIX = ".MRD"
 OUTPUT_SUFFIX = ".mrd2"
 
-# substrings that identify the sequence family. Spectral sequence names take several forms across
-# scanner generations and protocols: 1puls_extrf_KIC, 1pulsch_phase_clin, one_pulse_clin_gating
-EPSI_MARKERS = ("epsi",)
-SPECTRAL_MARKERS = ("1pul", "one_pulse", "fid")
-
-# families that record one repetition per scan directory, so sibling directories holding the same
-# acquisition matrix are one acquisition split across files
-UNIFIED_FAMILIES = frozenset({"epsi"})
-
-# the dimensions that have to agree for two files to be repetitions of one acquisition, which is the
-# whole of what decides grouping. Ordered as the raw data is, so a reported difference reads in the
-# same order as the shape it describes
+# the dimensions that have to agree for two files to be repetitions of one acquisition. Ordered as
+# the raw data is, so a reported difference reads in the same order as the shape it describes
 SIGNATURE_FIELDS = ("nsamples", "nviews", "nsliceviews", "nslices", "nechoes", "nrepetitions",
                     "naverages", "datatype")
 
+# where those two sit in a signature tuple, so the prescan predicate and the repetition count can be
+# read off one without a per-file object to hang them on
+NREPETITIONS = SIGNATURE_FIELDS.index("nrepetitions")
+NAVERAGES = SIGNATURE_FIELDS.index("naverages")
 
-def sequence_family(sequence_name: str) -> str:
+# the leading fields of a signature are the axes rawdata is reshaped onto, in that order
+# (MRSreader.MRSdata.rawdata), so a shape is a signature with the two non-axis fields dropped
+SHAPE_FIELDS = SIGNATURE_FIELDS[:NREPETITIONS + 1]
+
+
+def is_prescan(naverages: int, nrepetitions: int) -> bool:
     """
-    Which conversion family a sequence belongs to
+    Whether a scan was averaged rather than repeated.
+
+    MR Solutions collapses the averages into a single acquisition, so an averaged scan arrives as
+    naverages>1 at one repetition, where the acquisition it calibrates arrives as naverages=1
+    repeated - across scan directories, or on the nrepetitions axis of one file. The single source
+    of truth for the predicate, so which list a file lands in (group_experiment) and how its
+    acquisitions are flagged (MRStomrd2.generate_acquisition) never disagree about what is prescan
+    """
+    return naverages > 1 and nrepetitions == 1
+
+
+def signature_of(mrs: MRSdata) -> tuple:
+    """
+    The acquisition matrix of one probed file, everything that distinguishes one kind of scan from
+    another. Two files whose signatures differ cannot concatenate on the repetition axis - a
+    calibration scan at 2176x12 beside a 1792x8 series, or a file that already carries 25
+    repetitions of its own
     Args:
-        - sequence_name: as read from the SEQUENCE or PPL record, e.g. 'epsigre43_FB_13C'
+        - mrs: the file, probed or fully parsed
     Returns:
-        - 'epsi', 'spectral', or '' when the name matches neither
+        - the dimensions named by SIGNATURE_FIELDS, in that order
     """
-    name = (sequence_name or "").lower()
-    if any(marker in name for marker in EPSI_MARKERS):
-        return "epsi"
-    if any(marker in name for marker in SPECTRAL_MARKERS):
-        return "spectral"
-    return ""
+    # a probe that failed on a malformed header leaves the dimensions at their zero default, and a
+    # scan of no repetitions still holds one
+    return tuple(max(int(getattr(mrs, name)), 1) if name == "nrepetitions" else int(getattr(mrs, name))
+                 for name in SIGNATURE_FIELDS)
+
+
+def shape_of(signature: tuple, nrepetitions: int) -> tuple:
+    """
+    The shape the concatenated rawdata of a group takes, as np.reshape orders it - one file's
+    acquisition matrix with the group's repetition count on the last axis, since that is the only
+    axis the files concatenate on
+    Args:
+        - signature: the acquisition matrix every rawdata file in the group shares
+        - nrepetitions: repetitions summed across those files
+    Returns:
+        - the dimensions named by SHAPE_FIELDS, () for a signature that was never filled in
+    """
+    if not signature:
+        return ()
+    return signature[:NREPETITIONS] + (nrepetitions,)
+
+
+def describe_signature(signature: tuple) -> str:
+    """The acquisition matrix as a line, so a report or error can show what a group holds"""
+    return ", ".join(f"{name}={value}" for name, value in zip(SIGNATURE_FIELDS, signature))
 
 
 def is_scan_id(name: str) -> bool:
@@ -186,77 +256,64 @@ def experiment_dir_for(path, experiment_root: str = "", resolve: bool = True) ->
     return experiment_dir, meas_id
 
 
-@dataclass(frozen=True)
-class ScanFile:
-    """One .MRD file, with everything grouping and checking need and nothing else"""
-    path: str
-    scan_dir: str
-    experiment_dir: str
-    meas_id: str
-    sequence_name: str
-    family: str
-    nsamples: int
-    nviews: int
-    nsliceviews: int
-    nslices: int
-    nechoes: int
-    nrepetitions: int
-    naverages: int
-    datatype: int
-    scan_id: Optional[int]
-
-    @property
-    def signature(self) -> tuple:
-        """
-        Everything that has to agree for two files to be repetitions of one acquisition. Two files
-        whose signatures differ cannot concatenate on the repetition axis, so they are separate
-        acquisitions however they are filed - a calibration scan at 2176x12 beside a 1792x8 series,
-        or a file that already carries 25 repetitions of its own
-        """
-        return tuple(getattr(self, name) for name in SIGNATURE_FIELDS)
-
-    def describe_signature(self) -> str:
-        """
-        The acquisition matrix as a line, so a report can show what a group holds. Written with the
-        same field names differs_from uses, so the two read against each other
-        """
-        return ", ".join(f"{name}={getattr(self, name)}" for name in SIGNATURE_FIELDS)
-
-    def differs_from(self, other: "ScanFile") -> str:
-        """
-        Which dimensions kept this file out of the group beside it, as 'name this vs that' terms.
-        Empty when the two agree, which is when they would have combined
-        """
-        return ", ".join(f"{name} {getattr(self, name)} vs {getattr(other, name)}"
-                         for name in SIGNATURE_FIELDS
-                         if getattr(self, name) != getattr(other, name))
-
-
 @dataclass
 class ScanGroup:
-    """The files converting to one MRD stream, and where that stream goes"""
+    """
+    The files converting to one MRD stream, and where that stream goes.
+
+    Paths and scalars only, never parsed files: the probe that decided the grouping is the only
+    time these files are read before conversion streams them back one at a time
+    """
     meas_id: str
     sequence_name: str
-    family: str
     experiment_dir: str
     output_dir: str
-    scan_files: List[ScanFile] = field(default_factory=list)
+    # real acquisition data, in acquisition order. One path per repetition in case 1, a single path
+    # already holding every repetition in case 2, which is what len() > 1 tells apart
+    rawdata_file_list: List[str] = field(default_factory=list)
+    # averaged prescans, converting into the same stream after the data above rather than a file of
+    # their own. The header is never built from one of these
+    prescan_file_list: List[str] = field(default_factory=list)
+    nrepetitions: int = 0   # repetitions across rawdata_file_list, recorded so conversion can write
+                            # the header without having read every file first
+    signature: tuple = ()   # the rawdata acquisition matrix, for reporting
+    # the shape the whole group's rawdata comes to once its files are concatenated, named by
+    # SHAPE_FIELDS: the shared acquisition matrix carrying nrepetitions above rather than one file's.
+    # Recorded here so a caller can size what a group holds without probing its files itself, which
+    # is the one number the two cases (a series of files, or one file already holding the axis) do
+    # not read the same way. () for a group whose signature was never filled in
+    rawdata_shape: tuple = ()
     output_name: str = ""
 
     @property
-    def files(self) -> List[str]:
-        """The paths, in acquisition order"""
-        return [scan_file.path for scan_file in self.scan_files]
+    def reference_path(self) -> str:
+        """
+        The file convert_group_to_mrd builds the header from: real data when there is any, else the
+        prescan, since a group always holds at least one file of one kind or the other
+        """
+        return (self.rawdata_file_list or self.prescan_file_list)[0]
 
     @property
     def is_combined(self) -> bool:
-        """Whether several files were combined into this group, rather than one converting alone"""
-        return len(self.scan_files) > 1
+        """Whether several data files were combined into this group, rather than one converting alone"""
+        return len(self.rawdata_file_list) > 1
 
     @property
-    def nrepetitions(self) -> int:
-        """Repetitions the stream will hold, which is what the group is for"""
-        return sum(scan_file.nrepetitions for scan_file in self.scan_files)
+    def is_prescan(self) -> bool:
+        """
+        Whether every file in this group is an averaged prescan, rather than the usual mix of real
+        acquisition data plus the prescan that calibrates it
+        """
+        return bool(self.prescan_file_list) and not self.rawdata_file_list
+
+    @property
+    def stream_repetitions(self) -> int:
+        """
+        Repetitions the written stream will hold, data and prescan together, which is what the
+        header's repetition limit and the LAST_IN_REPETITION flag are counted against. Each prescan
+        contributes exactly one, since is_prescan is only true at nrepetitions=1
+        """
+        return self.nrepetitions + len(self.prescan_file_list)
 
     @property
     def output_path(self) -> str:
@@ -269,8 +326,8 @@ def collect_mrd_paths(root) -> List[str]:
     Args:
         - root: directory to walk, or a single .MRD file
     Returns:
-        - paths in natural order. Ordering is settled again per group once families are known, but
-          walking in a stable order keeps the output reproducible
+        - paths in natural order. Ordering is settled again once prescan files are sorted to the end
+          of the group, but walking in a stable order keeps the output reproducible
     """
     root = Path(root)
     if root.is_file():
@@ -288,113 +345,30 @@ def _is_junk(path) -> bool:
     return any(part.startswith("._") for part in _posix(path).parts)
 
 
-def describe(path: str, mrs: MRSdata, experiment_root: str = "", resolve: bool = True) -> ScanFile:
+def group_experiment(paths: Sequence[str],
+                     probe: Callable[[str], MRSdata],
+                     root: str = "",
+                     experiment_root: str = "",
+                     fallback_meas_id: str = "",
+                     meas_id_override: str = "",
+                     resolve: bool = True) -> Optional[ScanGroup]:
     """
-    Build the grouping record for one probed file
-    Args:
-        - path: filesystem path or tar member name
-        - mrs: the file, probed or fully parsed
-        - experiment_root: see experiment_dir_for
-        - resolve: see experiment_dir_for
-    Returns:
-        - ScanFile
-    """
-    experiment_dir, meas_id = experiment_dir_for(path, experiment_root, resolve=resolve)
-    return ScanFile(path=str(path),
-                    scan_dir=str(_posix(path).parent),
-                    experiment_dir=experiment_dir,
-                    meas_id=meas_id,
-                    sequence_name=mrs.sequence_name,
-                    family=sequence_family(mrs.sequence_name),
-                    nsamples=int(mrs.nsamples),
-                    nviews=int(mrs.nviews),
-                    nsliceviews=int(mrs.nsliceviews),
-                    nslices=int(mrs.nslices),
-                    nechoes=int(mrs.nechoes),
-                    # a probe that failed on a malformed header leaves the dimensions at their zero
-                    # default, and a scan of no repetitions still holds one
-                    nrepetitions=max(int(mrs.nrepetitions), 1),
-                    naverages=int(mrs.naverages),
-                    datatype=int(mrs.datatype),
-                    scan_id=scan_id_of(path))
+    Sort the .MRD files of one experiment into the single stream they convert to. The one place the
+    rule lives.
 
+    One input is one experiment, so this returns one group rather than a list of them: there is no
+    key to sort files under and no bucket for a file to fall into, only the two lists of the group -
+    real acquisition data, and the averaged prescan beside it. What the files are is still read off
+    the acquisition matrix, and it is still read off a header-only probe, so nothing here parses a
+    file it does not have to.
 
-def check_group(group: ScanGroup) -> List[str]:
-    """
-    Look for signs that a group is not the intact scan it appears to be. Files are sometimes misfiled
-    on upload, and the directory structure that grouping trusts cannot report that by itself.
-
-    Every check is a warning. Each has a benign explanation often enough that refusing to convert
-    would be wrong, and a converted stream with a warning beside it is more useful than neither
-    Args:
-        - group: a grouped scan, files in acquisition order
-    Returns:
-        - warning lines, empty when the group looks intact
-    """
-    warnings: List[str] = []
-
-    # the scan ids of one acquisition run consecutively, so a hole is a file that never arrived. A
-    # calibration scan sits outside the run, and is already in a group of its own by then
-    acquired = sorted(f.scan_id for f in group.scan_files if f.scan_id is not None)
-    if len(acquired) > 1:
-        missing = [scan_id for previous, scan_id in zip(acquired, acquired[1:])
-                   for scan_id in range(previous + 1, scan_id)]
-        if missing:
-            warnings.append(f"{group.meas_id} is missing scan id{'s' if len(missing) > 1 else ''} "
-                            f"{_summarize(missing)} between {acquired[0]} and {acquired[-1]}, so "
-                            f"{len(missing)} file(s) did not arrive")
-
-    sequence_names = {f.sequence_name for f in group.scan_files}
-    if len(sequence_names) > 1:
-        warnings.append(f"{group.meas_id} mixes sequences {sorted(sequence_names)}")
-    return warnings
-
-
-def check_groups(groups: Sequence[ScanGroup]) -> List[str]:
-    """
-    Look for signs of misfiling that only show up between groups rather than inside one.
-
-    A file that agrees with nothing around it becomes a group of one, which is the normal shape of a
-    calibration scan and is not reported. Two combined series in one experiment directory is the
-    reportable case: it is legitimate if a rig renamed its ppl mid session or reconfigured the
-    matrix, and is a misfiled upload the rest of the time, so it is reported rather than merged
-    Args:
-        - groups: every group from one run
-    Returns:
-        - warning lines, empty when nothing looks misfiled
-    """
-    warnings: List[str] = []
-    by_experiment: Dict[tuple, List[ScanGroup]] = {}
-    for group in groups:
-        if group.is_combined:
-            by_experiment.setdefault((group.experiment_dir, group.meas_id), []).append(group)
-    for (_, meas_id), siblings in by_experiment.items():
-        if len(siblings) > 1:
-            detail = ", ".join(f"{g.sequence_name} ({len(g.scan_files)} files)"
-                               for g in sorted(siblings, key=lambda g: g.sequence_name))
-            warnings.append(f"{meas_id} holds {len(siblings)} combined series, converted "
-                            f"separately: {detail}")
-    return warnings
-
-
-def _summarize(numbers: Sequence[int], limit: int = 6) -> str:
-    """Render a list of ids without letting a large hole fill the log"""
-    shown = ", ".join(str(number) for number in numbers[:limit])
-    return shown if len(numbers) <= limit else f"{shown}, … (+{len(numbers) - limit} more)"
-
-
-def group_files(paths: Sequence[str],
-                probe: Callable[[str], MRSdata],
-                root: str = "",
-                experiment_root: str = "",
-                fallback_meas_id: str = "",
-                meas_id_override: str = "",
-                resolve: bool = True) -> List[ScanGroup]:
-    """
-    Sort .MRD files into the streams they convert to. The one place the rule lives
+    Two things the grouping key used to absorb quietly are therefore said out loud instead: a second
+    acquisition matrix among the real data raises, and a second sequence name anywhere in the
+    experiment is reported. Neither has been seen inside one real experiment folder, so both read as
+    the input having named more than one
     Args:
         - paths: candidate .MRD paths or tar member names
-        - probe: reads one path far enough to give sequence_name, naverages and the timestamp
+        - probe: reads one path far enough to give sequence_name, naverages and the dimensions
         - root: directory the caller pointed at. Output stays inside it even when the experiment
           resolves above it, so pointing at a scan directory never writes somewhere unexpected
         - experiment_root: the experiment every path belongs to, see experiment_dir_for. Only a
@@ -404,79 +378,64 @@ def group_files(paths: Sequence[str],
         - meas_id_override: names the experiment outright, ahead of the folder it was read from
         - resolve: see experiment_dir_for
     Returns:
-        - groups, each with its files in acquisition order and its output name assigned
+        - the group, its files in acquisition order and its output name assigned, or None when there
+          was no .MRD file to convert
     """
+    if not paths:
+        return None
     root_dir = str(_posix(os.path.abspath(str(root)))) if root and resolve else str(_posix(root))
-    # EPSI buckets by acquisition matrix, so scan directories recording one repetition each collect
-    # together and anything acquired differently stays out. Everything else converts a file at a
-    # time: its repetitions are already inside it, and two scans can share a sequence name
-    buckets: Dict[tuple, List[ScanFile]] = {}
-    alone: List[ScanFile] = []
+    # probed in acquisition order, since a file's position in the rawdata list becomes its
+    # repetition index. (path, signature, sequence name) is everything the group is built from
+    entries: List[Tuple[str, tuple, str]] = []
     for path in sorted(paths, key=natural_key):
-        scan_file = describe(path, probe(path), experiment_root, resolve=resolve)
-        if not scan_file.family:
-            print(f"{path}: sequence {scan_file.sequence_name!r} is neither EPSI nor spectral, "
-                  f"converting it on its own", file=sys.stderr)
-        if scan_file.family in UNIFIED_FAMILIES:
-            key = (scan_file.experiment_dir, scan_file.family, scan_file.sequence_name,
-                   scan_file.signature)
-            buckets.setdefault(key, []).append(scan_file)
-        else:
-            alone.append(scan_file)
-
-    members = _combine(buckets) + [[scan_file] for scan_file in alone]
-    # the caller naming the experiment outright wins over the folder it was read from, which is what
+        mrs = probe(path)
+        entries.append((str(path), signature_of(mrs), mrs.sequence_name))
+    rawdata = [entry for entry in entries
+               if not is_prescan(entry[1][NAVERAGES], entry[1][NREPETITIONS])]
+    prescan = [entry for entry in entries
+               if is_prescan(entry[1][NAVERAGES], entry[1][NREPETITIONS])]
+    # real data first so write_header builds the header from an acquisition rather than a prescan,
+    # unless the experiment is nothing but prescan
+    reference_path, reference_signature, reference_sequence = (rawdata or prescan)[0]
+    # every file belongs to the one experiment the caller named, so this is read once rather than
+    # per file. The caller naming it outright wins over the folder it was read from, which is what
     # names a file that arrived without an experiment folder around it
-    groups = [ScanGroup(meas_id=meas_id_override or scan_files[0].meas_id or fallback_meas_id,
-                        sequence_name=scan_files[0].sequence_name,
-                        family=scan_files[0].family,
-                        experiment_dir=scan_files[0].experiment_dir,
-                        output_dir=_clamp(scan_files[0].experiment_dir, root_dir),
-                        scan_files=scan_files)
-              for scan_files in members]
-    # tree order, which is what a reader walking the folder alongside the report expects
-    groups.sort(key=lambda group: natural_key(group.scan_files[0].path))
-    assign_output_names(groups)
-    return groups
+    experiment_dir, path_meas_id = experiment_dir_for(reference_path, experiment_root,
+                                                     resolve=resolve)
+    meas_id = meas_id_override or path_meas_id or fallback_meas_id
 
+    # the rawdata files concatenate on the repetition axis, so they have to be the same acquisition;
+    # a second matrix among them is misfiled data rather than a longer series. The prescans are held
+    # to nothing, since none of them is concatenated onto anything
+    matrices = {signature for _, signature, _ in rawdata}
+    if len(matrices) > 1:
+        described = "; ".join(sorted(describe_signature(matrix) for matrix in matrices))
+        raise ValueError(f"{meas_id} holds {len(matrices)} distinct acquisition matrices of real "
+                         f"data, which cannot be repetitions of one scan: {described}. Point -f or "
+                         f"-t at one experiment, or convert the odd scan on its own with -i")
+    # the sequence name is the ppl the scanner ran, so one experiment reads the same one on every
+    # file, prescan included - it is not what tells data and calibration apart. It no longer decides
+    # anything, so a file carrying another one now joins this stream instead of starting its own,
+    # and the header can only record the one
+    sequences = {sequence_name for _, _, sequence_name in entries}
+    if len(sequences) > 1:
+        print(f"WARNING {meas_id} holds {len(sequences)} sequence names "
+              f"({', '.join(sorted(sequences))}), converting them into one stream recorded as "
+              f"{reference_sequence!r}", file=sys.stderr)
 
-def _combine(buckets: Dict[tuple, List[ScanFile]]) -> List[List[ScanFile]]:
-    """
-    Decide which buckets convert as one stream and which convert a file at a time.
-
-    An experiment folder records one acquisition, so within one experiment and sequence the bucket
-    holding the most repetitions is that acquisition and combines. The rest were acquired
-    differently and only happen to be filed beside it - a calibration scan, a test scan run before
-    the acquisition started - so each of their files converts on its own and keeps a scan id to be
-    named by. Without that, two calibration scans run alike would read as one acquisition of two
-    repetitions: cirrhrat_43_1's 24792 and 24793 share a matrix and consecutive ids, and are two
-    scans rather than one.
-
-    Repetitions rather than files, because the acquisition is not always the fattest folder.
-    cirrhrat_39_4 holds 2 test scans at one repetition each and the acquisition in a single file at
-    40, so counting files would combine the two test scans and leave the acquisition out.
-
-    Buckets tied for the most repetitions all combine, since nothing here can say which of them is
-    the acquisition. That is the misfiled upload check_groups reports
-    Args:
-        - buckets: files sharing an experiment, sequence and acquisition matrix
-    Returns:
-        - the file lists each becoming one group
-    """
-    def weight(scan_files: Sequence[ScanFile]) -> int:
-        return sum(scan_file.nrepetitions for scan_file in scan_files)
-
-    largest: Dict[tuple, int] = {}
-    for key, scan_files in buckets.items():
-        experiment = key[:-1]                       # the key without the acquisition matrix
-        largest[experiment] = max(largest.get(experiment, 0), weight(scan_files))
-    members: List[List[ScanFile]] = []
-    for key, scan_files in buckets.items():
-        if len(scan_files) > 1 and weight(scan_files) == largest[key[:-1]]:
-            members.append(scan_files)
-        else:
-            members.extend([scan_file] for scan_file in scan_files)
-    return members
+    group = ScanGroup(
+        meas_id=meas_id,
+        sequence_name=reference_sequence,
+        experiment_dir=experiment_dir,
+        output_dir=_clamp(experiment_dir, root_dir),
+        rawdata_file_list=[path for path, _, _ in rawdata],
+        prescan_file_list=[path for path, _, _ in prescan],
+        nrepetitions=sum(signature[NREPETITIONS] for _, signature, _ in rawdata),
+        signature=reference_signature)
+    group.rawdata_shape = shape_of(group.signature, group.nrepetitions)
+    # one group per input, so a name cannot collide with a sibling's and nothing has to be broken
+    group.output_name = base_name(group) + OUTPUT_SUFFIX
+    return group
 
 
 def _clamp(experiment_dir: str, root_dir: str) -> str:
@@ -493,65 +452,43 @@ def _clamp(experiment_dir: str, root_dir: str) -> str:
 
 def base_name(group: ScanGroup) -> str:
     """
-    What to call a group's stream, before ties are broken.
+    What to call a group's stream.
 
-    A group is named for what it holds, and every name carries the sequence. Files that combined say
-    so, since no one scan id names the set. A file converting on its own adds its scan id, which is
-    unique within an experiment and is what distinguishes it from the series beside it - the sequence
-    name alone would not, because a calibration scan runs the same ppl as the acquisition it
-    calibrates. A file with no scan id to add, which is how spectral data arrives, is the sequence on
-    its own
+    A group is named for what it holds, and every name carries the sequence. An averaged prescan says
+    so ahead of anything else, since what it is matters more than how many files it arrived in, and
+    the acquisition beside it runs the same ppl so the sequence name alone would not tell them apart.
+    Files that combined say so, since no one scan id names the set. A file converting on its own adds
+    its scan id, which is unique within an experiment. A file with no scan id to add, which is how
+    spectral data arrives, is the sequence on its own
     Args:
         - group: a grouped scan with at least one file
     Returns:
         - the name without its suffix
     """
     name = f"{sanitize(group.meas_id)}_{sanitize(group.sequence_name)}"
+    if group.is_prescan:
+        return f"{name}_prescan"
     if group.is_combined:
         return f"{name}_combined"
-    scan_id = group.scan_files[0].scan_id
+    scan_id = scan_id_of(group.reference_path)
     return f"{name}_{scan_id}" if scan_id is not None else name
 
 
-def assign_output_names(groups: Sequence[ScanGroup]) -> None:
+def organize_folder(root, meas_id_override: str = "", quiet: bool = True) -> Optional[ScanGroup]:
     """
-    Name each group's stream and break ties.
+    Group every .MRD file under one experiment folder into the one stream it converts to.
 
-    Two groups can still propose one name: two combined series in an experiment differ by their
-    acquisition matrix rather than by anything in the name. When that happens every colliding group
-    takes its scan directory into its name, rather than only the later ones, so a name does not
-    depend on the order the tree was walked
-    Args:
-        - groups: assigned in place
-    """
-    proposed: Dict[tuple, List[ScanGroup]] = {}
-    for group in groups:
-        proposed.setdefault((group.output_dir, base_name(group)), []).append(group)
-    for (_, name), colliding in proposed.items():
-        if len(colliding) == 1:
-            colliding[0].output_name = name + OUTPUT_SUFFIX
-            continue
-        for group in colliding:
-            tag = sanitize(_posix(group.scan_files[0].path).parent.name)
-            group.output_name = f"{name}_{tag}{OUTPUT_SUFFIX}"
-        print(f"{len(colliding)} scans in {colliding[0].output_dir} share the name {name}, "
-              f"distinguishing them by scan directory", file=sys.stderr)
-
-
-def organize_folder(root, meas_id_override: str = "", quiet: bool = True) -> List[ScanGroup]:
-    """
-    Group every .MRD file under one experiment folder.
-
-    The folder is the experiment and names every stream written out of it, so the directories under
-    it are read for nothing but their scan ids. Pointing this at a folder of several experiments
-    puts them all in one experiment, and two series acquired at the same matrix would combine
+    The folder is the experiment and names the stream written out of it, so the directories under it
+    are read for nothing but their scan ids. Pointing this at a folder of several experiments makes
+    them one experiment: whatever the acquisition matrix check lets through concatenates into a
+    single series
     Args:
         - root: the experiment folder to walk, or a single .MRD file
         - meas_id_override: name the experiment rather than taking it from the folder, which is how
           a lone file with no experiment folder around it gets a name of its own
         - quiet: suppress MRSreader's per record reporting, which repeats once per file
     Returns:
-        - groups, ordered and named
+        - the group, or None when the folder held no .MRD file
     """
     def probe(path: str) -> MRSdata:
         mrs = MRSdata()
@@ -564,27 +501,30 @@ def organize_folder(root, meas_id_override: str = "", quiet: bool = True) -> Lis
     is_file = root_path.is_file()
     clamp_root = str(root_path.parent if is_file else root_path)
     experiment_root = "" if is_file else str(_posix(os.path.abspath(clamp_root)))
-    groups = group_files(paths, probe, root=clamp_root, experiment_root=experiment_root,
-                         meas_id_override=meas_id_override)
-    print(f"Grouped {len(paths)} files into {len(groups)} scans", file=sys.stderr)
-    return groups
+    group = group_experiment(paths, probe, root=clamp_root, experiment_root=experiment_root,
+                             meas_id_override=meas_id_override)
+    print(f"Grouped {len(paths)} files into {describe_group(group)}", file=sys.stderr)
+    return group
 
 
 def organize_members(members: Sequence[Tuple[str, bytes]],
                      fallback_meas_id: str = "",
-                     quiet: bool = True) -> List[ScanGroup]:
+                     quiet: bool = True) -> Optional[ScanGroup]:
     """
     Group the .MRD members of a tar, whose names are paths but whose contents are already in memory.
 
-    A tar holds one experiment folder, so its root is that experiment and names every stream out of
-    it, exactly as the folder given to organize_folder does
+    A tar holds one experiment folder, so its root is that experiment and names the stream out of
+    it, exactly as the folder given to organize_folder does. A tar sharing no single root directory
+    still converts as one stream, named by fallback_meas_id, since a Tyger job has one output buffer
+    to write into
     Args:
         - members: (member_name, file_bytes) as read_scan_tar returns them
         - fallback_meas_id: measurement id for members that carry no experiment directory, normally
           the tar's root directory
         - quiet: suppress MRSreader's per record reporting
     Returns:
-        - groups, ordered and named. Their files are member names, to be looked up in members
+        - the group, or None when the tar held no .MRD member. Its files are member names, to be
+          looked up in members
     """
     payloads = {name: payload for name, payload in members}
 
@@ -593,78 +533,51 @@ def organize_members(members: Sequence[Tuple[str, bytes]],
         mrs.probe_from_buffer(payloads[name], quiet=quiet)
         return mrs
 
-    groups = group_files(list(payloads), probe, experiment_root=tar_root(list(payloads)),
-                         fallback_meas_id=fallback_meas_id, resolve=False)
-    print(f"Grouped {len(payloads)} members into {len(groups)} scans", file=sys.stderr)
-    return groups
+    group = group_experiment(list(payloads), probe, experiment_root=tar_root(list(payloads)),
+                             fallback_meas_id=fallback_meas_id, resolve=False)
+    print(f"Grouped {len(payloads)} members into {describe_group(group)}", file=sys.stderr)
+    return group
 
 
-def reference_group(groups: Sequence[ScanGroup]) -> Optional[ScanGroup]:
+def describe_group(group: Optional[ScanGroup]) -> str:
+    """One line naming what an input resolved to, for the line each entry point logs"""
+    if group is None:
+        return "nothing to convert"
+    return (f"{group.output_name}: {len(group.rawdata_file_list)} data, "
+            f"{len(group.prescan_file_list)} prescan")
+
+
+def report(group: Optional[ScanGroup]) -> None:
     """
-    The group the others in an experiment are a departure from: the acquisition the experiment was
-    for. That is the group holding the most repetitions, which is the same reasoning _combine uses
-    to pick the acquisition in the first place, so a report always measures against what combined
+    Print what one experiment resolved to, converting nothing
     Args:
-        - groups: the groups of one experiment
-    Returns:
-        - the reference, or None when there is only one group and nothing to compare it against
+        - group: as returned by organize_folder or organize_members
     """
-    if len(groups) < 2:
-        return None
-    return max(groups, key=lambda group: (group.nrepetitions, len(group.scan_files)))
-
-
-def report(groups: Sequence[ScanGroup]) -> int:
-    """
-    Print the grouping and its integrity warnings.
-
-    A file that converts on its own is the part of a report worth explaining, because the folder it
-    sits in says it belongs with the rest and only its dimensions say otherwise. Each one is printed
-    against the acquisition it did not join, naming the dimensions that differ, so the reason it was
-    left out is on the page rather than something to go and work out
-    Args:
-        - groups: as returned by organize_folder or organize_members
-    Returns:
-        - number of warnings raised across all groups
-    """
-    total = 0
-    for warning in check_groups(groups):
-        total += 1
-        print(f"WARNING {warning}")
-    by_experiment: Dict[tuple, List[ScanGroup]] = {}
-    for group in groups:
-        by_experiment.setdefault((group.experiment_dir, group.meas_id), []).append(group)
-    references = {id(group): reference_group(siblings)
-                  for siblings in by_experiment.values() for group in siblings}
-    for group in groups:
-        first = group.scan_files[0]
-        print(f"\n{group.output_name}")
-        print(f"  meas_id   {group.meas_id}")
-        print(f"  sequence  {group.sequence_name} ({group.family})")
-        print(f"  matrix    {first.describe_signature()}")
-        reference = references.get(id(group))
-        if reference is not None and reference is not group:
-            difference = first.differs_from(reference.scan_files[0])
-            print(f"  separate  did not combine into {reference.output_name}: "
-                  f"{difference or 'same dimensions, so it is a second series'}")
-        print(f"  first     {first.path}")
-        if len(group.scan_files) > 1:
-            print(f"  last      {group.scan_files[-1].path}")
-        print(f"  output    {group.output_path}")
-        for warning in check_group(group):
-            total += 1
-            print(f"  WARNING   {warning}")
-    print(f"\n{len(groups)} scans, {total} warning(s)", file=sys.stderr)
-    return total
+    if group is None:
+        print("No .MRD file to convert", file=sys.stderr)
+        return
+    all_files = group.rawdata_file_list + group.prescan_file_list
+    print(f"\n{group.output_name}")
+    print(f"  meas_id   {group.meas_id}")
+    print(f"  sequence  {group.sequence_name}")
+    print(f"  files     {len(group.rawdata_file_list)} data, "
+          f"{len(group.prescan_file_list)} prescan")
+    print(f"  matrix    {describe_signature(group.signature)}")
+    print(f"  shape     {group.rawdata_shape}")
+    print(f"  reps      {group.nrepetitions} data, {group.stream_repetitions} in the stream")
+    print(f"  first     {group.reference_path}")
+    if len(all_files) > 1:
+        print(f"  last      {all_files[-1]}")
+    print(f"  output    {group.output_path}")
 
 
 def main() -> int:
     """
-    Print how a folder would be grouped, without converting anything
-    - -f/--folder: directory to walk
+    Print the stream one experiment folder would convert to, without converting anything
+    - -f/--folder: the experiment folder to walk
     """
     parser = argparse.ArgumentParser(
-        description="Show which .MRD files would be grouped into one experiment")
+        description="Show which .MRD files of one experiment convert into one stream")
     parser.add_argument("-f", "--folder", type=Path, required=True,
                         help="directory containing MRS data files")
     args = parser.parse_args()

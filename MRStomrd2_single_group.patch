@@ -1,0 +1,166 @@
+--- a/MRStomrd2.py
++++ b/MRStomrd2.py
+@@ -13,9 +13,10 @@
+     -f/--folder  Legacy method for local testing. One experiment folder, walked for its .MRD files
+ 
+ Both -t and -f represent one experiment and take their name from it, so mrs_organize reads the
+-directories inside only for their scan ids. Which files belong to one scan it decides from the
+-sequence and the acquisition matrix. All three converge on convert_group_to_mrd, so header choice
+-and repetition numbering have exactly one implementation.
++directories inside only for their scan ids. Each mode resolves to exactly one group, since each
++names one experiment, and mrs_organize reads the acquisition matrix only to tell that experiment's
++real data from the averaged prescan beside it. All three converge on convert_group_to_mrd, so header
++choice and repetition numbering have exactly one implementation.
+ 
+ Every file converts to acquisitions the same way whatever kind of scan it is. mrs_organize decides
+ which files make up a stream and whether that stream is data or an averaged prescan, and that answer
+@@ -449,29 +450,28 @@
+                 discard_pre=discard_pre, pooled=pooled)
+ 
+ 
+-def report_echo_positions(groups: Sequence[ScanGroup],
++def report_echo_positions(group: ScanGroup,
+                           load: Optional[Callable[[MRSdata, str], None]] = None) -> int:
+     """
+-    Plot the echo position per switch for every scan the input resolves to, converting nothing.
++    Plot the echo position per switch for the scan the input resolved to, converting nothing.
+ 
+     Grouped exactly as a conversion would group it, so the repetitions that pool into one figure
+-    are the repetitions that would have pooled into one stream. The phantom of a group is plotted
+-    separately for the reason it is excluded from the pool: averaged data placed beside 27
+-    repetitions measures neither of them
++    are the repetitions that would have pooled into one stream. The prescan is plotted separately
++    for the reason it is excluded from the pool: averaged data placed beside 27 repetitions
++    measures neither of them
+     Args:
+-        - groups: the scans to report on, from group_inputs
++        - group: the scan to report on, from organize_folder or organize_members
+         - load: how to turn one of a group's paths into a parsed MRSdata; see read_mrs_group
+     Returns:
+         - how many figures were produced
+     """
+     reported = 0
+-    for group in groups:
+-        for files, label in ((group.rawdata_file_list, group.meas_id),
+-                             (group.prescan_file_list, f"{group.meas_id} prescan")):
+-            if not files:
+-                continue
+-            if shift_echo_position(read_mrs_group(files, load), label) is not None:
+-                reported += 1
++    for files, label in ((group.rawdata_file_list, group.meas_id),
++                         (group.prescan_file_list, f"{group.meas_id} prescan")):
++        if not files:
++            continue
++        if shift_echo_position(read_mrs_group(files, load), label) is not None:
++            reported += 1
+     return reported
+ 
+ 
+@@ -497,17 +497,19 @@
+     Returns:
+         - True when at least one scan was written, or when a dry run found something to convert
+     """
+-    groups = mrs_organize.organize_folder(folder, meas_id_override)
++    group = mrs_organize.organize_folder(folder, meas_id_override)
+     if dry_run:
+-        mrs_organize.report(groups)
+-        return bool(groups)
++        mrs_organize.report(group)
++        return group is not None
++    if group is None:
++        print(f"No .MRD file under {folder}", file=sys.stderr)
++        return False
+     written = False
+     if window_check:
+         all_repetition_rawdata = None
+-        for filepath in groups[0].rawdata_file_list:
++        for filepath in group.rawdata_file_list:
+             print(f'filepath={filepath}')
+-            mrs = MRSdata()
+-            mrs.read_from_file(filepath)
++            mrs = MRSdata(filepath)
+             all_repetition_rawdata.append(mrs.rawdata)
+         # convert a list of single repetition mrs.rawdata into np.array
+         np.array(all_repetition_rawdata)
+@@ -528,11 +530,10 @@
+     Returns:
+         - True when a stream was written
+     """
+-    groups = mrs_organize.organize_folder(input_path, meas_id_override)
+-    if not groups:
++    group = mrs_organize.organize_folder(input_path, meas_id_override)
++    if group is None:
+         print(f"Nothing to convert in {input_path}", file=sys.stderr)
+         return False
+-    group = groups[0]
+     destination = output_path or Path(group.output_path)
+     print(f"Converting {input_path} to {destination}", file=sys.stderr)
+     with open(destination, "wb") as output:
+@@ -548,14 +549,13 @@
+     EOF, the .SPR sidecar can follow the .MRD members in tar order, and the header needs the whole
+     group before the first acquisition can be written.
+ 
+-    A Tyger job has one output buffer, so this writes one stream. The members are grouped exactly
+-    as a folder is, which turns "the caller tarred one scan" from an assumption into a checked
+-    precondition: more than one scan in the archive is an error, unless --output names a directory
+-    to write them all into
++    A Tyger job has one output buffer, so this writes one stream, and the members group into exactly
++    one as a folder's files do: the archive holds one experiment, so what would once have been a
++    second scan now either joins this stream or trips mrs_organize's acquisition matrix check
+     Args:
+         - tar_path: tar archive of one scan directory, or a FIFO carrying one
+-        - output_path: where to write the stream, which may also be a FIFO, or a directory when the
+-          archive holds more than one scan
++        - output_path: where to write the stream, which may also be a FIFO, or a directory to write
++          the stream into under the name grouping gave it
+         - meas_id_override: measurement id to record instead of the tar's root directory name
+     Returns:
+         - True when a stream was written
+@@ -571,33 +571,26 @@
+         print("No base frequency from a .SPR sidecar in the tar", file=sys.stderr)
+ 
+     payloads = dict(members)
+-    groups = mrs_organize.organize_members(members, fallback_meas_id=fallback)
+-    report_warnings(groups)
++    group = mrs_organize.organize_members(members, fallback_meas_id=fallback)
+     into_directory = output_path.is_dir()
+-    if len(groups) > 1 and not into_directory:
+-        raise ValueError(f"the tar holds {len(groups)} scans "
+-                         f"({', '.join(group.output_name for group in groups)}) but --output names "
+-                         f"a single stream: tar one scan directory, or point --output at a "
+-                         f"directory")
++    if group is None:
++        if not into_directory:
++            with open(output_path, "wb"):   # nothing grouped, but the buffer still has to close
++                pass
++        return False
+ 
+     def load(mrs: MRSdata, name: str) -> None:
+         mrs.parse_from_buffer(payloads[name])
+         mrs.set_base_frequency(spr_frequency)   # the .MRD may defer its frequency to the sidecar
+ 
+-    written = False
+-    for group in groups:
+-        # meas_id_override names the scan itself, so it wins over what grouping inferred
+-        group.meas_id = meas_id_override or group.meas_id or fallback
+-        destination = output_path / group.output_name if into_directory else output_path
+-        # opened even with nothing to write: on Tyger this is the output buffer's FIFO, and closing
+-        # it empty is what tells the sidecar the job produced nothing, rather than leaving it
+-        # blocked on a stream that never opens
+-        with open(destination, "wb") as output:
+-            written |= convert_group_to_mrd(group, output, load=load)
+-    if not groups and not into_directory:
+-        with open(output_path, "wb"):       # nothing grouped, but the buffer still has to close
+-            pass
+-    return written
++    # meas_id_override names the scan itself, so it wins over what grouping inferred
++    group.meas_id = meas_id_override or group.meas_id or fallback
++    destination = output_path / group.output_name if into_directory else output_path
++    # opened even with nothing to write: on Tyger this is the output buffer's FIFO, and closing it
++    # empty is what tells the sidecar the job produced nothing, rather than leaving it blocked on a
++    # stream that never opens
++    with open(destination, "wb") as output:
++        return convert_group_to_mrd(group, output, load=load)
+ 
+ 
+ 

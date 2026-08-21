@@ -78,8 +78,11 @@ def build_fid_matrix(head: mrd.Header,
     """
     Stack the complex FIDs into a matrix, placing each FID at the column given by its
     acquisition header index (`idx.repetition`) rather than by arrival order, so the
-    result is robust to out-of-order/interleaved streams. Navigation/phantom
-    acquisitions are skipped. Unfilled columns are compacted out before returning.
+    result is robust to out-of-order/interleaved streams. Acquisitions flagged
+    IS_NAVIGATION_DATA are skipped, which is a leftover guard: no converter in
+    this pipeline sets that flag any more, and none marks phantom acquisitions
+    at all - a phantom is a stream of its own, named by mrs_organize. Unfilled
+    columns are compacted out before returning.
 
     Assumes single-channel MRS data: acq.data has shape (coils=1, samples).
 
