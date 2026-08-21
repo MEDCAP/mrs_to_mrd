@@ -46,6 +46,9 @@ NOISE_THRESHOLD_MULTIPLIER = 3.0
 PHASE_SEARCH_RANGE = 15
 # spectral zero fill factor; 1 means the spectral axis is exactly one point per echo
 FIDPAD = 1
+# leading samples of an epsigre readout that carry nothing usable, read as zero. The count is this
+# one sequence's quirk rather than anything a header records, and --zero-lead overrides it
+EPSIGRE_ZERO_LEAD = 13
 
 # ---------- peak specification -------------------------------------------
 
@@ -979,6 +982,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-lb", "--line-broadening", type=float, default=42, required=False, help="Line broadening factor in Hz")
     parser.add_argument("-d", "--denoise", action="store_true", help="Apply truncated-SVD denoising before the transform")
     parser.add_argument("-r", "--rank", type=int, default=None, required=False, help="Number of singular values to retain (default: auto via Gavish-Donoho)")
+    # the options the reconstruction already takes, which had no way in from the command line
+    parser.add_argument("--pad", type=int, default=None, required=False,
+                        help="Sampling window pad in samples: each switch is read from "
+                             "iswitch * points_per_switch + discard_pre - pad "
+                             "(default: derived from the recorded ramp time). "
+                             "MRStomrd2.py -w reports the pad that reads the gradient plateau")
+    parser.add_argument("--zero-lead", type=int, default=None, required=False,
+                        help="Leading samples to read as zero (default: the sequence's own, 13 on "
+                             "epsigre and none otherwise)")
+    parser.add_argument("--phantom", type=Path, default=None, required=False,
+                        help="Separately converted phantom scan to fit and scale the maps against")
+    parser.add_argument("--wigglefactor", type=float, default=1.0, required=False,
+                        help="How far a peak center may move from its named ppm during the fit, as "
+                             "a multiple of the default allowance")
+    parser.add_argument("--skip-initial-reps", type=int, default=0, required=False,
+                        help="Repetitions to drop from the front of the series, e.g. dummy scans "
+                             "acquired before the bolus arrived")
     return parser
 
 if __name__ == "__main__":

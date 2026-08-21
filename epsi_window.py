@@ -570,9 +570,10 @@ def aligned_echo_position(cube: np.ndarray, view: Optional[int] = None) -> Tuple
     return int(np.argmax(profile)), sharpness
 
 
-def peak_families(signal: np.ndarray, slope: float) -> dict:
+def peak_families(signal: np.ndarray, slope: float, anchor: Optional[int] = None,
+                  fallback_separation: Optional[float] = None) -> dict:
     """
-    Sort the per-switch peaks into the two echoes a switch carries.
+    Sort the per-switch peaks into the two echoes a switch carries, against switch 0.
 
     The brightest position in one switch is whichever of its two echoes happened to win, so a plot of
     those peaks looks like scatter when the echo is in fact perfectly orderly: on ischemia_179 they
@@ -581,53 +582,84 @@ def peak_families(signal: np.ndarray, slope: float) -> dict:
     needs a switch to peak on the readout echo - a switch peaking on the rephasing echo still says
     where the train is.
 
-    Done against the line of the slope being applied, so the residuals are what is left after the
-    correction and the two families show up as two modes of them. The slope refitted by folding those
-    residuals on the separation comes back as an independent estimate: it reads +0.187 on
-    ischemia_179 where the coherent search reads +0.232, and no fold period reconciles the two, so it
-    is reported beside the applied slope rather than used instead of it
+    Which family is which is decided by switch 0 and nothing else. The signal decays along the train -
+    peak magnitude per switch runs 0.70 to 1.00 relative at the front of ischemia_179 against 0.17 to
+    0.27 at the back - so the first switch is the most reliable reading there is, and the drift is
+    linear from it. Sorting by "whichever mode holds more switches" instead gets the front of the train
+    backwards: with the drift left in the residuals it labelled switches 0 to 3 of ischemia_179, all
+    peaking at 3 on the readout echo, as the second one.
+
+    The separation between the families is measured rather than taken from the ramp formula, which
+    predicts 8.5 to 10 where the data reads 9 to 11 on the kidney scans and about 14 on cirrhrat
     Args:
         - signal: (switch, position) magnitude summed over views and repetitions
-        - slope: the drift still present in `signal`, in samples per switch, which the residuals are
-          measured against so the two families separate into two modes. Zero for a readout already
-          corrected. It does not touch the refitted slope, which is searched from the peaks alone
+        - slope: the drift still present in `signal`, in samples per switch, so that a switch on the
+          readout echo has a residual near zero whatever the drift. Zero for a corrected readout
+        - anchor: the readout echo's position in switch 0, or None to read it off switch 0's own peak
+        - fallback_separation: the spacing the sequence gives its two echoes, used when the data is
+          too smeared to measure one; None falls back to half a switch
     Returns:
-        - dict of the per-switch peaks, the two modes and their populations, the separation between
-          them and the slope that separation refits to
+        - dict of the per-switch peaks, the anchor, the separation and whether it was measured or
+          fallen back on, which family each switch fell in and how many that is, and the slope the
+          peaks refit to on their own
     """
     nswitch, total = signal.shape
     peaks = np.argmax(signal, axis=1)
     switches = np.arange(nswitch)
-    residual = (peaks - slope * switches) % total
+    if anchor is None:
+        anchor = int(peaks[0])
+    # distance from the line the anchor and the slope draw, the short way round the switch
+    residual = (peaks - anchor - slope * switches + total / 2) % total - total / 2
 
-    # counted on whole positions, since that is the resolution an argmax has anyway
+    # where the switches that did not peak on the readout echo cluster. Taken as the most populated
+    # whole position rather than as a mean, since the set holds noise as well as the second echo and
+    # one stray residual drags a mean a long way - on ischemia_179 the mean reads -5.2 where the
+    # cluster sits at +9. A quarter of a switch either side of zero is left out because the readout
+    # family itself spreads that far: on ischemia_179 its residuals walk from 0 to -3 across the
+    # train, and at an exclusion of 3 that tail held 9 switches and won the mode outright, reading a
+    # separation of -3 where the second echo plainly sits at +9
     census = np.zeros(total, dtype=int)
     for value in residual:
         census[int(round(value)) % total] += 1
-    readout_mode = int(np.argmax(census))
-    # the second mode has to be clear of the first, or the flank of one peak reads as the other
+    radius = max(3, total // 4)
     apart = [position for position in range(total)
-             if min((position - readout_mode) % total, (readout_mode - position) % total) >= 3]
-    second_mode = max(apart, key=lambda position: census[position]) if apart else readout_mode
-    separation = (second_mode - readout_mode) % total
+             if min(position % total, (-position) % total) >= radius]
+    mode = max(apart, key=lambda position: census[position]) if apart else 0
+    # counted over the mode and its neighbours, since the family spreads across two or three whole
+    # positions as the drift walks it: on ischemia_179 its 12 switches sit at +8, +9 and +10, and the
+    # strongest single position holds only 5 of them
+    population = int(sum(census[(mode + offset) % total] for offset in (-1, 0, 1)))
+    # believed only when enough switches sit there. On cirrhrat_43_1 the census is flat, because that
+    # readout is too smeared for a per switch argmax to mean anything, and a separation read off noise
+    # would then decide which echo switch 0 peaked on. The sequence's own spacing is the fallback, and
+    # the report says which was used
+    trusted = population >= max(6, nswitch // 8)
+    if trusted:
+        separation = float((mode + total / 2) % total - total / 2)
+    else:
+        separation = float(fallback_separation if fallback_separation else total / 2)
 
-    # which family each switch fell in, by whichever mode its peak sits nearer to
-    to_readout = np.abs((residual - readout_mode + total / 2) % total - total / 2)
-    to_second = np.abs((residual - second_mode + total / 2) % total - total / 2)
-    on_readout = int((to_readout <= to_second).sum())
+    # each switch to whichever line is nearer, so every one lands in a family
+    to_readout = np.abs(residual)
+    to_second = np.abs((residual - separation + total / 2) % total - total / 2)
+    readout_family = to_readout <= to_second
+    on_readout = int(readout_family.sum())
 
-    # refit by folding on the separation, which merges the two families into one population: a peak
-    # from either echo then constrains the same line
-    fold = separation or total
+    # the slope the peaks alone say, with the or-condition: a switch counts when it sits within a
+    # sample of either line, so switches that peaked on the rephasing echo constrain it too
     candidates = np.arange(-DRIFT_SLOPE_LIMIT, DRIFT_SLOPE_LIMIT + DRIFT_FINE_STEP / 2,
                            DRIFT_FINE_STEP)
-    concentration = [abs(np.exp(1j * 2 * np.pi * ((peaks - candidate * switches) % fold) / fold).mean())
-                     for candidate in candidates]
-    best = int(np.argmax(concentration))
-    return dict(peaks=peaks, census=census, readout_mode=readout_mode, second_mode=second_mode,
-                separation=int(separation), on_readout=on_readout,
-                on_second=nswitch - on_readout, fold=fold,
-                fitted_slope=float(candidates[best]), concentration=float(concentration[best]))
+    inliers = []
+    for candidate in candidates:
+        offset = (peaks - anchor - candidate * switches + total / 2) % total - total / 2
+        near_readout = np.abs(offset) <= 1
+        near_second = np.abs((offset - separation + total / 2) % total - total / 2) <= 1
+        inliers.append(int((near_readout | near_second).sum()))
+    best = int(np.argmax(inliers))
+    return dict(peaks=peaks, anchor=int(anchor), separation=separation, measured=bool(trusted),
+                population=population, readout_family=readout_family, on_readout=on_readout,
+                on_second=nswitch - on_readout,
+                fitted_slope=float(candidates[best]), inliers=int(inliers[best]))
 
 
 def rephasing_peak(profile: np.ndarray, readout: int, gap: int) -> Tuple[int, float]:
@@ -746,26 +778,48 @@ def echo_alignment(mrs_list: Sequence[MRSdata], slope: Optional[float] = None) -
     straightened = roll_switches(cube, shifts)
     aligned, sharpness = aligned_echo_position(straightened)
 
+    # the two echoes as the data shows them, read in the de-drifted frame the constant is added in.
+    # The sequence's own spacing goes in as the fallback for a readout too smeared to measure one
     positions = expected_echo_positions(reference)
     expected, expected_rephasing = positions if positions else (None, None)
-    # reduced the short way round the switch, since a position is cyclic within one: moving an echo
-    # from 18 to 2 of 20 is 4 samples later, not 16 earlier
-    constant = int((expected - aligned + total // 2) % total - total // 2) if expected is not None else 0
+    by_sequence = (expected_rephasing - expected) if positions else None
+    signal = np.abs(straightened).sum(axis=(2, 3))
+    families = peak_families(signal, 0.0, fallback_separation=by_sequence)
+    separation = families['separation']
+
+    # switch 0 is the anchor: the signal decays along the train, so the first switch is the most
+    # reliable reading of where the echo is, and the drift is linear from it. But switch 0 peaks on
+    # whichever of its two echoes was brighter, and on cirrhrat_43_1 that is the rephasing one - its
+    # peak reads 17 where its neighbours read 3, 4, 5 - so which echo it landed on is decided against
+    # the pooled profile before the anchor is believed, and the separation backed out when it was the
+    # second. Anchoring on it blindly would move that scan's readout echo to position 1 of 28
+    anchor = int(families['anchor'])
+    to_readout = abs((anchor - aligned + total / 2) % total - total / 2)
+    to_second = abs((anchor - aligned - separation + total / 2) % total - total / 2)
+    anchor_on_readout = to_readout <= to_second
+    if not anchor_on_readout:
+        anchor = int(round(anchor - separation)) % total
+
+    # measured from switch 0 rather than from the pooled profile, so the switch carrying the most
+    # signal is the one that lands exactly where the sequence says. Reduced the short way round the
+    # switch, since a position is cyclic within one: moving an echo from 18 to 2 of 20 is 4 samples
+    # later, not 16 earlier
+    constant = int((expected - anchor + total // 2) % total - total // 2) if expected is not None else 0
     shifts = shifts + constant
 
-    # the two echoes as the data shows them. Read off the readout as acquired, with the applied slope
-    # taken out of the residuals rather than out of the samples: that is what makes the two families
-    # separate into two modes, and it leaves the slope this refits an estimate from the peaks alone
-    # rather than one the correction has already been baked into
+    # the same families read off the readout as acquired, with the applied slope taken out of the
+    # residuals rather than out of the samples: that leaves the slope this refits an estimate from the
+    # peaks alone rather than one the correction has already been baked into
+    raw_families = peak_families(np.abs(cube).sum(axis=(2, 3)), applied,
+                                 fallback_separation=by_sequence)
     corrected = roll_switches(cube, shifts) if constant else straightened
-    families = peak_families(np.abs(cube).sum(axis=(2, 3)), applied)
     rephasing, rephasing_amplitude = (rephasing_peak(spectral_peak(corrected)[0],
-                                                     (aligned + constant) % total,
-                                                     max((expected_rephasing - expected) // 2, 1))
+                                                     (anchor + constant) % total,
+                                                     max(int(round(abs(separation) / 2)), 1))
                                       if expected is not None else (None, 0.0))
 
     discard_pre = (total - kept) // 2
-    landed = (aligned + constant) % total
+    landed = (anchor + constant) % total
     # judged against the window the sequence samples where there is one, since that is where the echo
     # was meant to land; a conversion's centred window is the fallback and the --pad above is the gap
     window = sequence_window(reference)
@@ -774,8 +828,10 @@ def echo_alignment(mrs_list: Sequence[MRSdata], slope: Optional[float] = None) -
                 applied=applied, given=given,
                 expected=expected, expected_rephasing=expected_rephasing,
                 aligned=aligned, sharpness=sharpness, constant=constant,
+                anchor=anchor, anchor_on_readout=bool(anchor_on_readout), separation=separation,
+                separation_measured=bool(families['measured']),
                 rephasing=rephasing, rephasing_amplitude=rephasing_amplitude,
-                families=families, window=window, window_start=window_start,
+                families=raw_families, window=window, window_start=window_start,
                 landed=landed, discard_pre=discard_pre,
                 inside=bool(((landed - window_start) % total) < kept),
                 sequence_name=reference.sequence_name, tramp=reference.tramp,
@@ -808,10 +864,19 @@ def shift_report(alignment: dict, label: str = "") -> None:
         print(f"  applying {alignment['applied']:+.4f} per switch as asked for, where the search "
               f"measured {drift['slope']:+.4f}")
     # the same train read a second way: peaks per switch, sorted into the two echoes a switch holds
+    how = ("measured" if alignment['separation_measured']
+           else "too smeared to measure, taken from the sequence")
     print(f"  per switch peaks: {families['on_readout']} of {nswitch} on the readout echo and "
-          f"{families['on_second']} on the second, {families['separation']} positions apart, which "
-          f"refits a slope of {families['fitted_slope']:+.4f} (concentration "
-          f"{families['concentration']:.2f}) against the {alignment['applied']:+.4f} applied")
+          f"{families['on_second']} on the second, {alignment['separation']:+.0f} positions apart "
+          f"({how}), which refits a slope of {families['fitted_slope']:+.4f} "
+          f"({families['inliers']} of {nswitch} switches within a sample) against the "
+          f"{alignment['applied']:+.4f} applied")
+    # what the constant below is measured from: switch 0, which carries the most signal of any switch
+    landed_on = 'the readout echo' if alignment['anchor_on_readout'] else 'the rephasing echo'
+    print(f"  switch 0 peaks on {landed_on}, so the readout echo of switch 0 sits at "
+          f"{alignment['anchor']} once the drift is out"
+          + ('' if alignment['anchor_on_readout']
+             else f", backed out by the {alignment['separation']:.1f} between the two"))
     if alignment['window']:
         start, end = alignment['window']
         pad = alignment['discard_pre'] - start
@@ -824,8 +889,9 @@ def shift_report(alignment: dict, label: str = "") -> None:
     else:
         ramp_us = alignment['sample_period'] / 10.0
         print(f"  the sequence puts the echo at {expected} = tramp {alignment['tramp']}us / "
-              f"{ramp_us:.0f}us sample period + {kept}/2, and it measures at "
-              f"{alignment['aligned']} with peak/median {alignment['sharpness']:.2f}")
+              f"{ramp_us:.0f}us sample period + {kept}/2, against the {alignment['anchor']} switch 0 "
+              f"reads (the pooled profile agrees at {alignment['aligned']}, peak/median "
+              f"{alignment['sharpness']:.2f})")
         start = alignment['window_start']
         print(f"  so the whole readout moves {alignment['constant']:+d}, landing the echo at "
               f"{alignment['landed']}, {'inside' if alignment['inside'] else 'OUTSIDE'} the "
