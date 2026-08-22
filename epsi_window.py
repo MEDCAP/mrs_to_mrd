@@ -34,6 +34,7 @@ import numpy as np
 import mrs_organize
 from MRSreader import MRSdata
 from MRStomrd2 import is_epsi, switch_layout
+from mrs_organize import ScanGroup
 from mrs_tar import read_scan_tar
 
 
@@ -53,6 +54,133 @@ DRIFT_MIN_GAIN = 1.5
 # peak over median the corrected profile has to reach, so that a large ratio on a scan that had no
 # echo to sharpen either way is refused rather than acted on
 DRIFT_MIN_SNR = 5.0
+
+
+def check_peak_position(scan_groups: ScanGroup) -> int:
+    """
+    Plot where the two echoes of a gradient switch sit, one figure per data file of one scan.
+
+    A switch carries two crossings of k-space centre, the readout echo on the gradient plateau and
+    the rephasing echo after it, and this looks for both in every switch rather than for the
+    brightest position and then which of the two it was. That is the difference from peak_families:
+    with two peaks in hand nothing has to be classified, and a switch where the rephasing echo came
+    out brighter says the same thing as one where the readout echo did.
+
+    One figure per file, never pooled, because pooling is what hides a file whose echo sits somewhere
+    the others' does not - and the repetitions inside one file are aggregated for the opposite reason,
+    since one repetition of one view is mostly noise
+    Args:
+        - scan_groups: the scan to walk, from mrs_organize. Only its real data is read; the averaged
+          prescan beside it calibrates a reconstruction rather than being reconstructed
+    Returns:
+        - how many files were plotted
+    """
+    plotted = 0
+    for filepath in scan_groups.rawdata_file_list:
+        mrs = MRSdata()
+        mrs.read_from_file(filepath)
+        if not is_epsi(mrs):
+            print(f"Skipping {filepath}: {mrs.sequence_name or 'unknown sequence'} is not an EPSI "
+                  f"readout, so it has no gradient switches to find echoes in", file=sys.stderr)
+            continue
+        if mrs.rawdata is None or mrs.rawdata.size == 0:
+            print(f"Skipping {filepath}: no raw data was read", file=sys.stderr)
+            continue
+        nswitch, total, _ = switch_layout(mrs)
+
+        # aggregate each file across repetition: magnitude summed over every axis but the samples
+        # one, which folds in the views, the slices, the echoes and the repetitions - for finding an
+        # echo they are all just repeats of the same readout
+        aggregated = np.abs(mrs.rawdata).sum(axis=tuple(range(1, mrs.rawdata.ndim)))
+
+        # reshape the rawdata array into (nsamples/nswitches, nswitches). The split itself is
+        # (nswitches, nsamples/nswitches): samples are acquired switch-major, s = iswitch * total + p,
+        # so reshaping straight into (total, nswitch) would read the switch index as the fast axis and
+        # scramble the readout. The transpose is what puts the position within a switch first. Samples
+        # past the last whole switch are dropped, the same truncation switch_cube applies
+        per_switch_rawdata = aggregated[:nswitch * total].reshape(nswitch, total).T
+
+        # identify two echo peaks and plot their position. The name goes out first, since the figure
+        # itself carries only the data it was given and a scan of one repetition per file draws a
+        # dozen of them in a row
+        print(f"\n{filepath}: {nswitch} switches of {total} positions, "
+              f"{mrs.nrepetitions} repetition(s) aggregated")
+        if plot_echo_position(per_switch_rawdata):
+            plotted += 1
+    return plotted
+
+
+def plot_echo_position(per_switch_rawdata: np.ndarray) -> bool:
+    """
+    Find both echoes in every switch and draw where they sit along the train.
+
+    per_switch_rawdata is aggregated data of shape (nsamples/nswitches, nswitches), i.e. position
+    within a switch first and the switch index second, as check_peak_position builds it.
+
+    The first peak of a switch is simply its brightest position. The second is the brightest one at
+    least a quarter of a switch away, which is far enough that the answer cannot be the flank of the
+    first: the two echoes sit 9 to 14 positions apart on the data this was written against, against a
+    peak two or three positions wide. Neither is assumed to be the readout echo - a switch peaks on
+    whichever of its two was brighter, and both trajectories are drawn as found.
+
+    The second peak's height, as a fraction of its own switch's peak, is what says whether it is a
+    real echo: it runs about a third to a half on a readout that has two, and close to one on a
+    profile too smeared to have two of anything, where "the strongest position a quarter switch away"
+    is just the far side of one broad hump
+    Args:
+        - per_switch_rawdata: (position within a switch, switch), magnitude
+    Returns:
+        - True when a figure was drawn, False for an array that could not be read
+    """
+    # imported here rather than at module scope, so reporting needs no plotting stack unless plotted
+    import matplotlib.pyplot as plt
+
+    if per_switch_rawdata.ndim != 2 or not per_switch_rawdata.size:
+        print(f"  cannot read {per_switch_rawdata.shape} as (position, switch)", file=sys.stderr)
+        return False
+    total, nswitch = per_switch_rawdata.shape
+    if not np.any(per_switch_rawdata):
+        print(f"  every position of every switch is zero, so there is no echo to find",
+              file=sys.stderr)
+        return False
+
+    gap = max(1, total // 4)
+    first = np.argmax(per_switch_rawdata, axis=0)
+    second = np.zeros(nswitch, dtype=int)
+    height = np.zeros(nswitch)
+    for iswitch in range(nswitch):
+        # the same exclusion rephasing_peak makes on a pooled profile, one switch at a time
+        second[iswitch], height[iswitch] = rephasing_peak(per_switch_rawdata[:, iswitch],
+                                                          int(first[iswitch]), gap)
+    # measured the short way round, since a position is cyclic within a switch: the pair (18, 2) of 20
+    # is 4 apart, not 16
+    apart = np.abs((second - first + total / 2) % total - total / 2)
+    switches = np.arange(nswitch)
+
+    print(f"  first peak visits {int(first.min())}..{int(first.max())}, at {int(first[0])} in switch "
+          f"0 and {int(first[-1])} in switch {nswitch - 1}")
+    print(f"  second peak visits {int(second.min())}..{int(second.max())}, at {int(second[0])} and "
+          f"{int(second[-1])}, a median {np.median(apart):.0f} positions from the first at "
+          f"{np.median(height):.2f} of its height")
+
+    figure, axes = plt.subplots(figsize=(9, 7))
+    axes.imshow(per_switch_rawdata.T, aspect='auto', origin='lower', interpolation='nearest',
+                extent=(-0.5, total - 0.5, -0.5, nswitch - 0.5))
+    axes.plot(first, switches, 'x', color='C3', ms=6, label='brightest position')
+    axes.plot(second, switches, '+', color='C1', ms=7,
+              label=f"brightest {gap}+ positions away, median {np.median(height):.2f} of it")
+    axes.set_xlabel(f"position within the {total} point switch")
+    axes.set_ylabel("switch")
+    axes.set_title(f"two echoes per switch, a median {np.median(apart):.0f} positions apart")
+    axes.legend(fontsize=8, loc='upper right')
+    figure.colorbar(axes.images[0], ax=axes, label='signal aggregated over views and repetitions')
+    figure.tight_layout()
+    plt.show()
+    # released once shown, because a scan of one repetition per file draws one of these per file and
+    # 27 of them left open is what matplotlib warns about
+    plt.close(figure)
+    return True
+
 
 
 # ---------- finding the EPSI readout sampling window ----------------------------------------
