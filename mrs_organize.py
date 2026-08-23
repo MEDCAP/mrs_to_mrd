@@ -68,6 +68,21 @@ contrast and no list of those names stays complete.
 Only -i names a lone file with no folder to take, and then the path is walked up past the scan id
 the scanner always writes. If nothing above it names the experiment, use the tar filename
 
+Why a tar is one of the inputs:
+Tyger hands a job its input buffer as a named FIFO, which is strictly sequential - lseek() on it
+returns ESPIPE. That rules out the three filesystem lookups the folder walk relies on: the .SPR
+sidecar found beside the data, the directory names meas_id is derived from, and the grouping of the
+files belonging to one experiment. Wrapping the experiment directory in a tar puts all three into a
+single sequential stream:
+
+    tar cf - -C /data cirrhrat_0_1 | tyger buffer write $input_buffer
+
+read_scan_tar drains that stream and organize_members groups what comes out of it, the same way
+collect_mrd_paths and group_experiment do for a folder, so a tar and a folder holding the same
+experiment convert to the same stream. That is why the two live here together rather than the
+reading sitting in a module of its own: the tar's member names are paths like any other, and the
+root that names the experiment, the ._ shadows to drop and the grouping are all already here.
+
 The stream is named for what it holds:
     <experiment>_<sequence>_prescan.mrd2    every file in the group is an averaged prescan
     <experiment>_<sequence>_combined.mrd2   more than one file converted into one acquisition
@@ -80,13 +95,15 @@ import argparse
 import os
 import re
 import sys
+import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import BinaryIO, Callable, List, Optional, Sequence, Tuple
 
 from MRSreader import MRSdata
 
 MRD_SUFFIX = ".MRD"
+SPR_SUFFIX = ".SPR"
 OUTPUT_SUFFIX = ".mrd2"
 
 # the dimensions that have to agree for two files to be repetitions of one acquisition. Ordered as
@@ -505,6 +522,56 @@ def organize_folder(root, meas_id_override: str = "", quiet: bool = True) -> Opt
                              meas_id_override=meas_id_override)
     print(f"Grouped {len(paths)} files into {describe_group(group)}", file=sys.stderr)
     return group
+
+
+def read_scan_tar(stream: BinaryIO) -> Tuple[str, int, List[Tuple[str, bytes]]]:
+    """
+    Drain a tar stream holding one experiment and return its contents in memory.
+
+    Everything is buffered because none of it can be acted on incrementally: the MR Solutions
+    format appends its ASCII parameter block after the data at EOF, the .SPR sidecar may follow the
+    .MRD members in tar order and streaming mode cannot rewind to it, and the header needs the
+    repetition count across every file in the group before the first acquisition can be written.
+
+    Args:
+        - stream: readable binary stream positioned at the start of a tar archive. May be
+                  non-seekable (a FIFO, a socket, sys.stdin.buffer)
+    Returns:
+        - meas_id: the experiment directory name, as tar_root reads it off the member paths. Empty
+                   when the archive shares no single root directory, in which case the caller has
+                   to supply a name instead
+        - basefreq: base frequency in Hz from the .SPR sidecar, or 0 if the archive carries none
+        - members: (member_name, file_bytes) for each .MRD member, sorted by member name, ready to
+                   hand to organize_members
+    """
+    mrd_members: List[Tuple[str, bytes]] = []
+    basefreq = 0
+
+    # 'r|*' is tarfile's stream mode: it reads strictly forward and never seeks, unlike 'r'/'r:*'
+    # which probe the file and fail on a FIFO with "OSError: [Errno 29] Illegal seek".
+    with tarfile.open(fileobj=stream, mode="r|*") as tar:
+        for member in tar:
+            if not member.isfile() or _is_junk(member.name):
+                continue
+            payload = tar.extractfile(member)   # valid only until the next iteration in stream mode
+            if payload is None:
+                continue
+            if member.name.endswith(SPR_SUFFIX):
+                freq = MRSdata.parse_spr(payload.read())
+                if freq:                        # keep an earlier hit if this SPR has no FREQ entry
+                    basefreq = freq
+            elif member.name.endswith(MRD_SUFFIX):
+                mrd_members.append((member.name, payload.read()))
+
+    if not mrd_members:
+        raise ValueError(f"input tar contains no *{MRD_SUFFIX} members")
+
+    # Member order in a tar is filesystem order and is not guaranteed. The position of a file in
+    # this list becomes its acquisition repetition index, so sort it explicitly. Scan filenames are
+    # zero padded (12345_000_0.MRD, 12345_001_0.MRD) so lexical order is acquisition order.
+    mrd_members.sort(key=lambda item: item[0])
+
+    return tar_root([name for name, _ in mrd_members]), basefreq, mrd_members
 
 
 def organize_members(members: Sequence[Tuple[str, bytes]],

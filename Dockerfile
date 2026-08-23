@@ -29,7 +29,7 @@ RUN apt-get update \
     && apt-get purge -y --auto-remove git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY MRSreader.py MRStomrd2.py mrs_tar.py ./
+COPY MRSreader.py MRStomrd2.py mrs_organize.py ./
 
 FROM base AS epsi
 COPY tyger_convert_epsi.py ./

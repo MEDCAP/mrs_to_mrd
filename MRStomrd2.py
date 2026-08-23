@@ -60,8 +60,7 @@ import numpy as np
 import mrd
 import mrs_organize
 from MRSreader import MRSdata
-from mrs_organize import ScanGroup, is_prescan
-from mrs_tar import read_scan_tar
+from mrs_organize import ScanGroup, is_prescan, read_scan_tar
 
 
 def is_epsi(mrs: MRSdata) -> bool:
