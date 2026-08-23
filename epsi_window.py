@@ -34,8 +34,7 @@ import numpy as np
 import mrs_organize
 from MRSreader import MRSdata
 from MRStomrd2 import is_epsi, switch_layout
-from mrs_organize import ScanGroup
-from mrs_tar import read_scan_tar
+from mrs_organize import ScanGroup, read_scan_tar
 
 
 # How wide a drift the search covers, in samples per switch. The kidney data runs from -0.03 on the
