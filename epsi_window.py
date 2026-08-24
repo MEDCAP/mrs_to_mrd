@@ -109,6 +109,59 @@ def check_peak_position(scan_groups: ScanGroup) -> int:
     return plotted
 
 
+def fit_first_peak(signal: np.ndarray, tolerance: float = 1.0) -> dict:
+    """
+    Fit a straight line through the first echo's position along the switch train.
+
+    The brightest position of a switch is whichever of its two echoes won, so a least squares fit
+    through every switch is dragged off the line by the ones that peaked on the second: on
+    ischemia_179 that reads +0.113 positions per switch where the drift search reads +0.232, and on
+    cirrhrat_43_1 it leaves not one switch of 64 within a position of its own line.
+
+    So the switches that did not peak on the first echo are left out and the line is fitted through
+    the rest, then evaluated at every switch - which is what puts a position on the ones that were
+    dropped. peak_families supplies the coarse line to select against, since it already searches the
+    slope cyclically and anchors on switch 0; this refits it by least squares through the inliers
+    alone, on positions unwrapped about that line so a train crossing the switch boundary still fits
+
+    Which family the line follows is switch 0's and nothing else: on cirrhrat_43_1 switch 0 peaks on
+    the rephasing echo, so the line rides that one and the readout switches are the outliers. The
+    slope is right either way, since the two families are parallel and only the offset differs - a
+    kept count near half the train is what says the line took the second echo
+    Args:
+        - signal: (switch, position within a switch) magnitude
+        - tolerance: how far off the coarse line a switch may peak and still be fitted through, in
+          positions. The same one position peak_families counts an inlier at
+    Returns:
+        - dict of the per switch peaks, which switches were fitted through, the slope and intercept,
+          and the pixel the line lands on in each switch
+    """
+    nswitch, total = signal.shape
+    switches = np.arange(nswitch)
+    families = peak_families(signal, 0.0)
+    peaks, anchor, coarse = families['peaks'], families['anchor'], families['fitted_slope']
+
+    # distance from the coarse line, the short way round the switch, since a position is cyclic
+    # within one: a peak at 19 of 20 against a line at 0 is 1 away, not 19
+    offset = (peaks - anchor - coarse * switches + total / 2) % total - total / 2
+    fitted_through = np.abs(offset) <= tolerance
+    # the peaks unwrapped about the coarse line, so the fit sees a straight train rather than one
+    # that jumps by `total` wherever it crosses the switch boundary
+    unwrapped = anchor + coarse * switches + offset
+
+    if int(fitted_through.sum()) >= 2:
+        slope, intercept = np.polyfit(switches[fitted_through], unwrapped[fitted_through], 1)
+    else:
+        # nothing to fit through, so the coarse line stands rather than a fit through one point
+        slope, intercept = coarse, float(anchor)
+
+    # evaluated at every switch, including the ones left out: that is what lands a position on a
+    # switch whose own peak was the second echo
+    return dict(peaks=peaks, fitted_through=fitted_through,
+                slope=float(slope), intercept=float(intercept),
+                pixel=np.rint(intercept + slope * switches).astype(int) % total)
+
+
 def plot_echo_position(per_switch_rawdata: np.ndarray) -> bool:
     """
     Find both echoes in every switch and draw where they sit along the train.
@@ -162,10 +215,20 @@ def plot_echo_position(per_switch_rawdata: np.ndarray) -> bool:
           f"{int(second[-1])}, a median {np.median(apart):.0f} positions from the first at "
           f"{np.median(height):.2f} of its height")
 
+    # transposed, since the fit reads a switch per row where this function holds a position per row
+    fit = fit_first_peak(per_switch_rawdata.T)
+    kept = int(fit['fitted_through'].sum())
+    print(f"  the first peak fits {fit['slope']:+.4f} positions per switch through {kept} of "
+          f"{nswitch} switches, the other {nswitch - kept} peaking off that line")
+
     figure, axes = plt.subplots(figsize=(9, 7))
     axes.imshow(per_switch_rawdata.T, aspect='auto', origin='lower', interpolation='nearest',
                 extent=(-0.5, total - 0.5, -0.5, nswitch - 0.5))
     axes.plot(first, switches, 'x', color='C3', ms=6, label='brightest position')
+    # drawn as markers rather than a joined line, because the fit wraps round the switch and
+    # joining it up would streak straight across the figure at every crossing
+    axes.plot(fit['pixel'], switches, 's', color='c', ms=5, mfc='none',
+              label=f"first peak fit, {fit['slope']:+.3f} per switch through {kept} switches")
     axes.plot(second, switches, '+', color='C1', ms=7,
               label=f"brightest {gap}+ positions away, median {np.median(height):.2f} of it")
     axes.set_xlabel(f"position within the {total} point switch")
