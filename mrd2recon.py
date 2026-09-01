@@ -1,5 +1,5 @@
 """
-Reconstruct a converted .mrd2 file into spectra, Lorentzian peak fits and metabolite maps.
+Reconstruct a converted EPSI .mrd2 file into Lorentzian peak fits and metabolite maps.
 
 tyger args:
     - python mrd2recon.py
@@ -8,15 +8,10 @@ tyger args:
     - -o
     - $(OUTPUT_PIPE)
 
-Across multiple converted .mrd2 files to reconstruct, have multiple jobs.
+local run python mrd2recon.py -f {folderpath of data}
 
 With --folder, every .mrd2 that is not itself a _recon.mrd2 is reconstructed to <name>_recon.mrd2
-beside it. MRStomrd2 names what it converts <meas_id>_<sequence>.mrd2, so a directory can hold more
-than one scan and there is no single filename to look for.
-
-Which reconstruction runs is decided by the sequence, via mrs_organize.sequence_family, not by a
-command line flag. Peaks are specified the way the legacy recon specified them, as a name with
-optional modifiers followed by a chemical shift in ppm:
+beside it. 
 
     python mrd2recon.py -i raw.mrd2 -o recon.mrd2 \
         -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
@@ -26,14 +21,11 @@ optional modifiers followed by a chemical shift in ppm:
     _m  a derived metabolite
 
 Everything the reconstruction produces is written to the output stream as mrd NdArrays, and the
-raw acquisitions are passed through unchanged. Nothing is plotted and nothing is written outside
-the output file; use mrdplot.py to look at the result.
-
-Requires the mrd python package on the `dev` branch of mrd-fork, which is where the NdArray
-types live.
+raw acquisitions are passed through unchanged.
 """
 
 import argparse
+import itertools
 import math
 import os
 import sys
@@ -46,28 +38,14 @@ import numpy as np
 import mrd
 
 from lorentzian_fitter import LorentzianFitter, candidate_centers, estimate_width_fwhm
-from mrs_organize import sequence_family
 from svd_denoise import denoise_svd
 
-# a voxel spectrum is fitted only if it rises this far above the estimated noise floor
+# a voxel spectrum is fitted only if above the estimated noise floor
 NOISE_THRESHOLD_MULTIPLIER = 3.0
 # how far a voxel spectrum may be rolled when aligning it against the reference spectrum
 PHASE_SEARCH_RANGE = 15
 # spectral zero fill factor; 1 means the spectral axis is exactly one point per echo
 FIDPAD = 1
-
-# Where each echo of an EPSI readout starts. A gradient switch holds more points than the sequence
-# keeps, the extras being the ramps either side of the flat top, and only the flat top carries the
-# uniform kx spacing the transform assumes. discard_pre drops points as though the ramp were split
-# evenly across both ends, which it is not, so the window is addressed as a pad back from it: echo i
-# starts at i * totalppswitch + discard_pre - pad. MRStomrd2 records the ramp time as the 'tramp'
-# user parameter in us, and the ramp is what the pad is derived from; a file converted before that
-# was recorded falls back to this constant, i.e. to discard_pre exactly as the sequence set it
-EPSIGRE_DEFAULT_PAD = 0
-# leading samples of a readout to replace with zero, for a sequence whose first points are unusable
-# for a reason the ramp time does not account for. Only the first echo can reach samples this early
-EPSIGRE_ZERO_LEAD = 13
-
 
 # ---------- peak specification -------------------------------------------
 
@@ -645,9 +623,12 @@ def reconstruct_phantom(path: Path, line_broadening: float, wigglefactor: float,
     """
     Reconstruct a separately converted phantom scan and fit it.
 
-    The phantom is named explicitly on the command line rather than detected in the stream: the
-    converter deliberately does not mark acquisitions as phantom data, since whether a scan is
-    calibration is a question about the scan and not about its acquisitions.
+    The phantom is still named explicitly on the command line rather than detected here. Phantom
+    acquisitions do carry IS_NAVIGATION_DATA now, but this function reads every acquisition in the
+    file it's given as phantom data - it doesn't filter on the flag, so it only works pointed at a
+    file that is entirely phantom. The common case, a phantom alongside the data it calibrates,
+    converts into one merged stream (mrs_organize only writes a phantom-only file when every scan in
+    a group is one), which this function does not unpack.
     """
     with open(path, "rb") as stream:
         with mrd.BinaryMrdReader(stream) as reader:
@@ -930,6 +911,17 @@ def acquisition_reader(input: Iterable[mrd.StreamItem]) -> Iterable[mrd.Acquisit
             yield item.value
 
 
+def is_epsi_acquisition(acq: mrd.Acquisition) -> bool:
+    """
+    Whether an acquisition records an EPSI switch layout, the same generic, header-agnostic signal
+    MRStomrd2 decides from (mrs.nswitch) rather than the sequence name, read from the other side:
+    the converter only ever populates user_int with [nswitch, totalppswitch] for an EPSI readout, so
+    a valid pair here means the same thing switch_layout()'s own guard checks a few lines later
+    """
+    user_int = list(acq.head.user_int or [])
+    return len(user_int) >= 2 and int(user_int[0]) > 0
+
+
 def reconstruct_mrs(input: BinaryIO,
                     output: BinaryIO,
                     *,
@@ -942,11 +934,10 @@ def reconstruct_mrs(input: BinaryIO,
                     phantom_map: np.ndarray = None,
                     pad: Optional[int] = None,
                     zero_lead: Optional[int] = None) -> None:
-    """Reconstruct one converted file, choosing the reconstruction from its sequence."""
+    """Reconstruct one converted file, choosing the reconstruction from its acquisitions."""
     with mrd.BinaryMrdReader(input) as reader:
         with mrd.BinaryMrdWriter(output) as writer:
             header = reader.read_header()
-            family = sequence_family(header.measurement_information.sequence_name)
             append_recon_header(header,
                                 line_broadening=line_broadening,
                                 spec=spec,
@@ -955,7 +946,10 @@ def reconstruct_mrs(input: BinaryIO,
                                 phantom_scaling=phantom_scaling)
             writer.write_header(header)
             acquisitions = acquisition_reader(reader.read_data())
-            if family == "epsi":
+            first = next(acquisitions, None)
+            epsi = first is not None and is_epsi_acquisition(first)
+            acquisitions = itertools.chain([first], acquisitions) if first is not None else iter(())
+            if epsi:
                 writer.write_data(
                     reconstruct_epsi(header, acquisitions,
                                      line_broadening=line_broadening,
@@ -968,10 +962,6 @@ def reconstruct_mrs(input: BinaryIO,
                                      pad=pad,
                                      zero_lead=zero_lead))
             else:
-                if family != "spectral":
-                    print(f"Unrecognized sequence "
-                          f"'{header.measurement_information.sequence_name}', "
-                          f"reconstructing it as a single voxel FID series", file=sys.stderr)
                 writer.write_data(
                     reconstruct_spectral(header, acquisitions,
                                          line_broadening=line_broadening,
@@ -989,13 +979,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-lb", "--line-broadening", type=float, default=42, required=False, help="Line broadening factor in Hz")
     parser.add_argument("-d", "--denoise", action="store_true", help="Apply truncated-SVD denoising before the transform")
     parser.add_argument("-r", "--rank", type=int, default=None, required=False, help="Number of singular values to retain (default: auto via Gavish-Donoho)")
-    parser.add_argument("-w", "--wigglefactor", type=float, default=1.0, required=False, help="How far peak centers may move from their specified offsets, in ppm")
-    parser.add_argument("--phantom", type=Path, default=None, required=False, help="A separately converted phantom .mrd2 to fit for the scaling it provides")
-    parser.add_argument("--skip-initial-reps", type=int, default=0, required=False, help="Repetitions to leave out of the per-voxel fits")
-    parser.add_argument("--pad", type=int, default=None, required=False, help="EPSI sampling window, as samples back from discard_pre. Default: derived from the recorded ramp time, use MRSreader.py -w to check it against the data")
-    parser.add_argument("--zero-lead", type=int, default=None, required=False, help="Leading samples of each readout to read as zero, overriding the sequence's own default")
     return parser
-
 
 if __name__ == "__main__":
     parser = build_parser()
