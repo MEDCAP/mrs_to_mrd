@@ -139,7 +139,6 @@ def check_peak_position(scan_groups: ScanGroup) -> bool:
     plot_sample_window(drift_corrected_rawdata, ramp_points, npoints_per_switch, mrs.nswitches) 
     return True
 
-
 def plot_sample_window(rawdata: np.ndarray, ramp_points: int, npoints_per_switch: int, nswitches: int) -> bool:
     """
     Plot rawdata sample points across switches and overlay the actual sampling window
@@ -162,7 +161,8 @@ def plot_sample_window(rawdata: np.ndarray, ramp_points: int, npoints_per_switch
                  label=f'sample window of {npoints_per_switch} readout')
     # echo should happen at the middle of npoints_per_switch e.g.) 12points_per_switch->echo at idx7 
     expected_echo_position = ramp_points + (npoints_per_switch // 2)
-    axes.axvline(x=expected_echo_position, color='b', linestyle='--', label='expected echo position')
+    axes.axvspan(expected_echo_position-1, expected_echo_position, color='r', alpha=0.3, 
+                 label='expected echo position')
     axes.set_xlabel(f"position within the {npoints_per_switch + 4 * ramp_points} point switch")
     axes.set_ylabel("switch")
     axes.legend(fontsize=8, loc='upper right')
@@ -173,29 +173,21 @@ def plot_sample_window(rawdata: np.ndarray, ramp_points: int, npoints_per_switch
     return True
 
 
-# ---------- finding the EPSI readout sampling window ----------------------------------------
-
-
-def switch_cube(mrs: MRSdata) -> np.ndarray:
+def read_mrd_acq(input_file: BinaryIO, output_file: BinaryIO):
     """
-    The readout laid out as (switch, position in switch, view, everything else).
-
-    The sample axis comes first in rawdata, so splitting it in C order is exactlMy the switch-major
-    order the samples were acquired in. The slice, sliceview and echo axes are single valued in an
-    EPSI scan and are folded in with the repetitions, since for every purpose here they are all just
-    repeats. Samples past the last whole switch are dropped, which is the same truncation the
-    conversion applies when nsamples does not divide by the switch count
-    Args:
-        - mrs: one parsed MRS file, read rather than probed
-    Returns:
-        - (nswitch, total, nviews, repeats) view of the raw data
-    Raises:
-        - ValueError when called on a file whose data block was never read
+    Read a mrd file acquisition field, correct for echo position, and rewrite back a corrected raw file
     """
-    if mrs.rawdata is None:
-        raise ValueError("no data to profile; read_from_file rather than probe_from_file")
-    nswitch, total, _ = switch_layout(mrs)
-    return mrs.rawdata[:nswitch * total].reshape(nswitch, total, mrs.nviews, -1)
+    with mrd.BinaryMrdReader(input_file) as reader:
+        with mrd.BinaryMrdWriter(output_file) as writer:
+            header = reader.read_header()
+            tramp = header.user_parameters.user_parameters_long[0].get('tramp')
+            for item in reader.read_data():
+                if isinstance(item, mrs.StreamItem.Acquisition):
+                    pass
+                else:
+                    continue
+
+
 
 def spectral_peak(cube: np.ndarray, view: Optional[int] = None):
     """
@@ -1139,26 +1131,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Report the EPSI sampling window and echo drift for MR Solutions MRS data")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("-t", "--tar", type=Path,
-                      help="tar archive of one scan directory, or a FIFO carrying one")
     mode.add_argument("-i", "--input", type=Path,
                       help="single MRS .MRD file")
-    mode.add_argument("-f", "--folder", type=Path,
-                      help="directory to walk for MRS .MRD files")
     args = parser.parse_args()
 
-    if args.tar and not args.tar.exists():
-        parser.error(f"{args.tar} does not exist")
     if args.input and not args.input.is_file():
         parser.error(f"{args.input} is not a file")
-    if args.folder and not args.folder.is_dir():
-        parser.error(f"{args.folder} is not a directory")
-
-    reported = report_windows(read_inputs(args))
-    if not reported:
-        print("No EPSI readout to report a sampling window for", file=sys.stderr)
-        return 1
-    print(f"Reported the sampling window of {reported} file(s)", file=sys.stderr)
+    
     return 0
 
 

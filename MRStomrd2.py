@@ -142,9 +142,10 @@ def generate_header(mrs: MRSdata, meas_id: str, rep_count: Optional[int]=None) -
     
     header.experimental_conditions.h1resonance_frequency_hz = mrs.base_frequency
     
-    header.user_parameters = mrd.UserParametersType()
-    header.user_parameters.user_parameter_long.append(
+    user_param = mrd.UserParametersType()
+    user_param.user_parameter_long.append(
             mrd.UserParameterLongType(name="tramp", value=int(mrs.tramp)))
+    header.user_parameters = user_param
 
     encoded_space = mrd.EncodingSpaceType()
     encoded_space.matrix_size = mrd.MatrixSizeType(x=mrs.nsamples, y=mrs.nviews, z=mrs.nsliceviews)
@@ -228,56 +229,6 @@ def convert_folder_to_mrd(folder: Path,
         print(f"No data to convert for {grouped_files.meas_id}", file=sys.stderr)
         return False
 
-    return True
-
-
-def convert_file_to_mrd(input_path: Path, output_path: Optional[Path] = None) -> bool:
-    """
-    Convert a single .MRD file. Spectral fid data arrives this way: one file already holds every
-    repetition on its nex axis, so there is nothing to collect or group, and nothing to offset the
-    repetition numbering against - the file is the whole stream.
-
-    A directory holding that one file converts the same way, since the scanner writes fid data into
-    a directory of its own. More than one file in there is a folder of an experiment rather than a
-    single scan, which is what --folder is for
-    Args:
-        - input_path: the .MRD file, or a directory holding exactly one
-        - output_path: where to write, defaulting to the scan named beside the file it came from
-    Returns:
-        - True when a stream was written
-    """
-    # walks a directory, or returns the file itself when handed one
-    paths = mrs_organize.collect_mrd_paths(input_path)
-    if not paths:
-        print(f"No {mrs_organize.MRD_SUFFIX} file to convert in {input_path}", file=sys.stderr)
-        return False
-    if len(paths) > 1:
-        print(f"{input_path} holds {len(paths)} {mrs_organize.MRD_SUFFIX} files, which is an "
-              f"experiment rather than a single scan: convert it with -f, or point -i at one file",
-              file=sys.stderr)
-        return False
-    filepath = Path(paths[0])
-    mrs = MRSdata()
-    mrs.read_from_file(filepath)
-    # the file is its own group of one, so the repetition count comes from the same place the other
-    # two modes take it from rather than being read straight off this file's axis. It is already
-    # parsed, so the probe hands the group this object rather than reading the file a second time
-    group = mrs_organize.group_experiment([str(filepath)], lambda _: mrs,
-                                          root=str(filepath.parent))
-    rep_count = group.nrepetitions
-    # a lone file sits outside any experiment folder, so it is named for itself rather than for
-    # whichever directory it happens to be in
-    meas_id = filepath.stem
-    destination = output_path or filepath.with_name(
-            f"{mrs_organize.sanitize(meas_id)}_{mrs_organize.sanitize(mrs.sequence_name)}"
-            f"{mrs_organize.OUTPUT_SUFFIX}")
-    print(f"Writing file at {destination}", file=sys.stderr)
-    writer = mrd.BinaryMrdWriter(str(destination))
-    try:
-        writer.write_header(generate_header(mrs, meas_id, rep_count))
-        writer.write_data(generate_acquisition(mrs, 0, rep_count))
-    finally:
-        writer.close()
     return True
 
 
@@ -367,8 +318,6 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("-t", "--tar", type=Path,
                       help="tar archive of one scan directory, or a FIFO carrying one")
-    mode.add_argument("-i", "--input", type=Path,
-                      help="single MRS .MRD file")
     mode.add_argument("-f", "--folder", type=Path,
                       help="directory to walk for MRS .MRD files")
     parser.add_argument("-o", "--output", type=Path,
@@ -384,12 +333,10 @@ def main() -> int:
 
     if args.tar and not args.tar.exists():
         parser.error(f"{args.tar} does not exist")
-    if args.input and not args.input.exists():
-        parser.error(f"{args.input} does not exist")
     if args.folder and not args.folder.is_dir():
         parser.error(f"{args.folder} is not a directory")
     if args.tar and (args.window or args.dry_run):
-        parser.error(f"-t can only used to convert file")
+        parser.error(f"-t can only us to convert file")
 
     if args.folder:
         # convert folder allows
@@ -401,9 +348,6 @@ def main() -> int:
             parser.error("--tar needs --output, or $OUTPUT_PIPE set")
         print(f"Converting tar of single experiment folder {args.tar}", file=sys.stderr)
         written = convert_tar_to_mrd(args.tar, output)
-    else:
-        print(f"Converting single file {args.input}", file=sys.stderr)
-        written = convert_file_to_mrd(args.input, args.output)
     if not written:
         print("Nothing was converted", file=sys.stderr)
         return 1
