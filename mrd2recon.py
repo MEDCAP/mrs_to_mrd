@@ -52,6 +52,14 @@ from svd_denoise import denoise_svd
 NOISE_THRESHOLD_MULTIPLIER = 3.0
 # how far a voxel spectrum may be rolled when aligning it against the reference spectrum
 PHASE_SEARCH_RANGE = 15
+# How far the global fit may move a peak from its rigid-pattern placement, in ppm. The offsets are
+# known chemistry and candidate_centers places the whole pattern from them, so a center is nearly
+# determined before the fit starts. Left unbounded, a tiny peak slides onto a strong neighbour and
+# is fitted as a second component of its line: on a 6 peak kidney series hyd_tm walked 1.2 ppm onto
+# urea, took a third of its amplitude, and cut the residual doing it. This is the window the
+# retired wigglefactor enforced, which is why that option's removal needed replacing rather than
+# simply dropping
+GLOBAL_CENTER_WINDOW = 0.5
 # spectral zero fill factor; 1 means the spectral axis is exactly one point per echo
 FIDPAD = 1
 
@@ -71,8 +79,10 @@ EPSIGRE_ZERO_LEAD = 13
 # retired option whose value parses as a float does not fail, it silently becomes a peak and
 # shifts the fit. These are rejected by name instead
 RETIRED_OPTIONS = {
-    "-w": "peak widths are constrained by -dw, per voxel and in ppm",
-    "--wigglefactor": "peak widths are constrained by -dw, per voxel and in ppm",
+    "-w": "the global fit holds a center inside GLOBAL_CENTER_WINDOW; -dw is the per voxel "
+          "width allowance",
+    "--wigglefactor": "the global fit holds a center inside GLOBAL_CENTER_WINDOW; -dw is the "
+                      "per voxel width allowance",
     "--phantom": "a phantom is reconstructed as its own file rather than folded in here",
     "--pad": "the sampling window is derived from the recorded ramp time; use MRSreader.py -w "
              "to check it against the data",
@@ -563,7 +573,8 @@ def fit_global_multipeak(global_spect: np.ndarray,
     for icg in candidates:
         fitter = LorentzianFitter(xscale)
         centers = candidate_centers(xscale, norm, spec.offsets, icg, bw_ppm)
-        params = fitter.fit_global(norm, centers, widths_init, width_bounds=width_bounds)
+        params = fitter.fit_global(norm, centers, widths_init, width_bounds=width_bounds,
+                                   center_window=GLOBAL_CENTER_WINDOW)
         if best_fitter is None or params.loss < best_fitter.params.loss:
             best_fitter = fitter
             best_idx = icg

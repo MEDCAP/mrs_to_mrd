@@ -66,8 +66,8 @@ class LorentzianFitter:
     """Fits Lorentzian peaks to MRS spectra.
 
     Global fit: optimises centers, widths, phases, amplitudes and baseline over a whole
-    spectrum. Windowed fit: refits one voxel with the line shape held at, or within a stated
-    distance of, the global result.
+    spectrum, each within a window of where it was placed. Windowed fit: refits one voxel with
+    the line shape held at, or within a stated distance of, the global result.
 
     Every parameter is optimised in its own units - a center as a ppm offset from where it was
     placed, a width as an absolute ppm value - and is constrained by an explicit box bound
@@ -153,16 +153,22 @@ class LorentzianFitter:
                    spectrum: np.ndarray,
                    centers_init: np.ndarray,
                    widths_init: np.ndarray,
-                   width_bounds: tuple = None) -> PeakParams:
+                   width_bounds: tuple = None,
+                   center_window: float = 0.5) -> PeakParams:
         """Fit all Lorentzian parameters (centers, widths, phases, amplitudes, baseline).
 
-        Centers are free to move anywhere; only the widths are constrained, which is what
-        holds the fit together when several peaks are close enough to trade signal.
+        A center may move by at most center_window from where it was placed and a width is held
+        inside width_bounds, which is what holds the fit together when several peaks are close
+        enough to trade signal. The placement is the strongest prior the fit has, since the peak
+        offsets are known chemistry and only the pattern's position is unknown; leave a center
+        unbounded and a tiny peak slides onto a strong neighbour to be fitted as a second
+        component of its line, which lowers the residual and ruins both peaks' maps.
         Stores the result in self.params and returns it.
         Args:
             - centers_init: where each peak is thought to be, in ppm
             - widths_init: the width guess each peak starts from, in ppm
             - width_bounds: an absolute (lo, hi) width range in ppm, applied to every peak
+            - center_window: how far a center may move from centers_init, in ppm
         """
         npeaks = len(centers_init)
         c0 = np.asarray(centers_init, dtype=float)
@@ -175,6 +181,7 @@ class LorentzianFitter:
 
         bounds = [(None, None)] * (4 * npeaks + 2)
         for j in range(npeaks):
+            bounds[j] = (-center_window, center_window)
             # a width is an absolute value here, so an unbounded optimizer can walk one through
             # zero and the model diverges. The default is the range the arctan parameterization
             # this replaces used to enforce implicitly
