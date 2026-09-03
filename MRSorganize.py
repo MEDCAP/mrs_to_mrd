@@ -201,12 +201,12 @@ def _is_junk(path) -> bool:
     return any(part.startswith("._") for part in _posix(path).parts)
 
 
-def experiment_dir_for(path, experiment_root: str = "", resolve: bool = True) -> Tuple[str, str]:
+def experiment_dir_for(path, experiment_name: str = "", resolve: bool = True) -> Tuple[str, str]:
     """
     The directory identifying the experiment a file belongs to.
 
     The caller names the experiment rather than the path being read for it: -f is pointed at one
-    experiment folder and a tar holds one, so experiment_root is the answer and no directory name
+    experiment folder and a tar holds one, so experiment_name is the answer and no directory name
     has to be recognised on the way. This is why there is no list of modality directory names -
     whatever sits between the experiment and the scan directory, and whether anything sits there at
     all, stops mattering.
@@ -215,15 +215,15 @@ def experiment_dir_for(path, experiment_root: str = "", resolve: bool = True) ->
     writes is walked past to reach the folder holding it
     Args:
         - path: filesystem path or tar member name
-        - experiment_root: the experiment the caller named, '' to take it from the path
+        - experiment_name: the experiment the caller named, '' to take it from the path
         - resolve: make the path absolute first, so a file named on its own resolves against the
           filesystem. Off for tar members, which have no filesystem to resolve against
     Returns:
         - (experiment_dir, meas_id). meas_id is '' when there is nothing above the scan directory to
           name the experiment after, which leaves the caller to supply one
     """
-    if experiment_root:
-        return experiment_root, _posix(experiment_root).name
+    if experiment_name:
+        return experiment_name, _posix(experiment_name).name
     posix = _posix(os.path.abspath(str(path)) if resolve else path)
     parts = list(posix.parent.parts)
     if not parts:
@@ -318,7 +318,7 @@ def collect_mrd_paths(root) -> List[str]:
 def group_experiment(paths: Sequence[str],
                      probe: Callable[[str], MRSdata],
                      root: str = "",
-                     experiment_root: str = "",
+                     experiment_name: str = "",
                      fallback_meas_id: str = "",
                      resolve: bool = True) -> Optional[ScanGroup]:
     """
@@ -340,7 +340,7 @@ def group_experiment(paths: Sequence[str],
         - probe: reads one path far enough to give sequence_name, naverages and the dimensions
         - root: directory the caller pointed at. Output stays inside it even when the experiment
           resolves above it, so pointing at a scan directory never writes somewhere unexpected
-        - experiment_root: the experiment every path belongs to, see experiment_dir_for. Only a
+        - experiment_name: the experiment every path belongs to, see experiment_dir_for. Only a
           lone file leaves this empty and has its experiment read off the path
         - fallback_meas_id: used when the path gives no experiment name, e.g. a tar of a bare scan
           directory
@@ -372,7 +372,7 @@ def group_experiment(paths: Sequence[str],
     # every file belongs to the one experiment the caller named, so this is read once rather than
     # per file. The caller naming it outright wins over the folder it was read from, which is what
     # names a file that arrived without an experiment folder around it
-    experiment_dir, path_meas_id = experiment_dir_for(reference_path, experiment_root,
+    experiment_dir, path_meas_id = experiment_dir_for(reference_path, experiment_name,
                                                      resolve=resolve)
     meas_id = path_meas_id or fallback_meas_id
 
@@ -447,32 +447,27 @@ def base_name(group: ScanGroup) -> str:
     scan_id = scan_id_of(group.reference_path)
     return f"{name}_{scan_id}" if scan_id is not None else name
 
-
-def organize_folder(root)-> Optional[ScanGroup]:
+def organize_folder(root: Path)-> Optional[ScanGroup]:
     """
-    Group every .MRD file under one experiment folder into the one stream it converts to.
+    Group every .MRD file under one experiment folder into single ScanGroup
 
-    The folder is the experiment and names the stream written out of it, so the directories under it
-    are read for nothing but their scan ids. Pointing this at a folder of several experiments makes
-    them one experiment: whatever the acquisition matrix check lets through concatenates into a
-    single series
     Args:
         - root: the experiment folder to walk, or a single .MRD file
     Returns:
-        - the group, or None when the folder held no .MRD file
+        - ScanGroup, or None when the folder held no .MRD file
     """
     def probe(path: str) -> MRSdata:
         mrs = MRSdata()
         mrs.probe_from_file(path)
         return mrs
-
+    
     paths = collect_mrd_paths(root)
     # a lone file names no experiment, so its own path is read for one and output goes beside it
     root_path = Path(root)
     is_file = root_path.is_file()
     clamp_root = str(root_path.parent if is_file else root_path)
-    experiment_root = "" if is_file else str(_posix(os.path.abspath(clamp_root)))
-    group = group_experiment(paths, probe, root=clamp_root, experiment_root=experiment_root)
+    experiment_name = "" if is_file else str(_posix(os.path.abspath(clamp_root)))
+    group = group_experiment(paths, probe, root=clamp_root, experiment_name=experiment_name)
     print(f"Grouped {len(paths)} files into {describe_group(group)}", file=sys.stderr)
     return group
 
@@ -562,7 +557,7 @@ def organize_members(members: Sequence[Tuple[str, bytes]],
     # called. '' when they share no single one, and then fallback_meas_id names the scan instead
     roots = {_posix(name).parts[0] for name in payloads if len(_posix(name).parts) > 1}
     group = group_experiment(list(payloads), probe,
-                             experiment_root=next(iter(roots)) if len(roots) == 1 else "",
+                             experiment_name=next(iter(roots)) if len(roots) == 1 else "",
                              fallback_meas_id=fallback_meas_id, resolve=False)
     print(f"Grouped {len(payloads)} members into {describe_group(group)}", file=sys.stderr)
     return group
@@ -576,7 +571,7 @@ def describe_group(group: Optional[ScanGroup]) -> str:
             f"{len(group.prescan_file_list)} prescan")
 
 
-def report(group: Optional[ScanGroup]) -> None:
+def report_group(group: Optional[ScanGroup]) -> None:
     """
     Print what one experiment resolved to, converting nothing
     Args:
@@ -612,7 +607,7 @@ def main() -> int:
     args = parser.parse_args()
     if not args.folder.exists():
         raise SystemExit(f"{args.folder} does not exist")
-    report(organize_folder(args.folder))
+    report_group(organize_folder(args.folder))
     return 0
 
 

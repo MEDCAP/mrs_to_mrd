@@ -36,9 +36,8 @@ import numpy as np
 # mrd python package
 import mrd
 from MRSreader import MRSdata
-import mrs_organize
-from mrs_organize import read_scan_tar
-from epsi_window import check_peak_position
+from MRSorganize import read_scan_tar, organize_folder, report_group
+from mrd2shift import check_peak_position
 
 
 def generate_acquisition(mrs: MRSdata,
@@ -99,11 +98,13 @@ def generate_acquisition(mrs: MRSdata,
             acq.head.user_int = [mrs.nswitches, mrs.npoints_per_switch]
             acq.head.discard_pre = ramp
             acq.head.discard_post = ramp * 3    # rampdown + rephasing, which is two ramps
+        # Only for epsi data, treat this file as prescan phantom data when navg>1 and nrep==1
         if mrs.naverages > 1 and mrs.nrepetitions == 1 and 'epsi' in mrs.sequence_name:
             acq.head.flags |= mrd.AcquisitionFlags.IS_NAVIGATION_DATA
-        # MRS acquires on one channel, so add the coil axis: acq.data.shape=(coils=1, samples)
+        # epsi rawdata has only one repetition per file so irep should index 0
         if mrs.nrepetitions == 1:
             irep = 0
+        # MRS acquires on one channel, so add the coil axis: acq.data.shape=(coils=1, samples)
         acq.data = np.expand_dims(mrs.rawdata[:, iview, isliceview, islice, iecho, irep], axis=0)
         yield mrd.StreamItem.Acquisition(acq)
 
@@ -190,9 +191,9 @@ def convert_folder_to_mrd(folder: Path,
         - True when at least one scan was written, or when a dry run found something to convert
     """
     # scan subfolders of provided folder and group them into rawdata and prescan data as object ScanGroup
-    grouped_files = mrs_organize.organize_folder(folder)
+    grouped_files = organize_folder(folder)
     if dry_run:
-        mrs_organize.report(grouped_files)
+        report_group(grouped_files)
         return bool(grouped_files)
     if grouped_files is None:
         print(f"No data to convert in {folder}", file=sys.stderr)
@@ -201,15 +202,18 @@ def convert_folder_to_mrd(folder: Path,
     if check_window:
         check_peak_position(grouped_files)
 
-    # If mrs.nrepetitions>1, single file carries multiple repetitions and rep_count=mrs.nrepetitions
-    # If mrs.nrepetitions==1, a group of files represent entire repetitions and rep_count={number of rawdata files} 
-    rep_count = grouped_files.nrepetitions
     writer: Optional[mrd.BinaryMrdWriter] = None
     try:
         # first convert raw data files before phantom files in the group
         for filepath in grouped_files.rawdata_file_list:
             mrs = MRSdata()                     # one at a time, released once written
             mrs.read_from_file(filepath)
+            # If mrs.nrepetitions>1, single file carries multiple repetitions and rep_count=mrs.nrepetitions
+            # If mrs.nrepetitions==1, a group of files represent entire repetitions and rep_count={number of rawdata files} 
+            if mrs.nrepetition == 1:
+                rep_count = len(grouped_files.rawdata_file_list)
+            else:
+                rep_count = mrs.nrepetitions
             if writer is None:
                 print(f'Writing file at {grouped_files.output_path}', file=sys.stderr)
                 writer = mrd.BinaryMrdWriter(grouped_files.output_path)
@@ -340,7 +344,7 @@ def main() -> int:
 
     if args.folder:
         # convert folder allows
-        print(f"Converting folder of single experiment folder {args.folder}", file=sys.stderr)
+        print(f"Converting single experiment folder {args.folder}", file=sys.stderr)
         written = convert_folder_to_mrd(args.folder, args.dry_run, args.window)
     elif args.tar:
         output = args.output or Path(os.environ.get("OUTPUT_PIPE", ""))
