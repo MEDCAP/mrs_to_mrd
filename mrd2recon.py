@@ -554,6 +554,88 @@ def fit_voxel_peaks(volumes: np.ndarray,
     return amplitudes, areas
 
 
+def fit_and_emit_peaks(aligned: np.ndarray,
+                       global_spect: np.ndarray,
+                       xscale: np.ndarray,
+                       spec: PeakSpec,
+                       *,
+                       noise_threshold: float,
+                       fit_df: float = 0.0,
+                       fit_dw: float = 0.0,
+                       fit_dph: float = 0.0) -> Iterable[mrd.StreamItem]:
+    """
+    Fit the peaks on an aligned series and emit everything that describes the fit.
+
+    Everything downstream of the alignment: the global fit, the line shape it settled on, and
+    the per-voxel maps. Nothing flows back to the caller, so a run with no peaks named stops
+    after the summed spectrum.
+    Args:
+        - aligned: (nreps, nviews, nro, nfreq) complex, already phase aligned
+        - global_spect: the sum over aligned voxels, which the line shape is fitted to
+    """
+    if len(spec) == 0:
+        print("No peaks specified, skipping the Lorentzian fits", file=sys.stderr)
+        yield emit(global_spect,
+                   dimension_labels=[mrd.ArrayDimension.CONTRAST],
+                   description="global_spect",
+                   xscale_ppm=xscale)
+        return
+
+    print(f"Fitting {len(spec)} peaks to the global spectrum", file=sys.stderr)
+    fitter, biggest_idx, width_guess = fit_global_multipeak(global_spect, xscale, spec)
+    params = fitter.params
+    global_scaling = float(np.max(np.abs(global_spect)))
+
+    yield emit(global_spect,
+               dimension_labels=[mrd.ArrayDimension.CONTRAST],
+               description="global_spect",
+               xscale_ppm=xscale,
+               width_guess_ppm=width_guess,
+               biggest_peak_index=biggest_idx,
+               biggest_peak_name=spec.names[biggest_idx])
+    yield emit(fitter.eval() * global_scaling,
+               dimension_labels=[mrd.ArrayDimension.CONTRAST],
+               description="global_spect_fit",
+               xscale_ppm=xscale,
+               fit_loss=params.loss)
+
+    for description, values in (("lorentzian_centers_ppm", params.centers),
+                                ("lorentzian_widths_ppm", params.widths),
+                                ("lorentzian_phases_rad", params.phases),
+                                ("lorentzian_amplitudes", params.amplitudes * global_scaling)):
+        yield emit(values,
+                   dimension_labels=[mrd.ArrayDimension.BASIS],
+                   description=description,
+                   peak_names=spec.names)
+    yield emit(np.array([params.baseline * global_scaling]),
+               dimension_labels=[mrd.ArrayDimension.SAMPLES],
+               description="lorentzian_baseline")
+
+    # peak height and peak area. The area is each voxel's own amplitude times its own fitted
+    # width, so with the width window closed it is a per-peak rescaling of the amplitudes and
+    # with it open it is a genuinely per-voxel integral
+    metabolites, areas = fit_voxel_peaks(aligned, fitter,
+                                         noise_threshold=noise_threshold,
+                                         fit_df=fit_df, fit_dw=fit_dw, fit_dph=fit_dph)
+
+    map_meta = dict(peak_names=spec.names,
+                    peak_offsets_ppm=spec.offsets,
+                    source_peak_index=spec.source_idx,
+                    metabolite_indices=spec.metabolite_idx or None,
+                    fit_df_ppm=fit_df,
+                    fit_dw_ppm=fit_dw,
+                    fit_dph_rad=fit_dph)
+    for description, values in (("metabolite_amplitude", metabolites),
+                                ("metabolite_area", areas)):
+        yield emit(values,
+                   dimension_labels=[mrd.ArrayDimension.BASIS,
+                                     mrd.ArrayDimension.REPETITION,
+                                     mrd.ArrayDimension.Y,
+                                     mrd.ArrayDimension.X],
+                   description=description,
+                   **map_meta)
+
+
 # ---------- EPSI reconstruction ------------------------------------------
 
 
@@ -647,67 +729,9 @@ def reconstruct_epsi(header: mrd.Header,
     print("Aligning voxel spectra", file=sys.stderr)
     aligned, global_spect = phase_align(volumes, max_spect, noise_threshold=noise_threshold)
 
-    if len(spec) == 0:
-        print("No peaks specified, skipping the Lorentzian fits", file=sys.stderr)
-        yield emit(global_spect,
-                   dimension_labels=[mrd.ArrayDimension.CONTRAST],
-                   description="global_spect",
-                   xscale_ppm=xscale)
-        return
-
-    print(f"Fitting {len(spec)} peaks to the global spectrum", file=sys.stderr)
-    fitter, biggest_idx, width_guess = fit_global_multipeak(global_spect, xscale, spec)
-    params = fitter.params
-    global_scaling = float(np.max(np.abs(global_spect)))
-
-    yield emit(global_spect,
-               dimension_labels=[mrd.ArrayDimension.CONTRAST],
-               description="global_spect",
-               xscale_ppm=xscale,
-               width_guess_ppm=width_guess,
-               biggest_peak_index=biggest_idx,
-               biggest_peak_name=spec.names[biggest_idx])
-    yield emit(fitter.eval() * global_scaling,
-               dimension_labels=[mrd.ArrayDimension.CONTRAST],
-               description="global_spect_fit",
-               xscale_ppm=xscale,
-               fit_loss=params.loss)
-
-    for description, values in (("lorentzian_centers_ppm", params.centers),
-                                ("lorentzian_widths_ppm", params.widths),
-                                ("lorentzian_phases_rad", params.phases),
-                                ("lorentzian_amplitudes", params.amplitudes * global_scaling)):
-        yield emit(values,
-                   dimension_labels=[mrd.ArrayDimension.BASIS],
-                   description=description,
-                   peak_names=spec.names)
-    yield emit(np.array([params.baseline * global_scaling]),
-               dimension_labels=[mrd.ArrayDimension.SAMPLES],
-               description="lorentzian_baseline")
-
-    # peak height and peak area. The area is each voxel's own amplitude times its own fitted
-    # width, so with the width window closed it is a per-peak rescaling of the amplitudes and
-    # with it open it is a genuinely per-voxel integral
-    metabolites, areas = fit_voxel_peaks(aligned, fitter,
-                                         noise_threshold=noise_threshold,
-                                         fit_df=fit_df, fit_dw=fit_dw, fit_dph=fit_dph)
-
-    map_meta = dict(peak_names=spec.names,
-                    peak_offsets_ppm=spec.offsets,
-                    source_peak_index=spec.source_idx,
-                    metabolite_indices=spec.metabolite_idx or None,
-                    fit_df_ppm=fit_df,
-                    fit_dw_ppm=fit_dw,
-                    fit_dph_rad=fit_dph)
-    for description, values in (("metabolite_amplitude", metabolites),
-                                ("metabolite_area", areas)):
-        yield emit(values,
-                   dimension_labels=[mrd.ArrayDimension.BASIS,
-                                     mrd.ArrayDimension.REPETITION,
-                                     mrd.ArrayDimension.Y,
-                                     mrd.ArrayDimension.X],
-                   description=description,
-                   **map_meta)
+    yield from fit_and_emit_peaks(aligned, global_spect, xscale, spec,
+                                  noise_threshold=noise_threshold,
+                                  fit_df=fit_df, fit_dw=fit_dw, fit_dph=fit_dph)
 
 
 # ---------- driver -------------------------------------------------------
