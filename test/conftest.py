@@ -9,7 +9,7 @@ numeric function, and the suite runs on numpy and scipy alone.
 
 The real package is preferred whenever it is installed, so this never masks a genuine
 change in the mrd schema. To run against it, use an interpreter that has it, e.g.
-    ~/.local/share/mamba/envs/mrd/bin/python -m unittest discover -s test -t .
+    ~/.local/share/mamba/envs/mrd/bin/python -m unittest discover -s test -t test
 
 Imported for its side effects by the test modules; also picked up automatically as a
 conftest if pytest is ever added.

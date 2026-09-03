@@ -3,7 +3,7 @@
 ## Running the tests
 
 ```
-python3 -m unittest discover -s test -t .
+python3 -m unittest discover -s test -t test
 ```
 
 numpy and scipy are the only requirements. stdlib `unittest` rather than pytest, because
@@ -33,7 +33,7 @@ package whenever it is importable, so it cannot mask a change in the mrd schema.
 against the real one, use an interpreter that has it:
 
 ```
-~/.local/share/mamba/envs/mrd/bin/python -m unittest discover -s test -t .
+~/.local/share/mamba/envs/mrd/bin/python -m unittest discover -s test -t test
 ```
 
 ## Sample data

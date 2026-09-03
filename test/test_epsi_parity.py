@@ -18,7 +18,7 @@ Two kinds of test here, and the split is the point:
                surprise.
 
 Run with:
-    python3 -m unittest discover -s test -t .
+    python3 -m unittest discover -s test -t test
 numpy and scipy are the only requirements; conftest supplies a stand-in for mrd when the
 real package is not installed. Nothing here reads a scan from disk.
 """
