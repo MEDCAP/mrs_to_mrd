@@ -227,33 +227,6 @@ def meta_values(value: Any) -> List[mrd.ArrayMetaValue]:
     raise TypeError(f"cannot encode {type(value)} as array meta")
 
 
-def make_meta(**fields: Any) -> mrd.ArrayMeta:
-    """Build an ArrayMeta from keyword values, dropping the ones that are None."""
-    return {key: meta_values(value) for key, value in fields.items() if value is not None}
-
-
-def ndarray_stream_item(arr: mrd.NdArray) -> mrd.StreamItem:
-    """Map an NdArray onto its StreamItem union arm; the dtype picks the arm."""
-    dt = arr.data.dtype
-    if dt == np.uint16:
-        return mrd.StreamItem.NdArrayUint16(arr)
-    if dt == np.int16:
-        return mrd.StreamItem.NdArrayInt16(arr)
-    if dt == np.uint32:
-        return mrd.StreamItem.NdArrayUint32(arr)
-    if dt == np.int32:
-        return mrd.StreamItem.NdArrayInt32(arr)
-    if dt == np.float32:
-        return mrd.StreamItem.NdArrayFloat(arr)
-    if dt == np.float64:
-        return mrd.StreamItem.NdArrayDouble(arr)
-    if dt == np.complex64:
-        return mrd.StreamItem.NdArrayComplexFloat(arr)
-    if dt == np.complex128:
-        return mrd.StreamItem.NdArrayComplexDouble(arr)
-    raise TypeError(f"Unsupported NdArray dtype for stream: {dt}")
-
-
 def emit(data: np.ndarray, *,
          head: mrd.NdArrayHeader = None,
          dimension_labels: List = None,
@@ -262,28 +235,25 @@ def emit(data: np.ndarray, *,
     """
     Wrap an array as a stream-ready NdArray.
 
-    Real data is normalised to float64 and complex data to complex128 so the union arm is
-    always one of the two the readers on the other side expect. Meta goes on the NdArray,
-    which is where the dev schema puts it, not on the header.
+    Real data is normalised to float64 and complex data to complex128, which is also what
+    picks the StreamItem union arm: those are the only two the readers on the other side
+    expect, so the cast and the choice of arm are the same decision. Meta goes on the
+    NdArray, which is where the dev schema puts it, not on the header, and a None value is
+    dropped rather than encoded.
     """
     array = np.asarray(data)
-    array = array.astype(np.complex128) if np.iscomplexobj(array) else array.astype(np.float64)
+    complex_data = np.iscomplexobj(array)
+    array = array.astype(np.complex128) if complex_data else array.astype(np.float64)
     if head is None:
         head = mrd.NdArrayHeader(dimension_labels=dimension_labels, array_type=array_type)
-    return ndarray_stream_item(mrd.NdArray(head=head, data=array, meta=make_meta(**meta)))
+    arr = mrd.NdArray(head=head, data=array,
+                      meta={key: meta_values(value)
+                            for key, value in meta.items() if value is not None})
+    return (mrd.StreamItem.NdArrayComplexDouble(arr) if complex_data
+            else mrd.StreamItem.NdArrayDouble(arr))
 
 
 # ---------- k-space assembly ---------------------------------------------
-
-
-def header_user_long(header: mrd.Header, name: str) -> Optional[int]:
-    """The named long user parameter, or None when the header does not carry it."""
-    user = getattr(header, "user_parameters", None)
-    params = getattr(user, "user_parameter_long", None) or [] if user is not None else []
-    for param in params:
-        if param.name == name:
-            return int(param.value)
-    return None
 
 
 def epsi_leading_pad(header: mrd.Header,
@@ -294,13 +264,18 @@ def epsi_leading_pad(header: mrd.Header,
     The ramp at the head of a switch is not on the flat top, so the usable window opens
     ceil(tramp / dwell) samples into the switch. discard_pre assumes the discarded points split
     evenly across both ends instead, and the pad is the difference between the two, which is what
-    apply_line_broadening subtracts from every echo's start.
-    Args:
-        - acq: any acquisition of the readout, read for its dwell time and discard count
+    apply_line_broadening subtracts from every echo's start. The pad owns the pedestal under the
+    peak; a residual drift phase is a separate axis and owns linewidth and symmetry. epsi_window.py
+    and MRSreader.py -w are the tools that check the number against the data.
     Returns:
         - (pad, a one line account of where it came from, for the log)
     """
-    tramp_us = header_user_long(header, "tramp")
+    tramp_us = None
+    if header.user_parameters is not None:
+        for param in header.user_parameters.user_parameter_long or []:
+            if param.name == "tramp":
+                tramp_us = int(param.value)
+                break
     if tramp_us is None:
         return EPSIGRE_DEFAULT_PAD, (f"pad {EPSIGRE_DEFAULT_PAD}, the header records no ramp time; "
                                      f"convert again to record one")
@@ -376,7 +351,7 @@ def apply_line_broadening(acq: mrd.Acquisition,
     return result
 
 
-def spectral_axis(header: mrd.Header, acq: mrd.Acquisition) -> Tuple[np.ndarray, float, float]:
+def spectral_axis(header: mrd.Header, acq: mrd.Acquisition) -> Tuple[np.ndarray, float]:
     """
     The spectral axis of an EPSI readout, in ppm.
 
@@ -385,7 +360,7 @@ def spectral_axis(header: mrd.Header, acq: mrd.Acquisition) -> Tuple[np.ndarray,
     runs from 0 rather than being centred on zero: the peak centers are placed modulo the
     spectral width and the Lorentzian model carries explicit +-BW wraparound terms.
     Returns:
-        - (xscale in ppm, spectral bandwidth in Hz, spectral bandwidth in ppm)
+        - (xscale in ppm, spectral bandwidth in Hz)
     """
     nswitch, totalppswitch, _ = switch_layout(acq)
     spectral_bw_hz = 1.0e+9 / (acq.head.sample_time_ns * totalppswitch)
@@ -395,7 +370,7 @@ def spectral_axis(header: mrd.Header, acq: mrd.Acquisition) -> Tuple[np.ndarray,
     bw_ppm = spectral_bw_hz / center_freq_hz * 1.0e+6
     nfreq = nswitch * FIDPAD
     xscale = np.arange(nfreq) / nfreq * bw_ppm
-    return xscale, spectral_bw_hz, bw_ppm
+    return xscale, spectral_bw_hz
 
 
 def iter_repetitions(header: mrd.Header,
@@ -612,7 +587,7 @@ def reconstruct_epsi(header: mrd.Header,
             yield mrd.StreamItem.Acquisition(acq)
 
         if xscale is None:
-            xscale, spectral_bw_hz, _ = spectral_axis(header, reference_acq)
+            xscale, spectral_bw_hz = spectral_axis(header, reference_acq)
 
         # FFT the k-space cube over all three axes into (views, readout, frequency)
         axes = tuple(range(kspace.ndim))
