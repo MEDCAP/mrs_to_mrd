@@ -1,6 +1,8 @@
 """
 Reconstruct a converted EPSI .mrd2 file into lorentzian peak fits and metabolite maps.
 
+EPSI only: anything else raises.
+
 tyger args:
     - python mrd2recon.py
     - -i
@@ -8,13 +10,10 @@ tyger args:
     - -o
     - $(OUTPUT_PIPE)
 
+With --folder, every .mrd2 that is not itself a _recon.mrd2 is reconstructed to
+<name>_recon.mrd2 beside it. With --input, one file is reconstructed to --output.
 
-With --folder, every .mrd2 that is not itself a _recon.mrd2 is reconstructed to <name>_recon.mrd2
-beside it.
-   
     python mrd2recon.py -f {directory} {metabolite shift parameters}
-    
-With --input, single .mrd2 file of raw data is reconstructed to a file specified at --output
     python mrd2recon.py -i raw.mrd2 -o recon.mrd2 \
         -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
 
@@ -22,18 +21,17 @@ With --input, single .mrd2 file of raw data is reconstructed to a file specified
     _t  tiny peak, not a candidate for "which peak is the tallest one"
     _m  a derived metabolite
 
-An EPSI reconstruction fits the relative ppm shift of each metabolite on the summed spectrum once, 
-then fits every voxel again with that line shape. 
-
-How far a voxel is allowed to depart from it is given by three windows, all zero by
-default, which is to say the line shape is pinned and only the amplitudes vary:
+The fit runs twice: once on the summed spectrum, to settle the relative ppm shift of each
+metabolite, then once per voxel with that line shape. How far a voxel may depart from it is
+given by three windows, all zero by default, which is to say the line shape is pinned and
+only the amplitudes vary:
 
     -df   how far a peak center may move from the global fit, in ppm
     -dw   how far a peak width may move from the global fit, in ppm
     -dph  how far a peak phase may move from the global fit, in radians
 
-Metabolite map is saved to the output stream as mrd NdArrays, not mrd Image field and the
-raw acquisitions are kept in the recon file unchanged.
+Everything the reconstruction produces goes to the output stream as mrd NdArrays, not as the
+mrd Image field, and the raw acquisitions are kept in the recon file unchanged.
 """
 
 import argparse
@@ -266,9 +264,8 @@ def epsi_leading_pad(header: mrd.Header,
     evenly across both ends instead, and the pad is the difference between the two, which is what
     apply_line_broadening subtracts from every echo's start. The pad owns the pedestal under the
     peak; a residual drift phase is a separate axis and owns linewidth and symmetry. epsi_window.py
-    and MRSreader.py -w are the tools that check the number against the data.
-    Returns:
-        - (pad, a one line account of where it came from, for the log)
+    and MRSreader.py -w are the tools that check the number against the data. Returns the pad
+    and a one line account of where it came from, for the log.
     """
     tramp_us = None
     if header.user_parameters is not None:
@@ -296,13 +293,8 @@ def switch_layout(acq: mrd.Acquisition) -> Tuple[int, int, int]:
     The switch count comes from user_int, where the converter records it, because idx.contrast
     carries the echo index the sequence acquired rather than the switches packed into one readout.
     user_int holds the whole width of a switch, ramps included; the kept width is what is left of
-    it once the discard points come off both ends.
-    Args:
-        - acq: one acquisition of the readout
-    Returns:
-        - (switches, total points in one switch, points kept per switch)
-    Raises:
-        - ValueError on an acquisition converted before the switch layout was recorded
+    it once the discard points come off both ends. Returns (switches, total points in one
+    switch, points kept per switch), and raises on a scan converted before that was recorded.
     """
     user_int = list(acq.head.user_int or [])
     if len(user_int) < 2 or int(user_int[0]) <= 0:
@@ -329,13 +321,7 @@ def apply_line_broadening(acq: mrd.Acquisition,
     boundaries are placed as if leading_pad zeros had been prepended, and any sample whose
     position in the original readout is below zero_lead reads as zero. Sampling past the end of
     the readout, which the shift can cause for the last switch, also reads as zero.
-    Args:
-        - acq: one acquisition, one phase encode line
-        - line_broadening: line broadening factor in Hz
-        - leading_pad: zeros notionally prepended to the readout
-        - zero_lead: leading samples of the original readout to replace with zero
-    Returns:
-        - (kept points, switches) complex array, discard points trimmed off each switch
+    Returns a (kept points, switches) complex array, discard points trimmed off each switch.
     """
     # example data: 64 switches of 28 points over 1792 samples, 12 of each switch kept
     nswitch, totalppswitch, kept = switch_layout(acq)
@@ -442,11 +428,8 @@ def phase_align(volumes: np.ndarray,
     picking the combination that maximises overlap with the brightest spectrum in the series
     puts every voxel into a common frame, so the sum over voxels adds coherently instead of
     cancelling. Voxels below the noise threshold are left alone and excluded from the sum.
-    Args:
-        - volumes: (nreps, nviews, nro, nfreq) complex
-        - reference_spect: (nfreq,) complex, the brightest voxel spectrum in the series
-    Returns:
-        - (aligned copy of volumes, the global spectrum summed over aligned voxels)
+    Takes (nreps, nviews, nro, nfreq) against the brightest voxel spectrum in the series, and
+    returns (an aligned copy, the global spectrum summed over aligned voxels).
     """
     out = np.array(volumes, dtype=complex, copy=True)
     global_spect = np.zeros(out.shape[-1], dtype=complex)
@@ -527,13 +510,9 @@ def fit_voxel_peaks(volumes: np.ndarray,
     The windows say how far a voxel may depart from that shape. At their default of zero the
     line shape is pinned and only the amplitudes and a baseline are free, so a voxel too noisy
     to support a full fit still yields a usable amplitude. Opening them lets a voxel whose
-    shim, and so whose line, differs from the average of the slice fit its own.
-    Args:
-        - volumes: (nreps, nviews, nro, nfreq) complex, already phase aligned
-        - fit_df, fit_dw, fit_dph: center, width and phase windows, in ppm, ppm and radians
-    Returns:
-        - ((npeaks, nreps, nviews, nro) peak heights,
-           the matching peak areas, each from its own voxel's fitted width)
+    shim, and so whose line, differs from the average of the slice fit its own. The windows are
+    in ppm, ppm and radians. Returns ((npeaks, nreps, nviews, nro) peak heights, the matching
+    peak areas, each from its own voxel's fitted width).
     """
     npeaks = len(fitter.params.centers)
     nreps, ny, nx, _ = volumes.shape
@@ -567,11 +546,9 @@ def fit_and_emit_peaks(aligned: np.ndarray,
     Fit the peaks on an aligned series and emit everything that describes the fit.
 
     Everything downstream of the alignment: the global fit, the line shape it settled on, and
-    the per-voxel maps. Nothing flows back to the caller, so a run with no peaks named stops
-    after the summed spectrum.
-    Args:
-        - aligned: (nreps, nviews, nro, nfreq) complex, already phase aligned
-        - global_spect: the sum over aligned voxels, which the line shape is fitted to
+    the per-voxel maps. Takes the aligned (nreps, nviews, nro, nfreq) series and the sum over
+    its voxels, which the line shape is fitted to. Nothing flows back to the caller, so a run
+    with no peaks named stops after the summed spectrum.
     """
     if len(spec) == 0:
         print("No peaks specified, skipping the Lorentzian fits", file=sys.stderr)
