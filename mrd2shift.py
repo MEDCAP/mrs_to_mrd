@@ -16,9 +16,8 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-import mrs_organize
 from MRSreader import MRSdata
-from mrs_organize import ScanGroup, organize_folder, read_scan_tar
+from MRSorganize import ScanGroup, organize_folder, read_scan_tar
 
 
 # How wide a drift the search covers, in samples per switch. The kidney data runs from -0.03 on the
@@ -43,7 +42,7 @@ DRIFT_MIN_SNR = 5.0
 # mrd.acquisition -> ndarray
 # groups -> ndarray
 
-# helper function to call from MRStomrd2.py
+# helper function to call from MRStomrd2.py for local testing on scan_groups
 def check_peak_position(scan_groups: ScanGroup) -> bool:
     """
     Check where the readout and rephasing echoes happen per switch for raw data, not prescan data
@@ -173,19 +172,19 @@ def plot_sample_window(rawdata: np.ndarray, ramp_points: int, npoints_per_switch
     return True
 
 
-def read_mrd_acq(input_file: BinaryIO, output_file: BinaryIO):
-    """
-    Read a mrd file acquisition field, correct for echo position, and rewrite back a corrected raw file
-    """
-    with mrd.BinaryMrdReader(input_file) as reader:
-        with mrd.BinaryMrdWriter(output_file) as writer:
-            header = reader.read_header()
-            tramp = header.user_parameters.user_parameters_long[0].get('tramp')
-            for item in reader.read_data():
-                if isinstance(item, mrs.StreamItem.Acquisition):
-                    pass
-                else:
-                    continue
+# def read_mrd_acq(input_file: BinaryIO, output_file: BinaryIO):
+#     """
+#     Read a mrd file acquisition field, correct for echo position, and rewrite back a corrected raw file
+#     """
+#     with mrd.BinaryMrdReader(input_file) as reader:
+#         header = reader.read_header()
+#         for item in reader.read_data():
+#             if not isinstance(item, mrd.StreamItem.Acquisition):
+#                 continue
+#             # no correction for phantom prescan
+#             elif item.value.head.falgs & mrd.AcquisitionFlags.IS_NAVIGATION_DATA:
+#                 continue
+#             else:
 
 
 
