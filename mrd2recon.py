@@ -1,5 +1,5 @@
 """
-Reconstruct a converted EPSI .mrd2 file into Lorentzian peak fits and metabolite maps.
+Reconstruct a converted EPSI .mrd2 file into lorentzian peak fits and metabolite maps.
 
 tyger args:
     - python mrd2recon.py
@@ -8,11 +8,13 @@ tyger args:
     - -o
     - $(OUTPUT_PIPE)
 
-local run python mrd2recon.py -f {folderpath of data}
 
 With --folder, every .mrd2 that is not itself a _recon.mrd2 is reconstructed to <name>_recon.mrd2
 beside it.
-
+   
+    python mrd2recon.py -f {directory} {metabolite shift parameters}
+    
+With --input, single .mrd2 file of raw data is reconstructed to a file specified at --output
     python mrd2recon.py -i raw.mrd2 -o recon.mrd2 \
         -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
 
@@ -20,16 +22,18 @@ beside it.
     _t  tiny peak, not a candidate for "which peak is the tallest one"
     _m  a derived metabolite
 
-An EPSI reconstruction fits the summed spectrum once, then fits every voxel again with that line
-shape. How far a voxel is allowed to depart from it is given by three windows, all zero by
+An EPSI reconstruction fits the relative ppm shift of each metabolite on the summed spectrum once, 
+then fits every voxel again with that line shape. 
+
+How far a voxel is allowed to depart from it is given by three windows, all zero by
 default, which is to say the line shape is pinned and only the amplitudes vary:
 
     -df   how far a peak center may move from the global fit, in ppm
     -dw   how far a peak width may move from the global fit, in ppm
     -dph  how far a peak phase may move from the global fit, in radians
 
-Everything the reconstruction produces is written to the output stream as mrd NdArrays, and the
-raw acquisitions are passed through unchanged.
+Metabolite map is saved to the output stream as mrd NdArrays, not mrd Image field and the
+raw acquisitions are kept in the recon file unchanged.
 """
 
 import argparse
@@ -46,7 +50,6 @@ import numpy as np
 import mrd
 
 from lorentzian_fitter import LorentzianFitter, candidate_centers, estimate_width_fwhm
-from svd_denoise import denoise_svd
 
 # a voxel spectrum is fitted only if above the estimated noise floor
 NOISE_THRESHOLD_MULTIPLIER = 3.0
@@ -88,9 +91,14 @@ RETIRED_OPTIONS = {
              "to check it against the data",
     "--zero-lead": "the leading samples read as zero are the sequence's own",
     "--skip-initial-reps": "every repetition is fitted",
+    # -r is the trap this table exists for: once it left the parser it stopped being reserved,
+    # so '-r 5' would be read as a peak named 'r' at 5.0 ppm and silently shift the fit
+    "-d": "the reconstruction no longer denoises; svd_denoise.py is still there to call directly",
+    "--denoise": "the reconstruction no longer denoises; svd_denoise.py is still there to call "
+                 "directly",
+    "-r": "the reconstruction no longer denoises, so there is no rank to choose",
+    "--rank": "the reconstruction no longer denoises, so there is no rank to choose",
 }
-# what append_recon_header writes into user_parameter_double that is not a peak
-RECON_HEADER_PARAMS = frozenset({"line_broadening_factor", "fit_df", "fit_dw", "fit_dph"})
 
 
 # ---------- peak specification -------------------------------------------
@@ -176,50 +184,19 @@ def split_peak_args(argv: Sequence[str], reserved) -> Tuple[PeakSpec, List[str]]
     return spec, remaining
 
 
-def peak_spec_to_header(header: mrd.Header, spec: PeakSpec) -> None:
-    """Record the peak list on the header so a downstream consumer can recover it."""
-    if header.user_parameters is None:
-        header.user_parameters = mrd.UserParametersType()
-    for i, name in enumerate(spec.names):
-        full = f"{name}_{spec.modifiers[i]}" if spec.modifiers[i] else name
-        header.user_parameters.user_parameter_double.append(
-            mrd.UserParameterDoubleType(name=full, value=float(spec.offsets[i])))
-
-
-def peak_spec_from_header(header: mrd.Header) -> PeakSpec:
-    """Recover the peak list that peak_spec_to_header wrote into header.user_parameters.
-
-    A peak is named '<name>_<modifiers>', which is the shape of every double this recon
-    records, so what the reconstruction wrote about itself has to be named to be skipped.
-    """
-    names: List[str] = []
-    offsets: List[float] = []
-    modifiers: List[str] = []
-
-    user = getattr(header, "user_parameters", None)
-    params = getattr(user, "user_parameter_double", None) or [] if user is not None else []
-    for p in params:
-        if p.name in RECON_HEADER_PARAMS:
-            continue
-        name, _, mods = p.name.partition("_")
-        names.append(name)
-        offsets.append(float(p.value))
-        modifiers.append(mods)
-
-    return PeakSpec(names=names,
-                    offsets=np.asarray(offsets, dtype=float),
-                    modifiers=modifiers)
-
 
 def append_recon_header(header: mrd.Header, *,
                         line_broadening: float,
                         spec: PeakSpec,
-                        denoise: bool,
-                        rank: Optional[int],
                         fit_df: float = 0.0,
                         fit_dw: float = 0.0,
                         fit_dph: float = 0.0) -> mrd.Header:
-    """Record what this reconstruction was asked to do on the header it passes through."""
+    """
+    Record what this reconstruction was asked to do on the header it passes through.
+
+    The peak list goes on as one double per peak, named '<name>_<modifiers>', so a downstream
+    consumer can recover which peak each map belongs to.
+    """
     if header.user_parameters is None:
         header.user_parameters = mrd.UserParametersType()
     header.user_parameters.user_parameter_double.append(
@@ -227,11 +204,10 @@ def append_recon_header(header: mrd.Header, *,
     for name, value in (("fit_df", fit_df), ("fit_dw", fit_dw), ("fit_dph", fit_dph)):
         header.user_parameters.user_parameter_double.append(
             mrd.UserParameterDoubleType(name=name, value=float(value)))
-    if denoise and rank is not None:
-        header.user_parameters.user_parameter_long.append(
-            mrd.UserParameterLongType(name="svd_rank", value=int(rank)))
-    if len(spec) > 0:
-        peak_spec_to_header(header, spec)
+    for i, name in enumerate(spec.names):
+        full = f"{name}_{spec.modifiers[i]}" if spec.modifiers[i] else name
+        header.user_parameters.user_parameter_double.append(
+            mrd.UserParameterDoubleType(name=full, value=float(spec.offsets[i])))
     return header
 
 
@@ -476,27 +452,6 @@ def iter_repetitions(header: mrd.Header,
         yield reference_acq, kspace, acqs
 
 
-def denoise_kspace(kspace: np.ndarray, rank: Optional[int]):
-    """
-    Truncated-SVD denoise an EPSI k-space cube along its spectral dimension.
-
-    The cube is flattened to (nechoes, nviews * nsamples) so every column is the spectral FID
-    of one k-space location, which is the matrix layout the low-rank argument applies to.
-    Returns:
-        - (denoised cube of the original shape, the DenoiseResult)
-    """
-    nviews, nsamples, nechoes = kspace.shape
-    matrix = kspace.reshape(nviews * nsamples, nechoes).T
-    result = denoise_svd(matrix, rank)
-    return result.matrix.T.reshape(nviews, nsamples, nechoes), result
-
-
-def reconstruct_volume(kspace: np.ndarray) -> np.ndarray:
-    """FFT an EPSI k-space cube over all three axes into (views, readout, frequency)."""
-    axes = tuple(range(kspace.ndim))
-    return np.fft.fftshift(np.fft.fftn(kspace, axes=axes), axes=axes)
-
-
 # ---------- EPSI analysis ------------------------------------------------
 
 
@@ -632,18 +587,16 @@ def reconstruct_epsi(header: mrd.Header,
                      *,
                      line_broadening: float,
                      spec: PeakSpec,
-                     denoise: bool = False,
-                     rank: int = None,
                      fit_df: float = 0.0,
                      fit_dw: float = 0.0,
                      fit_dph: float = 0.0) -> Iterable[mrd.StreamItem]:
     """
     Reconstruct an EPSI acquisition into spectra, a global peak fit and metabolite maps.
 
-    The reconstruction is in two parts. Each repetition is assembled, optionally denoised,
-    transformed and emitted as it arrives, so a consumer sees repetition n before n+1 is read.
-    The analysis then runs once over the whole series, because aligning voxels against the
-    brightest spectrum and fitting a summed spectrum both need every repetition in hand.
+    The reconstruction is in two parts. Each repetition is assembled, transformed and emitted
+    as it arrives, so a consumer sees repetition n before n+1 is read. The analysis then runs
+    once over the whole series, because aligning voxels against the brightest spectrum and
+    fitting a summed spectrum both need every repetition in hand.
     """
     volumes: List[np.ndarray] = []
     xscale = None
@@ -661,15 +614,9 @@ def reconstruct_epsi(header: mrd.Header,
         if xscale is None:
             xscale, spectral_bw_hz, _ = spectral_axis(header, reference_acq)
 
-        if denoise:
-            kspace, denoise_result = denoise_kspace(kspace, rank)
-            yield emit(denoise_result.singular_values,
-                       dimension_labels=[mrd.ArrayDimension.SAMPLES],
-                       description="singular_values",
-                       svd_rank=denoise_result.rank,
-                       repetition=irep)
-
-        img = reconstruct_volume(kspace)
+        # FFT the k-space cube over all three axes into (views, readout, frequency)
+        axes = tuple(range(kspace.ndim))
+        img = np.fft.fftshift(np.fft.fftn(kspace, axes=axes), axes=axes)
         volumes.append(img)
         last_repetition = reference_acq.head.idx.repetition
 
@@ -788,103 +735,7 @@ def reconstruct_epsi(header: mrd.Header,
                    **map_meta)
 
 
-# ---------- spectral (single voxel FID) reconstruction --------------------
-
-
-def extract_fid(acq: mrd.Acquisition) -> np.ndarray:
-    """Extract a single 1-D complex FID from an acquisition, trimming discard points."""
-    fid = np.squeeze(np.asarray(acq.data)).astype(np.complex128).ravel()
-    pre = acq.head.discard_pre or 0
-    post = acq.head.discard_post or 0
-    if pre or post:
-        fid = fid[pre:len(fid) - post]
-    return fid
-
-
-def reconstruct_spectral(header: mrd.Header,
-                         input: Iterable[mrd.Acquisition],
-                         *,
-                         line_broadening: float,
-                         denoise: bool = False,
-                         rank: int = None) -> Iterable[mrd.StreamItem]:
-    """
-    Reconstruct a single-voxel FID spectral time series.
-
-    Each acquisition is one complex FID acquired at a time point of the metabolic flux
-    experiment. The FIDs are stacked as the columns of an (nsamples, nspectra) matrix,
-    optionally denoised by low rank approximation, then line broadened and Fourier
-    transformed. Denoising acts on the raw complex signal, so no phase correction is needed
-    beforehand.
-
-    Yields the raw acquisitions, one complex spectrum per time point, and, when denoising, the
-    singular values so the knee can be inspected and an explicit --rank chosen.
-    """
-    acqs = list(input)
-    if not acqs:
-        return
-    fids = [extract_fid(acq) for acq in acqs]
-    nsamples = min(f.shape[0] for f in fids)
-    # stack as (nsamples, nspectra); truncate to common length for safety
-    matrix = np.stack([f[:nsamples] for f in fids], axis=1)
-
-    singular_values = None
-    used_rank = None
-    if denoise:
-        result = denoise_svd(matrix, rank)
-        matrix, singular_values, used_rank = result.matrix, result.singular_values, result.rank
-        print(f"SVD denoising: matrix={matrix.shape}, rank={used_rank}, "
-              f"top singular values={np.round(singular_values[:min(10, len(singular_values))], 4)}",
-              file=sys.stderr)
-
-    # frequency / ppm axis from the dwell time
-    dwell_s = acqs[0].head.sample_time_ns / 1e9
-    freq_hz = np.fft.fftshift(np.fft.fftfreq(nsamples, d=dwell_s))
-    carrier_mhz = (header.experimental_conditions.h1resonance_frequency_hz or 0) / 1e6
-    xaxis = freq_hz / carrier_mhz if carrier_mhz > 0 else freq_hz   # ppm, else Hz
-
-    # line-broadening apodization applied to the FIDs before FFT
-    t = np.arange(nsamples) * dwell_s
-    apod = np.exp(-np.pi * line_broadening * t)
-
-    for acq in acqs:
-        yield mrd.StreamItem.Acquisition(acq)
-
-    if singular_values is not None:
-        yield emit(singular_values,
-                   dimension_labels=[mrd.ArrayDimension.SAMPLES],
-                   description="singular_values",
-                   svd_rank=used_rank)
-
-    for j, acq in enumerate(acqs):
-        spectrum = np.fft.fftshift(np.fft.fft(matrix[:, j] * apod))
-        yield emit(spectrum,
-                   dimension_labels=[mrd.ArrayDimension.FREQUENCY],
-                   description="global_spect",
-                   xscale_ppm=xaxis,
-                   repetition=j,
-                   acquisition_time_stamp_ns=int(acq.head.acquisition_time_stamp_ns or 0),
-                   **{"line broadening(Hz)": line_broadening})
-
-
 # ---------- driver -------------------------------------------------------
-
-
-def acquisition_reader(input: Iterable[mrd.StreamItem]) -> Iterable[mrd.Acquisition]:
-    """Yield just the acquisitions out of an mrd stream."""
-    for item in input:
-        if isinstance(item, mrd.StreamItem.Acquisition):
-            yield item.value
-
-
-def is_epsi_acquisition(acq: mrd.Acquisition) -> bool:
-    """
-    Whether an acquisition records an EPSI switch layout, the same generic, header-agnostic signal
-    MRStomrd2 decides from (mrs.nswitch) rather than the sequence name, read from the other side:
-    the converter only ever populates user_int with [nswitch, totalppswitch] for an EPSI readout, so
-    a valid pair here means the same thing switch_layout()'s own guard checks a few lines later
-    """
-    user_int = list(acq.head.user_int or [])
-    return len(user_int) >= 2 and int(user_int[0]) > 0
 
 
 def reconstruct_mrs(input: BinaryIO,
@@ -892,47 +743,52 @@ def reconstruct_mrs(input: BinaryIO,
                     *,
                     line_broadening: float,
                     spec: PeakSpec,
-                    denoise: bool = False,
-                    rank: int = None,
                     fit_df: float = 0.0,
                     fit_dw: float = 0.0,
                     fit_dph: float = 0.0) -> None:
-    """Reconstruct one converted file, choosing the reconstruction from its acquisitions."""
+    """
+    Reconstruct one converted EPSI file.
+
+    The EPSI test is the same generic, header-agnostic signal MRStomrd2 decides from
+    (mrs.nswitch) rather than the sequence name, read from the other side: the converter only
+    ever populates user_int with [nswitch, totalppswitch] for an EPSI readout. It runs before
+    the writer is opened, so a non-EPSI file fails with this message rather than unwinding the
+    writer mid-protocol behind a ProtocolError about unwritten data.
+    Raises:
+        - ValueError if the file holds no acquisitions, or acquisitions that are not EPSI
+    """
     with mrd.BinaryMrdReader(input) as reader:
+        header = reader.read_header()
+        acquisitions = (item.value for item in reader.read_data()
+                        if isinstance(item, mrd.StreamItem.Acquisition))
+
+        first = next(acquisitions, None)
+        if first is None:
+            raise ValueError("this file holds no acquisitions")
+        user_int = list(first.head.user_int or [])
+        if len(user_int) < 2 or int(user_int[0]) <= 0:
+            raise ValueError("this file is not an EPSI acquisition: it records no switch layout "
+                             "in user_int. This reconstruction is EPSI only")
+        acquisitions = itertools.chain([first], acquisitions)
+
         with mrd.BinaryMrdWriter(output) as writer:
-            header = reader.read_header()
             append_recon_header(header,
                                 line_broadening=line_broadening,
                                 spec=spec,
-                                denoise=denoise,
-                                rank=rank,
                                 fit_df=fit_df,
                                 fit_dw=fit_dw,
                                 fit_dph=fit_dph)
             writer.write_header(header)
-            acquisitions = acquisition_reader(reader.read_data())
-            first = next(acquisitions, None)
-            epsi = first is not None and is_epsi_acquisition(first)
-            acquisitions = itertools.chain([first], acquisitions) if first is not None else iter(())
-            if epsi:
-                writer.write_data(
-                    reconstruct_epsi(header, acquisitions,
-                                     line_broadening=line_broadening,
-                                     spec=spec,
-                                     denoise=denoise,
-                                     rank=rank,
-                                     fit_df=fit_df,
-                                     fit_dw=fit_dw,
-                                     fit_dph=fit_dph))
-            else:
-                writer.write_data(
-                    reconstruct_spectral(header, acquisitions,
-                                         line_broadening=line_broadening,
-                                         denoise=denoise,
-                                         rank=rank))
+            writer.write_data(
+                reconstruct_epsi(header, acquisitions,
+                                 line_broadening=line_broadening,
+                                 spec=spec,
+                                 fit_df=fit_df,
+                                 fit_dw=fit_dw,
+                                 fit_dph=fit_dph))
 
 
-def build_parser() -> argparse.ArgumentParser:
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Reconstruct MRS data from an mrd2 file. Peaks are named as "
                     "-<name>[_smt] <ppm>, e.g. -pyr_s 9.7 -lac_m 21.8")
@@ -940,15 +796,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-i", "--input", type=Path, required=False, help="Input mrd2 file")
     parser.add_argument("-o", "--output", type=Path, required=False, help="Output mrd2 file")
     parser.add_argument("-lb", "--line-broadening", type=float, default=42, required=False, help="Line broadening factor in Hz")
-    parser.add_argument("-d", "--denoise", action="store_true", help="Apply truncated-SVD denoising before the transform")
-    parser.add_argument("-r", "--rank", type=int, default=None, required=False, help="Number of singular values to retain (default: auto via Gavish-Donoho)")
     parser.add_argument("-df", "--fit-df", type=float, default=0.0, required=False, help="How far a peak center may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
     parser.add_argument("-dw", "--fit-dw", type=float, default=0.0, required=False, help="How far a peak width may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
     parser.add_argument("-dph", "--fit-dph", type=float, default=0.0, required=False, help="How far a peak phase may move from the global fit during the per-voxel fit, in radians. Default 0, i.e. held at the global fit")
-    return parser
 
-if __name__ == "__main__":
-    parser = build_parser()
     # the peak arguments have to come out before argparse sees them, since a peak's value may be
     # negative and argparse would read that as another option
     reserved = {option for action in parser._actions for option in action.option_strings}
@@ -957,45 +808,41 @@ if __name__ == "__main__":
 
     recon_kwargs = dict(line_broadening=args.line_broadening,
                         spec=spec,
-                        denoise=args.denoise,
-                        rank=args.rank,
                         fit_df=args.fit_df,
                         fit_dw=args.fit_dw,
                         fit_dph=args.fit_dph)
 
     if args.folder and args.input:
-        raise ValueError("Cannot specify both --folder and --input")
+        raise ValueError("Cannot specify both --folder (local only) and --input")
     elif args.folder:
         if not args.folder.is_dir():
             raise ValueError(f"{args.folder} is not a directory")
         else:
-            # MRStomrd2 names a converted scan <meas_id>_<sequence>.mrd2, so there is no fixed
-            # filename to look for and one directory can hold several. Everything this run writes
-            # ends in _recon.mrd2, and so does anything an earlier run left behind, which is what
-            # separates the inputs from the outputs
             mrd2_filepaths: List[Path] = []
             for root, dirnames, filenames in os.walk(args.folder):
                 for filename in sorted(filenames):
                     if filename.endswith(".mrd2") and not filename.endswith("_recon.mrd2"):
                         mrd2_filepaths.append(Path(os.path.join(root, filename)))
             if len(mrd2_filepaths) > 0:
-                # for raw filepath, run reconstruct with parameters from cmd line arguments
                 for i, input_filepath in enumerate(mrd2_filepaths):
-                    # named after the input rather than its directory, so that two scans converted
-                    # into one directory do not reconstruct over each other
+                    # generate output file with suffix '_recon.mrd2' of raw filename
                     recon_filepath = input_filepath.with_name(input_filepath.stem + "_recon.mrd2")
                     print(f"Reconstructing {i+1}/{len(mrd2_filepaths)} at: {recon_filepath}", file=sys.stderr)
-                    with open(input_filepath, "rb") as input, open(recon_filepath, "wb") as output:
-                        reconstruct_mrs(input, output, **recon_kwargs)
+                    try:
+                        with open(input_filepath, "rb") as input, open(recon_filepath, "wb") as output:
+                            reconstruct_mrs(input, output, **recon_kwargs)
+                    except ValueError as err:
+                        # a folder holds whatever was converted into it, and this reconstruction is
+                        # EPSI only. One spectral scan among the inputs should not abandon the rest,
+                        # so drop the empty output it left behind and carry on
+                        recon_filepath.unlink(missing_ok=True)
+                        print(f"  skipping {input_filepath.name}: {err}", file=sys.stderr)
             else:
-                raise ValueError(f"No mrd2 files found in {args.folder}")
+                raise ValueError(f"No raw mrd2 files found in {args.folder}")
     elif args.input:
-        if not args.input.is_file():
-            raise ValueError(f"{args.input} is not a file")
+        # no is_file() check: under tyger --input is a named pipe, for which it is False
         if args.output is None:
-            raise ValueError("--output must be specified with --input")
-        if not args.output.parent.is_dir():
-            raise ValueError(f"Output directory {args.output.parent} does not exist")
+            raise ValueError("--input needs --output")
         with open(args.input, "rb") as input, open(args.output, "wb") as output:
             reconstruct_mrs(input, output, **recon_kwargs)
     else:
