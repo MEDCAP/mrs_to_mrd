@@ -1,0 +1,40 @@
+# Stage 2. Take the EPSI echo drift out of a converted MRD2 stream.
+#
+#   tyger run exec -f tyger_deploy/shift_codespec.yml < raw.mrd2 > corrected.mrd2
+#
+# Optional in the chain. The drift is real on most kidney experiments and absent on a few, and
+# mrd2shift reports no measurement rather than a drift when the search lands on its bound, so a
+# scan that does not drift passes through rather than being bent.
+#
+# -o is passed explicitly here. Left off, mrd2shift names the output after the input, which under
+# tyger is the input FIFO's path.
+job:
+  codespec:
+    image: ghcr.io/medcap/mrs-shift:latest
+    buffers:
+      inputs: ["input"]
+      outputs: ["output"]
+    args:
+      - -i
+      - $(INPUT_PIPE)
+      - -o
+      - $(OUTPUT_PIPE)
+      # ARGS_BEGIN  (run-tyger.sh replaces everything between the markers)
+      # ARGS_END
+    resources:
+      requests:
+        # the drift search sweeps the whole switch train per candidate slope, over acquisitions
+        # that are all in memory at once
+        cpu: 2
+        memory: 4G
+
+  tags:
+    version: "1.0"
+
+  nodePool: cpunp
+
+  replicas: 1
+
+cluster: tep-centralus-1
+
+timeoutSeconds: 3600

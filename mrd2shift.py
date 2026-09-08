@@ -1,1268 +1,1004 @@
 """
-EVO2 epsi data shows a drift and shift of echo position, relative to the sampling window
-To account for the correction, this script calculates the largest peak position and tries to 
-align them on the expected peak position so that the mrd2recon stays relevant 
+Take the EPSI echo drift out of a converted MRD v2 stream.
 
-It can take a converted raw file as input.
-    -i/--input   a single raw .MRD file
+The middle stage of the pipeline:  tar -> MRStomrd2.py -> mrd2shift.py -> mrd2recon.py
+
+THE DEFECT.  The scanner records no_samples and no_switches separately, so everything downstream
+divides: 1792/64 = 28 samples per switch on the cirrhrat data.  That division is wrong - the real
+gradient period is 28.1937 samples.  Block i therefore starts 0.1937*i samples out of step with the
+gradient cycle it describes, and the echo appears to walk +12.2 samples across a 64 switch train.
+The reconstruction reads the same window out of every switch, so early switches are read correctly
+and late ones collect gradient ramp instead of signal.
+
+Two axes, and which is which matters: position within a switch is kx, the readout direction; the
+switch index is time, and becomes the spectral axis after the transform.
+
+THE MEASUREMENT.  fit_peak_lines fits the per-switch peaks as two parallel lines sharing one slope.
+Two lines because a switch crosses k-space centre twice - the readout echo on the plateau and the
+rephasing echo after it - so the brightest position in a switch is whichever of them won there, and
+what looks like scatter is two orderly families.  Sharing the slope means every switch constrains
+it rather than only the ones that happened to peak on the readout echo.
+
+THE BASE.  Before any of that, the whole readout is moved onto the position the sequence asks for by
+pushing zeros in at its front - measure_pad works out how many from where switch 0's readout echo
+sits against the `discard_pre + npoints_per_switch/2` the sequence puts it at, and prepend_zeros
+applies it.  Switch 0 is barely displaced by the drift, so once it is on target the first few
+switches can be trusted and everything left to correct is the accumulation along the train.  The
+number this measures is the `ramp + 3` an older converter hard-coded per tramp: +7 on the tramp 112
+cirrhrat data, +5 on the tramp 100 kidney data.  --pad overrides it, and --pad 0 turns it off.
+
+THE CORRECTION.  On top of that base, each switch i is displaced by delta_i = -slope * i, anchored on
+switch 0 so the train is pulled back onto the position the base put switch 0 at.  Where that
+displacement is applied is the whole question, and --method selects it:
+
+    regrid      exact, resampling the whole readout onto the period it was acquired at (default)
+    contiguous  exact, over the whole switch, along the contiguous readout rather than wrapping
+    shift       exact, over the whole switch, cyclically
+    roll        the fractional part rounded away, over the contiguous readout      (control)
+    alloc       the fractional part linearly interpolated, over the contiguous readout (control)
+
+A `phase` method, a phase ramp applied inside the reconstruction's window alone, was dropped: it
+leaves the readout where it was by construction, so it cannot straighten the echo, and measured on
+cirrhrat_43_1 it made the global fit worse than no correction at all (residual 1.648 against 1.284).
+
+    python mrd2shift.py -i raw.mrd2 -o straight.mrd2
+    cat raw.mrd2 | python mrd2shift.py -i - -o - | ...
+    python mrd2shift.py -i raw.mrd2 -p methods.png          # every method drawn, nothing written
+
+Both default to $INPUT_PIPE/$OUTPUT_PIPE, so a Tyger codespec needs no arguments.  The whole stream
+is held in memory: the drift is measured from every acquisition before the first can be written, and
+a buffer FIFO can only be read once.  Every diagnostic goes to stderr - anything on stdout lands in
+the middle of the stream and the next stage dies on its magic bytes.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 import mrd
-from MRSreader import MRSdata
-from MRSorganize import ScanGroup, organize_folder, read_scan_tar
 
-
-# How wide a drift the search covers, in samples per switch. The kidney data runs from -0.03 on the
-# one experiment that does not drift to +0.27 on the worst that does, so half a sample per switch,
-# which sweeps the echo one and a half switch widths over a 64 switch train, leaves ample room. A
-# winner sitting on this bound is reported as no measurement rather than as a drift, since it means
-# either the real optimum is outside the range or there was no optimum and noise won
+# How wide a drift the search covers, in samples per switch, and how finely.  Half a sample sweeps
+# the echo one and a half switch widths over a 64 switch train; the kidney scans run -0.03 to +0.27
+# and cirrhrat_43_1 fits +0.1937.
 DRIFT_SLOPE_LIMIT = 0.5
-DRIFT_COARSE_STEP = 0.02        # first pass over that range
-DRIFT_FINE_STEP = 0.002         # second pass, one coarse step either side of the winner
-# How much sharper removing the drift has to make the readout profile before the drift is believed,
-# as a ratio of peak over median after to peak over median before. Measured across five experiments:
-# 1.05 on the one with no drift, 1.85 and above on the four with one, so the threshold sits in a
-# wide gap rather than on a cliff
-DRIFT_MIN_GAIN = 1.5
-# peak over median the corrected profile has to reach, so that a large ratio on a scan that had no
-# echo to sharpen either way is refused rather than acted on
-DRIFT_MIN_SNR = 5.0
+DRIFT_FINE_STEP = 0.002
+# How far off its own fitted line a family may sit before the peaks are called noise.  Real data
+# reads 0.4-0.9 positions; a readout with no echo reads 2.1-2.6 with the switches split about evenly.
+DRIFT_MAX_RMS = 1.5
+# What was taken out, recorded so a second pass refuses rather than correcting twice.
+SLOPE_PARAMETER = "echo_drift_slope_applied"
+PAD_PARAMETER = "echo_drift_pad_applied"
+METHOD_PARAMETER = "echo_drift_method"
+METHODS = ("shift", "regrid", "contiguous", "roll", "alloc")
+DEFAULT_METHOD = "regrid"
 
-# ndarray -> identify peaks
-# ndarray, identified peaks -> plot
-# mrd.acquisition -> ndarray
-# groups -> ndarray
 
-# helper function to call from MRStomrd2.py for local testing on scan_groups
-def check_peak_position(scan_groups: ScanGroup) -> bool:
+# ---------- the stream ------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def open_binary(path: str, mode: str):
+    """A binary stream for a path, or stdin/stdout when the path is -, which is left unclosed."""
+    if path == "-":
+        yield sys.stdin.buffer if mode == "rb" else sys.stdout.buffer
+        return
+    with open(path, mode) as stream:
+        yield stream
+
+
+def read_stream(path: str) -> Tuple[mrd.Header, List[mrd.StreamItem]]:
+    """Read a whole stream into memory, keeping non-acquisition items so a rewrite passes them on."""
+    # opening a FIFO for read blocks until the buffer sidecar opens the write end
+    with open_binary(path, "rb") as stream:
+        with mrd.BinaryMrdReader(stream) as reader:
+            header = reader.read_header()
+            items = list(reader.read_data())
+    return header, items
+
+
+def write_stream(path: str, header: mrd.Header, items: Sequence[mrd.StreamItem]) -> None:
+    """Write the header and every item back out, opened even when nothing changed."""
+    with open_binary(path, "wb") as output:
+        # closing the writer is what emits the end-of-stream sentinel, hence the with block
+        with mrd.BinaryMrdWriter(output) as writer:
+            writer.write_header(header)
+            writer.write_data(items)
+
+
+def header_long(header: mrd.Header, name: str) -> Optional[int]:
+    """The named long user parameter, or None when the header does not carry it."""
+    user = getattr(header, "user_parameters", None)
+    for param in (getattr(user, "user_parameter_long", None) or []):
+        if param.name == name:
+            return int(param.value)
+    return None
+
+
+def switch_layout(header: mrd.Header, acq: mrd.Acquisition) -> Tuple[int, int, int, int]:
     """
-    Check where the readout and rephasing echoes happen per switch for raw data, not prescan data
+    (nswitch, total, kept, start) - the switch train, and the window the reconstruction reads.
 
+    MRStomrd2 records nswitches and npoints_per_switch on the header and discard_pre per
+    acquisition, and mrd2recon slices `discard_pre : discard_pre + npoints_per_switch`, so that
+    slice is what a correction aimed at the reconstruction has to target.
+
+    `kept` comes from this acquisition's own discards where they account for the switch, and only
+    then from the header.  npoints_per_switch is written once for a whole file, and a file holds the
+    series and a prescan acquired on a different switch period: on cirrhrat_43_1 the header says 12,
+    which is the series' kept and closes its 28 point switch, while the prescan's 34 point switch is
+    `4 + 18 + 3*4` and closes at 18.  Reading 12 off the header for both puts the prescan's window
+    and its expected echo position six samples from where they are.
+    """
+    nswitch = header_long(header, "nswitches") or 1
+    total = acq.samples() // max(nswitch, 1)
+    start = acq.head.discard_pre or 0
+    own = total - start - (acq.head.discard_post or 0)
+    if own > 0 and 4 * start + own == total:
+        return nswitch, total, own, start
+    return nswitch, total, (header_long(header, "npoints_per_switch") or 0) or total, start
+
+
+def acquisition_cube(acqs: Sequence[mrd.Acquisition], nswitch: int,
+                     total: int) -> Tuple[np.ndarray, int]:
+    """
+    One layout's acquisitions as a (switch, position, view, repetition) cube.
+
+    Views and repetitions are taken from the indices the converter set rather than their counts, so
+    a group missing one still lands in the right column.
+    """
+    views = sorted({int(a.head.idx.kspace_encode_step_1 or 0) for a in acqs})
+    reps = sorted({int(a.head.idx.repetition or 0) for a in acqs})
+    view_at = {v: i for i, v in enumerate(views)}
+    rep_at = {r: i for i, r in enumerate(reps)}
+
+    used = nswitch * total
+    cube = np.zeros((nswitch, total, len(views), len(reps)), dtype=np.complex128)
+    filled = np.zeros((len(views), len(reps)), dtype=bool)
+    for acq in acqs:
+        samples = np.asarray(acq.data)
+        # MRS acquires on one channel; summed rather than assumed, so a multi coil stream still reads
+        line = samples[0] if samples.shape[0] == 1 else samples.sum(axis=0)
+        v = view_at[int(acq.head.idx.kspace_encode_step_1 or 0)]
+        r = rep_at[int(acq.head.idx.repetition or 0)]
+        cube[:, :, v, r] = line[:used].reshape(nswitch, total)
+        filled[v, r] = True
+    return cube, int((~filled).sum())
+
+
+# Both, because the converter has used each in turn: MRStomrd2 marks an averaged prescan
+# IS_NOISE_MEASUREMENT today and mrd2recon reads that, while several docstrings and fid_recon still
+# name IS_NAVIGATION_DATA. Accepting either is what lets this read a stream from before or after
+# that change, and mrd2_recon_from_main.PRESCAN_FLAGS does the same for the same reason.
+PRESCAN_FLAGS = int(mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT) | int(
+    mrd.AcquisitionFlags.IS_NAVIGATION_DATA)
+
+
+def is_prescan(acq: mrd.Acquisition) -> bool:
+    """Whether this acquisition is the averaged prescan that calibrates the data, not data."""
+    return bool(int(acq.head.flags) & PRESCAN_FLAGS)
+
+
+# ---------- measuring the drift ---------------------------------------------------------------
+
+
+def fit_peak_lines(signal: np.ndarray) -> dict:
+    """
+    Fit the two parallel lines the per-switch peaks lie on.
+
+    A switch crosses k-space centre twice, so its brightest position is whichever echo won there and
+    a plot of those positions is two straight lines, not one line with outliers.  One slope is fitted
+    through every switch of both families with an intercept each, so all of them constrain the number
+    the correction uses, and the separation is measured from the same fit.
     Args:
-        - scan_groups: the scan to walk, from mrs_organize. Only its real data is read; the averaged
-          prescan beside it calibrates a reconstruction rather than being reconstructed
+        - signal: (switch, position) magnitude
+    Returns:
+        - the peaks, the shared slope, each line's intercept and rms, and which family each switch
+          fell in
+    """
+    nswitch, total = signal.shape
+    switches = np.arange(nswitch)
+    peaks = np.argmax(signal, axis=1)
+
+    # the one slope and separation leaving every switch nearest to one of two parallel lines,
+    # searched rather than derived because the assignment depends on the slope and vice versa
+    # The separation is not a free parameter and must not be searched.  The two crossings of k-space
+    # centre sit ppsw/2 + 2*ramp apart, and since period = ppsw + 4*ramp that is identically
+    # period/2 - so ppsw cancels and the spacing carries no information beyond the period.  Worse,
+    # period/2 is exactly where a two-line model cannot resolve: line + period/2 and line - period/2
+    # are the same line relabelled, so least squares is *repelled* from the truth.  Measured on
+    # cirrhrat_43_1 the loss reads 22.2 at separation 12, 81.3 at the true 14, and 22.2 again at 16.
+    # Pinning it leaves the shared slope, which is the only thing here that was ever identifiable.
+    separation = total / 2
+    best = None
+    for slope in np.arange(-DRIFT_SLOPE_LIMIT, DRIFT_SLOPE_LIMIT + DRIFT_FINE_STEP / 2,
+                           DRIFT_FINE_STEP):
+        residual = (peaks - peaks[0] - slope * switches + total / 2) % total - total / 2
+        nearer = np.minimum(np.abs(residual),
+                            np.abs((residual - separation + total / 2) % total - total / 2))
+        cost = float((nearer ** 2).sum())
+        if best is None or cost < best[0]:
+            best = (cost, float(slope))
+    _, slope = best
+
+    residual = (peaks - peaks[0] - slope * switches + total / 2) % total - total / 2
+    off_second = (residual - separation + total / 2) % total - total / 2
+    first = np.abs(residual) <= np.abs(off_second)
+    # unwrapped about whichever line each switch fell on, so a family crossing the switch boundary is
+    # a straight line to fit rather than one that jumps by `total` at the crossing
+    unwrapped = peaks[0] + slope * switches + np.where(first, residual, separation + off_second)
+
+    counts = (int(first.sum()), int((~first).sum()))
+    if min(counts) >= 2:
+        design = np.column_stack((switches, first, ~first)).astype(float)
+        solution = np.linalg.lstsq(design, unwrapped, rcond=None)[0]
+        slope, first_c, second_c = float(solution[0]), float(solution[1]), float(solution[2])
+    else:
+        fitted = np.polyfit(switches, unwrapped, 1)
+        slope, first_c = float(fitted[0]), float(fitted[1])
+        second_c = first_c + separation
+
+    def spread(family, intercept):
+        if not family.any():
+            return float('nan')
+        return float(np.sqrt(((unwrapped[family] - (intercept + slope * switches[family])) ** 2).mean()))
+
+    return dict(peaks=peaks, slope=slope, separation=float(second_c - first_c),
+                first_intercept=first_c, second_intercept=second_c, first_family=first,
+                on_first=counts[0], on_second=counts[1],
+                first_rms=spread(first, first_c), second_rms=spread(~first, second_c))
+
+
+def measure_drift(cube: np.ndarray, nswitch: int, total: int) -> dict:
+    """
+    How fast the echo walks along the switch train, fitted from the per-switch peaks.
+
+    This replaces an FFT-coherent search that scored candidate slopes by how sharp they left the
+    readout profile.  On cirrhrat_43_1 that search refuses the scan outright and, forced, returns
+    +0.2700 where the truth is +0.1937: de-drifting at +0.1937 and refitting leaves -0.001 residual
+    and lands the readout echo on the position the sequence predicts, which +0.2700 does not.
+    Returns:
+        - usable, reason, the slope, the drift over the train, the implied period, and the fit
+    """
+    lines = fit_peak_lines(np.abs(cube).sum(axis=(2, 3)))
+    slope = float(lines['slope'])
+    drift = slope * (nswitch - 1)
+    spread = [r for r in (lines['first_rms'], lines['second_rms']) if np.isfinite(r)]
+    worst = max(spread) if spread else float('inf')
+
+    report = dict(usable=False, reason="", slope=slope, drift=drift, period=total + slope,
+                  rms=worst, lines=lines, nswitch=nswitch, total=total)
+    if worst >= DRIFT_MAX_RMS:
+        report['reason'] = (f"the per switch peaks sit {worst:.2f} positions off the lines fitted "
+                            f"through them, past the {DRIFT_MAX_RMS} that separates a readout with "
+                            f"an echo from one where the argmax is landing on noise")
+    elif abs(drift) < 1.0:
+        report['reason'] = (f"the fitted drift, {drift:+.2f} samples over {nswitch} switches, is "
+                            f"below the one sample it would take to move anything")
+    else:
+        report['usable'] = True
+        report['reason'] = (f"{drift:+.2f} samples over {nswitch} switches, {slope:+.4f} per switch, "
+                            f"through {lines['on_first']}/{lines['on_second']} switches on the two "
+                            f"echoes, rms {worst:.2f}")
+    return report
+
+
+def switch_offsets(nswitch: int, slope: float) -> np.ndarray:
+    """
+    The displacement per switch, anchored on switch 0.
+
+    delta_i = -slope * i, so switch 0 does not move and every later switch is pulled back onto it.
+    Anchored there and not on the middle of the train because the zero-pad base is what decides the
+    absolute position, and it decides it from switch 0: switch 0 carries the least drift and the most
+    signal, so it is the one reading of the echo position worth trusting.  A mid-train anchor would
+    hold the *mean* position instead, and the two would compose into a readout sitting half the
+    drift - six samples of a twelve point window on cirrhrat - past where the pad aimed it.
+
+    The cost is that the largest displacement now falls at the end of the train, slope * (M-1)
+    rather than half that.  `shift` is the only method that still wraps inside a switch, so it is the
+    only one for which that means more of the switch's own ramp pulled into the window at the far
+    end; contiguous, regrid, roll and alloc all read from the neighbouring switch instead and do not
+    pay it.  Which is a difference -p is there to show.
+    """
+    return -slope * np.arange(nswitch)
+
+
+def geometry_closes(total: int, kept: int, start: int) -> bool:
+    """
+    Whether a layout's own numbers account for its switch, `ramp + kept + 3 ramps == total`.
+
+    The epsi readout loop runs rampup -> kept -> rampdown -> rephasing, so a switch holds
+    `4 * ramp + npoints_per_switch` samples, and `discard_pre` is the ramp.  When that does not add
+    up, the layout is not described by the numbers attached to it and nothing derived from them -
+    above all `start + kept // 2`, where the echo is supposed to be - can be trusted.
+
+    Both of cirrhrat_43_1's layouts do close, once switch_layout takes `kept` from each
+    acquisition's own discards rather than from the file-wide header: the series at `4 + 12 + 3*4`
+    = 28, the prescan at `4 + 18 + 3*4` = 34.  This stays as the guard for the case where they do
+    not - the kidney data, where `4*2.5 + 12` is 22 against a 20 point switch, is one.
+    """
+    return 4 * start + kept == total
+
+
+def readout_anchor(lines: dict, signal: np.ndarray, total: int) -> float:
+    """
+    Where switch 0's *readout* echo sits, read off the fitted lines rather than its own argmax.
+
+    A switch crosses k-space centre twice and the two crossings sit exactly total/2 apart, so the two
+    candidate anchors are equally far from any target and proximity cannot choose between them.
+    Brightness can: the readout echo is on the gradient plateau where the signal is, and the
+    rephasing one is not, so the family whose peaks average brighter is the readout family.
+
+    Read off the fitted line rather than off switch 0 itself because switch 0 peaks on whichever of
+    its two echoes won there.  On cirrhrat_43_1 that is the rephasing one - its argmax reads 17 where
+    its neighbours read 3, 4, 5 - and anchoring on that would aim the whole correction at the wrong
+    echo, putting the readout echo at position 1 of 28.
+    Args:
+        - lines: what fit_peak_lines returned for `signal`
+        - signal: (switch, position) magnitude, the array `lines` was fitted from
+    Returns:
+        - switch 0's readout echo position, wrapped into one switch
+    """
+    peaks = lines['peaks']
+    first = lines['first_family']
+    brightness = signal[np.arange(len(peaks)), peaks]
+    on_first = float(brightness[first].mean()) if first.any() else -np.inf
+    on_second = float(brightness[~first].mean()) if (~first).any() else -np.inf
+    intercept = lines['first_intercept'] if on_first >= on_second else lines['second_intercept']
+    return float(intercept % total)
+
+
+def measure_pad(anchor: float, total: int, start: int, kept: int) -> int:
+    """
+    How many zeros to push in at the front so switch 0's echo lands where the sequence puts it.
+
+    `start + kept // 2` is ramp + npoints_per_switch/2, the middle of the gradient plateau.  It is
+    taken from discard_pre as MRStomrd2 writes it - the ramp - and not from the centred
+    (total - kept)//2 an older reading of this file assumed; on cirrhrat those differ by 4.
+
+    Reduced the short way round the switch, since a position is cyclic within one: an anchor at 26 of
+    28 reaching a target of 2 has moved +4, not -24.
+    """
+    expected = start + kept // 2
+    return int(round((expected - anchor + total / 2) % total - total / 2))
+
+
+# ---------- applying it -----------------------------------------------------------------------
+
+
+def prepend_zeros(data: np.ndarray, pad: int) -> np.ndarray:
+    """
+    Move the whole readout `pad` samples later by pushing zeros in at its front.
+
+    Not a roll.  The readout is one continuous time series, so what falls off the end of the train is
+    gone rather than wrapped back to its start, and the positions switch 0 gains at its front were
+    never measured - zero says that, where a wrapped sample would claim the tail of the train was
+    acquired before its head.  A negative pad drops that many leading samples and zero-fills the tail
+    instead, which is the same statement made at the other end.
+    Args:
+        - data: (coils, samples)
+        - pad: samples to push in at the front, negative to drop them from it
+    """
+    out = np.zeros_like(data)
+    if pad > 0:
+        out[:, pad:] = data[:, :data.shape[1] - pad]
+    elif pad < 0:
+        out[:, :data.shape[1] + pad] = data[:, -pad:]
+    else:
+        out[:] = data
+    return out
+
+
+def _phase_shift(block: np.ndarray, offset: float, axis: int = 0) -> np.ndarray:
+    """One exact cyclic displacement by the shift theorem, along `axis`."""
+    n = block.shape[axis]
+    kernel = np.fft.fftfreq(n) * n
+    shape = [1] * block.ndim
+    shape[axis] = n
+    spectrum = np.fft.fft(block, axis=axis)
+    return np.fft.ifft(spectrum * np.exp(-2j * np.pi * kernel.reshape(shape) * offset / n),
+                       axis=axis)
+
+
+def apply_switch(data: np.ndarray, offsets: np.ndarray, nswitch: int, total: int) -> np.ndarray:
+    """
+    Displace each switch over the whole switch, exactly, so the window ends up holding different
+    samples.
+
+    That is what re-centres the k-space line on the echo and fixes the asymmetric truncation which
+    broadens the spatial point spread - it sharpens the metabolite map, where a phase confined to the
+    window cannot.  Cyclic: what a switch's own displacement pulls in at the end furthest from the
+    anchor is that switch's own ramp and rephasing points, not a real neighbour, and the weight this
+    implicitly puts on them never reaches zero the way a truncated sinc does - see _phase_shift's
+    impulse response.  `roll` and `alloc` both read the real neighbour instead; see apply_roll and
+    apply_alloc.
+    """
+    used = nswitch * total
+    out = np.array(data, copy=True).astype(np.complex128)
+    body = out[:, :used].reshape(out.shape[0], nswitch, total)
+    for i, offset in enumerate(offsets):
+        body[:, i, :] = _phase_shift(body[:, i, :], float(offset), axis=1)
+    out[:, :used] = body.reshape(out.shape[0], used)
+    return out
+
+
+def apply_roll(data: np.ndarray, offsets: np.ndarray, nswitch: int, total: int) -> np.ndarray:
+    """
+    Displace each switch by the nearest whole sample, read from the real contiguous readout.
+
+    `roll` throws away the same fractional part `shift` corrects for - the question it exists to
+    answer is what that fraction is worth - but there is no reason to also throw away where the
+    whole-sample part of the shift points.  `np.roll` wraps within one switch, so what fills the far
+    end of a large displacement is that switch's own ramp and rephasing samples: junk, standing in
+    for a real neighbour that the readout actually has.  This reads that neighbour instead, at
+    whatever integer position `switch_offsets` rounds to, over the same contiguous coordinate
+    `apply_contiguous` uses - it differs from it only in reading one real sample per position rather
+    than interpolating sixteen.
+    Args:
+        - offsets: per-switch displacement in samples, from switch_offsets; rounded here to the
+          nearest whole sample before it addresses anything
+    """
+    used = nswitch * total
+    whole = np.rint(offsets).astype(int)
+    source = (np.arange(used).reshape(nswitch, total) - whole[:, None]).ravel()
+    inside = (source >= 0) & (source < used)
+    out = np.array(data, copy=True).astype(np.complex128)
+    moved = np.zeros((data.shape[0], used), dtype=np.complex128)
+    moved[:, inside] = out[:, source[inside]]
+    out[:, :used] = moved
+    return out
+
+
+def apply_alloc(data: np.ndarray, offsets: np.ndarray, nswitch: int, total: int) -> np.ndarray:
+    """
+    Displace each switch by a linear blend of its two nearest real neighbours.
+
+    The two-tap answer to what roll and shift answer more crudely and more precisely: split the
+    fractional part of the displacement between the two samples straddling the source position, in
+    proportion to how close each one is - a source of 1142.748 reads mostly the sample at 1143
+    (weight 0.748, since it is only 0.252 away) and a little of 1142 (weight 0.252).  Read from the
+    contiguous readout, over the same source coordinate apply_contiguous and apply_roll use, so a
+    large displacement pulls in a real neighbouring switch rather than wrapping - unlike the cyclic
+    two-tap blend this replaces, which shaded the field of view instead of blurring it for the same
+    reason `shift` and `roll` used to wrap: the two taps came from within the same switch.
+    """
+    used = nswitch * total
+    source = (np.arange(used, dtype=float).reshape(nswitch, total)
+              - np.asarray(offsets)[:, None]).ravel()
+    base = np.floor(source).astype(int)
+    frac = source - base
+    out = np.array(data, copy=True).astype(np.complex128)
+    moved = np.zeros((data.shape[0], used), dtype=np.complex128)
+    for index, weight in ((base, 1.0 - frac), (base + 1, frac)):
+        inside = (index >= 0) & (index < used)
+        moved[:, inside] += weight[inside] * out[:, index[inside]]
+    out[:, :used] = moved
+    return out
+
+
+def resample(line: np.ndarray, source: np.ndarray, half_width: int = 8) -> np.ndarray:
+    """
+    Read a readout at arbitrary fractional sample positions, band-limited.
+
+    The readout is one continuous time series, so a sample between two of its points is recoverable
+    by interpolation rather than by rounding.  A Lanczos-windowed sinc, so truncating the kernel does
+    not ring, and zero outside the readout - at the two physical ends there is no neighbour, and zero
+    says "not measured" where clamping would repeat an edge.
+    Args:
+        - line: (coils, samples)
+        - source: float position to read for each output sample, same length as the readout
+    """
+    used = source.size
+    base = np.floor(source).astype(int)
+    out = np.zeros((line.shape[0], used), dtype=np.complex128)
+    for tap in range(-half_width + 1, half_width + 1):
+        index = base + tap
+        frac = source - index
+        weight = np.sinc(frac) * np.sinc(frac / half_width)
+        inside = (index >= 0) & (index < line.shape[1])
+        if inside.any():
+            out[:, inside] += weight[inside] * line[:, index[inside]]
+    return out
+
+
+def apply_regrid(data: np.ndarray, slope: float, nswitch: int, total: int,
+                 lead: float = 0.0) -> np.ndarray:
+    """
+    Resample the whole readout onto the period it was really acquired at.
+
+    The other methods displace each switch; this re-grids once.  The defect is that the stream is
+    divided by `total` where the gradient period is `total + slope`, so switch i of the real sequence
+    begins at sample `i*(total + slope)` rather than `i*total`.  Reading there and writing to `i*total`
+    puts every switch back on the grid the reconstruction assumes, with no per-switch discontinuity
+    at the boundaries and nothing wrapped.
+
+    Anchored on switch 0, like switch_offsets and for the same reason: reading switch i straight from
+    `i * (total + slope)` leaves every echo at the within-period offset switch 0 already had, which
+    is the position the zero-pad base has put where the sequence asks for it.  `lead` moves that
+    grid, and the base having already placed the readout there, it is left at zero.
+    """
+    used = nswitch * total
+    out = np.array(data, copy=True).astype(np.complex128)
+    position = np.arange(total, dtype=float)
+    source = np.concatenate([i * (total + slope) + position + lead
+                             for i in range(nswitch)])
+    out[:, :used] = resample(out[:, :used], source)
+    return out
+
+
+def apply_contiguous(data: np.ndarray, offsets: np.ndarray, nswitch: int, total: int,
+                     half_width: int = 8) -> np.ndarray:
+    """
+    Displace each switch along the contiguous readout instead of wrapping inside it.
+
+    `shift` is cyclic within a switch, so the samples it pulls in at the ends of the train - where
+    the displacement is largest - are that switch's own ramp and rephasing points.  Those are junk,
+    and burying the weak metabolites under them is what costs the whole-switch family its hydrate.
+    The readout is one continuous time series, so the samples that really sit beside the window are
+    the neighbouring switch's, and this takes those: band-limited interpolation with a windowed sinc
+    over the contiguous readout, zero only at the two physical ends where there is no neighbour.
+    Args:
+        - half_width: taps either side; 8 puts the sinc truncation well below the noise
+    """
+    used = nswitch * total
+    out = np.array(data, copy=True).astype(np.complex128)
+    source = (np.arange(used, dtype=float).reshape(nswitch, total)
+              - np.asarray(offsets)[:, None]).ravel()
+    out[:, :used] = resample(out[:, :used], source, half_width)
+    return out
+
+
+def apply_base_and_method(data: np.ndarray, pad: int, offsets: np.ndarray, slope: float,
+                          nswitch: int, total: int, method: str) -> np.ndarray:
+    """
+    The zero-pad base and then one drift method, in that order, over one readout.
+
+    The order is the whole point: the pad puts switch 0's echo where the sequence asks for it, and
+    the method straightens the walk away from there.  Reversed, the method would be straightening a
+    train about a mean the pad then moves, and the two would no longer compose.
+
+    Returned rather than written back, so the same call serves the stream correction and the -p
+    figure, which tries every method on a copy and must leave the stream alone.
+    """
+    padded = prepend_zeros(data, pad) if pad else data
+    if method == "regrid":
+        return apply_regrid(padded, slope, nswitch, total)
+    if method == "roll":
+        return apply_roll(padded, offsets, nswitch, total)
+    if method == "alloc":
+        return apply_alloc(padded, offsets, nswitch, total)
+    if method == "contiguous":
+        return apply_contiguous(padded, offsets, nswitch, total)
+    return apply_switch(padded, offsets, nswitch, total)
+
+
+def record(header: mrd.Header, slope: float, pad: int, method: str) -> None:
+    """Note what was taken out and how, so a second pass refuses rather than correcting twice."""
+    if header.user_parameters is None:
+        header.user_parameters = mrd.UserParametersType()
+    for param in header.user_parameters.user_parameter_double:
+        if param.name == SLOPE_PARAMETER:
+            param.value = float(param.value) + slope
+            break
+    else:
+        header.user_parameters.user_parameter_double.append(
+            mrd.UserParameterDoubleType(name=SLOPE_PARAMETER, value=float(slope)))
+    for param in header.user_parameters.user_parameter_long:
+        if param.name == PAD_PARAMETER:
+            param.value = int(param.value) + pad
+            break
+    else:
+        header.user_parameters.user_parameter_long.append(
+            mrd.UserParameterLongType(name=PAD_PARAMETER, value=int(pad)))
+    for param in header.user_parameters.user_parameter_string:
+        if param.name == METHOD_PARAMETER:
+            param.value = method
+            return
+    header.user_parameters.user_parameter_string.append(
+        mrd.UserParameterStringType(name=METHOD_PARAMETER, value=method))
+
+
+def header_double(header: mrd.Header, name: str) -> Optional[float]:
+    user = getattr(header, "user_parameters", None)
+    for param in (getattr(user, "user_parameter_double", None) or []):
+        if param.name == name:
+            return float(param.value)
+    return None
+
+
+def pooled_lines(acqs: Sequence[mrd.Acquisition]) -> List[np.ndarray]:
+    """
+    Each acquisition's readout as one coil-summed (1, samples) copy.
+
+    Copied, and taken before anything is applied to the stream: the correction writes back into
+    acq.data in place, so a figure built from the acquisitions afterwards would be drawing a second
+    correction on top of the first.
+    """
+    lines = []
+    for acq in acqs:
+        samples = np.asarray(acq.data)
+        # MRS acquires on one channel; summed rather than assumed, as acquisition_cube does
+        line = samples[0:1] if samples.shape[0] == 1 else samples.sum(axis=0, keepdims=True)
+        lines.append(np.array(line, copy=True))
+    return lines
+
+
+def pooled_signal(lines: Sequence[np.ndarray], nswitch: int, total: int,
+                  transform=None) -> np.ndarray:
+    """
+    A (switch, position) magnitude summed over every pooled readout, after `transform`.
+
+    The same aggregate acquisition_cube's callers take, built from the lines pooled_lines put aside
+    rather than through the (view, repetition) cube - which is what lets a method be tried on a copy
+    without writing anything back into the stream.
+    Args:
+        - lines: (1, samples) readouts, from pooled_lines
+        - transform: (coils, samples) -> (coils, samples), applied per readout; identity if None
+    """
+    used = nswitch * total
+    signal = np.zeros((nswitch, total))
+    for line in lines:
+        moved = transform(line) if transform is not None else line
+        signal += np.abs(moved[0, :used]).reshape(nswitch, total)
+    return signal
+
+
+def plot_method_matrix(panels: Sequence[Tuple[str, np.ndarray]], lines: dict, nswitch: int,
+                       total: int, start: int, kept: int, label: str, path: Path) -> None:
+    """
+    Draw where the echo sits in every switch: before the correction, and under every method.
+
+    The picture the whole correction is about: position within a switch across, switch number up, so
+    an echo that walks is a slanted stripe and a corrected one is vertical.  Every panel is drawn the
+    same way so they can be read against each other - the window the reconstruction reads is shaded,
+    and the position the sequence puts the echo at is a dotted line, which is what the pad aims
+    switch 0 at and what a working method holds the rest of the train on.
+
+    The fitted lines go on the first panel only, since that is the data they were fitted to.
+    Args:
+        - panels: ordered (title, signal) pairs, each signal a (switch, position) magnitude
+        - lines: what fit_peak_lines returned for the first panel
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    columns = min(len(panels), 4)
+    rows = -(-len(panels) // columns)
+    figure, axes = plt.subplots(rows, columns, figsize=(4.7 * columns, 5.8 * rows), squeeze=False)
+    switches = np.arange(nswitch)
+    expected = start + kept // 2
+    for index, (title, signal) in enumerate(panels):
+        ax = axes[index // columns][index % columns]
+        ax.imshow(signal, aspect='auto', origin='lower', interpolation='nearest',
+                  extent=(-0.5, total - 0.5, -0.5, nswitch - 0.5))
+        ax.axvspan(start - 0.5, start + kept - 0.5, color='w', alpha=0.16,
+                   label=f"window {start}..{start + kept - 1}")
+        ax.axvline(expected, color='C2', lw=1.1, ls=':', label=f"expected {expected}")
+        peaks = np.argmax(signal, axis=1)
+        ax.plot(peaks, switches, 'x', color='C3', ms=4, label='brightest position')
+        if index == 0:
+            for intercept, style in ((lines['first_intercept'], '-'),
+                                     (lines['second_intercept'], '--')):
+                ax.plot((intercept + lines['slope'] * switches) % total, switches, style,
+                        color='w', lw=1.2, alpha=0.8)
+            ax.plot([], [], '-', color='w', lw=1.2, label='fitted echo lines')
+        ax.set_xlabel(f"position within the {total} point switch")
+        ax.set_ylabel("switch")
+        ax.set_title(title)
+        ax.legend(fontsize=7, loc='upper right')
+    for blank in range(len(panels), rows * columns):
+        axes[blank // columns][blank % columns].axis('off')
+    figure.suptitle(label)
+    figure.tight_layout()
+    figure.savefig(path, dpi=140, bbox_inches='tight')
+    plt.close(figure)
+    print(f"  wrote {path}", file=sys.stderr)
+
+
+# ---------- the raw side, for MRStomrd2 -w ------------------------------------------------------
+
+
+def check_peak_position(group) -> int:
+    """
+    Plot where the two echoes sit in each switch, one figure per raw .MRD of one scan.
+
+    The same two-line fit the stream side uses, read off the files before conversion.  One figure per
+    file and never pooled, because pooling is what hides a file whose echo sits somewhere the others'
+    does not; the repetitions inside one file are aggregated for the opposite reason, since one
+    repetition of one view is mostly noise.
+    Args:
+        - group: a ScanGroup from MRSorganize; only its real data is read
     Returns:
         - how many files were plotted
     """
-    rawdata_across_rep = None
-    for filepath in scan_groups.rawdata_file_list:
+    # imported here so conversion needs neither the reader nor a plotting stack
+    import matplotlib.pyplot as plt
+    from MRSreader import MRSdata
+
+    plotted = 0
+    for filepath in group.rawdata_file_list:
         mrs = MRSdata()
         mrs.read_from_file(filepath)
-        # aggregate each repetition
-        if rawdata_across_rep is None:
-            rawdata_across_rep = mrs.rawdata
-        else:
-            rawdata_across_rep = np.concatenate((rawdata_across_rep, mrs.rawdata), axis=-1)
-    # revise rawdata shape from (nsamples,...) to (nswitches, nsamples/nswitches...)
-    total_points_per_switch = mrs.nsamples // mrs.nswitches
-    per_switch_rawdata = rawdata_across_rep.reshape(((mrs.nswitches, total_points_per_switch) + rawdata_across_rep.shape[1:]))
-    # sum across views and repetitions
-    per_switch_rawdata = np.sum(np.abs(per_switch_rawdata),axis=(2,6)).squeeze()
-     
-    # ramp up - readout points - ramp down - ramp up rephase - ramp down rephase
-    # ramp = mrs.tramp / mrs.sample_period 
-    # cirrhrat sample_period=280, no_samples=1792, tramp=112, points_per_switch=12, nswitches=64
-    # 112/28=4 - 12 - 4 - 4 - 4 = 1792/64 = 28
-    # expected first peak = 4 + 7 (peak sits on the right of midpoint of 12 pts) = 11 or idx=10
-    
-    # units: sample_period in 10us and tramp in us
-    ramp_points = mrs.tramp // (mrs.sample_period/10)
-    ntotal_points_per_switch = mrs.nsamples // mrs.nswitches
-    npoints_per_switch = mrs.npoints_per_switch
-    # check the tramp and points_per_switch adds up to ntotal_points_per_switch
-    assert ntotal_points_per_switch == 4 * ramp_points + npoints_per_switch, \
-            f"Expect ntotal_pts={ntotal_points_per_switch} with tramp={ramp_points}"
-    # plot pre-corrected data
-    plot_sample_window(per_switch_rawdata, ramp_points, npoints_per_switch, mrs.nswitches)
-
-    corrected_rawdata = np.zeros_like(per_switch_rawdata)
-    
-    for i in range(mrs.nswitches):
-        # shift = 7 for cirrhrat
-        # shift = 5 for ischemia
-        shift = int(ramp_points) + 3 # shift first echo by 3 points to the right 
-        if i==0:
-            corrected_rawdata[i] = np.concatenate((np.zeros(shift), per_switch_rawdata[0,:ntotal_points_per_switch-shift]))
-        else:
-            corrected_rawdata[i] = per_switch_rawdata.flatten()[i*ntotal_points_per_switch-shift:(i+1)*ntotal_points_per_switch-shift]
-    plot_sample_window(corrected_rawdata, ramp_points, npoints_per_switch, mrs.nswitches)
-
-    # calculate the drift based on the largest peaks on each switch
-    expected_peak_idx = ramp_points + npoints_per_switch//2  # for cirrhrat data, idx=6 out of 12points are used  
-    drift_corrected_rawdata = np.zeros_like(per_switch_rawdata)
-    for i in range(mrs.nswitches):
-        # every 3 points
-        if i<3:
-            shift=0
-        elif i<6:
-            shift=1
-        elif i<9:
-            shift=2
-        # every 5 points
-        elif i<14:
-            shift=3
-        elif i<19:
-            shift=4
-        elif i<24:
-            shift=5
-        elif i<29:
-            shift=6
-        elif i<34:
-            shift=7
-        elif i<39:
-            shift=8
-        elif i<44:
-            shift=9
-        elif i<49:
-            shift=10
-        elif i<54:
-            shift=11
-        elif i<59:
-            shift=12
-        elif i<63:
-            shift=13
-        elif i == 63:
-            print(corrected_rawdata[i,shift:].shape)
-            drift_corrected_rawdata[i] = np.concatenate((corrected_rawdata[i,shift:],np.zeros(shift)))
+        nswitch = max(mrs.nswitches, 1)
+        if nswitch <= 1 or mrs.rawdata is None or mrs.rawdata.size == 0:
+            print(f"Skipping {filepath}: no EPSI readout to find echoes in", file=sys.stderr)
             continue
-        drift_corrected_rawdata[i] = np.concatenate((corrected_rawdata[i,shift:], corrected_rawdata[i+1,:shift]))
-    plot_sample_window(drift_corrected_rawdata, ramp_points, npoints_per_switch, mrs.nswitches) 
-    return True
+        total = mrs.nsamples // nswitch
+        kept = mrs.npoints_per_switch or total
+        ramp = int(mrs.tramp // (mrs.sample_period // 10)) if mrs.sample_period else 0
+        # magnitude summed over every axis but the samples one: views, slices, echoes and
+        # repetitions are all just repeats of the same readout for finding an echo
+        aggregated = np.abs(mrs.rawdata).sum(axis=tuple(range(1, mrs.rawdata.ndim)))
+        signal = aggregated[:nswitch * total].reshape(nswitch, total)
 
-def plot_sample_window(rawdata: np.ndarray, ramp_points: int, npoints_per_switch: int, nswitches: int) -> bool:
+        lines = fit_peak_lines(signal)
+        switches = np.arange(nswitch)
+        print(f"\n{filepath}: {nswitch} switches of {total}, {mrs.nrepetitions} repetition(s)",
+              file=sys.stderr)
+        print(f"  slope {lines['slope']:+.4f} per switch, a period of {total + lines['slope']:.4f}; "
+              f"lines at {lines['first_intercept'] % total:.2f} ({lines['on_first']} switches, rms "
+              f"{lines['first_rms']:.2f}) and {lines['second_intercept'] % total:.2f} "
+              f"({lines['on_second']}, rms {lines['second_rms']:.2f})", file=sys.stderr)
+
+        figure, axes = plt.subplots(figsize=(7, 9))
+        axes.imshow(signal, aspect='auto', origin='lower', interpolation='nearest',
+                    extent=(-0.5, total - 0.5, -0.5, nswitch - 0.5))
+        axes.axvspan(ramp - 0.5, ramp + kept - 0.5, color='w', alpha=0.15,
+                     label=f"window {ramp}..{ramp + kept - 1}")
+        axes.plot(lines['peaks'][lines['first_family']], switches[lines['first_family']],
+                  'x', color='C3', ms=6, label=f"first echo ({lines['on_first']})")
+        if not lines['first_family'].all():
+            axes.plot(lines['peaks'][~lines['first_family']], switches[~lines['first_family']],
+                      '+', color='C1', ms=7, label=f"second echo ({lines['on_second']})")
+        for intercept in (lines['first_intercept'], lines['second_intercept']):
+            axes.plot((intercept + lines['slope'] * switches) % total, switches, '.',
+                      color='w', ms=2, alpha=0.7)
+        axes.set_xlabel(f"position within the {total} point switch")
+        axes.set_ylabel("switch")
+        axes.set_title(f"{Path(filepath).name}: {lines['slope']:+.4f} per switch")
+        axes.legend(fontsize=8, loc='upper right')
+        figure.tight_layout()
+        plt.show()
+        plt.close(figure)
+        plotted += 1
+    return plotted
+
+
+# ---------- driver ----------------------------------------------------------------------------
+
+
+def correct_stream(input_path: str, output_path: Optional[str], method: str = DEFAULT_METHOD,
+                   force: bool = False, drop_first: bool = False,
+                   plot: Optional[str] = None, pad: Optional[int] = None) -> int:
     """
-    Plot rawdata sample points across switches and overlay the actual sampling window
-    Discard points count is calculated by adding up ramp_points on the side of npoints_per_switch
-    ramp_points --- npoints_per_switch --- ramp_points --- ramp_points(rephase) --- ramp_points(rephase)
-    Args:
-        rawdata: shape in nswitches, ntotal_points_per_switch=(nsamples/nswitches)
-        ramp_points: sample points during ramp time: tramp // sample_period
-        npoints_per_switch:             
-    """
-    import matplotlib.pyplot as plt
-    figure, axes = plt.subplots(figsize=(6, 9))
-    # plot the largest peak as x
-    largest_peak = np.argmax(rawdata, axis=1)
-    axes.plot(largest_peak, range(nswitches), 'xr', label='largest peak')
-    # plot magnitude signal for each switch
-    img = axes.imshow(rawdata, vmin=0, origin='lower', aspect='auto')
-    # ramp -> npoints_per_switch -> ramp -> rephasing (two ramps)
-    axes.axvspan(ramp_points-0.5, ramp_points+npoints_per_switch-0.5, color='C7', alpha=0.5,
-                 label=f'sample window of {npoints_per_switch} readout')
-    # echo should happen at the middle of npoints_per_switch e.g.) 12points_per_switch->echo at idx7 
-    expected_echo_position = ramp_points + (npoints_per_switch // 2)
-    axes.axvspan(expected_echo_position-1, expected_echo_position, color='r', alpha=0.3, 
-                 label='expected echo position')
-    axes.set_xlabel(f"position within the {npoints_per_switch + 4 * ramp_points} point switch")
-    axes.set_ylabel("switch")
-    axes.legend(fontsize=8, loc='upper right')
-    figure.colorbar(img, ax=axes, label='signal aggregated over views and repetitions')
-    figure.tight_layout()
-    plt.show()
-    plt.close(figure)
-    return True
+    Measure the zero-pad base and the drift of a converted stream, and write it back corrected.
 
+    The acquisitions are grouped by switch layout, because a file holds the series and the averaged
+    prescan beside it and their layouts differ.  The biggest group's real data is what the reported
+    numbers come from - pooling an averaged prescan in with the repetitions would measure neither.
 
-# def read_mrd_acq(input_file: BinaryIO, output_file: BinaryIO):
-#     """
-#     Read a mrd file acquisition field, correct for echo position, and rewrite back a corrected raw file
-#     """
-#     with mrd.BinaryMrdReader(input_file) as reader:
-#         header = reader.read_header()
-#         for item in reader.read_data():
-#             if not isinstance(item, mrd.StreamItem.Acquisition):
-#                 continue
-#             # no correction for phantom prescan
-#             elif item.value.head.falgs & mrd.AcquisitionFlags.IS_NAVIGATION_DATA:
-#                 continue
-#             else:
+    The prescan is never shifted.  It is calibration rather than data, and the scaling the
+    reconstruction takes from it has to mean the same thing before and after a correction.  Any other
+    layout is measured on its own data rather than having the series' numbers scaled onto it, and one
+    whose echo cannot be fitted, or whose own geometry does not account for its switch, is left alone
+    too - being left alone is the better failure.
 
-
-
-def spectral_peak(cube: np.ndarray, view: Optional[int] = None):
-    """
-    How much signal sits at each position within a readout switch, over the switches given.
-
-    Every sample of the readout falls at one of `total` positions inside a gradient switch, and the
-    gradient echo, the point where kx crosses zero, sits at one of them. Summing raw magnitude over
-    the switches would locate it only when the object fills the field of view: for a compact object
-    |k-space| is close to flat and the echo hides in the phase instead. So this transforms along the
-    switch axis and keeps the strongest spectral line, which is a coherent sum over the switches
-    given and lifts the echo well clear of the noise. That coherent gain is why the drift
-    measurement passes a block of switches rather than one at a time.
-    Args:
-        - cube: (switch, position, view, repeat), whole or a slice along the switch axis
-        - view: phase encode line to read, or None for the one carrying the most signal. Not a knob
-          to offer: drift_sharpness has to score every candidate slope on the same view, since
-          re-picking the brightest one per candidate would leave the scores incomparable
+    With no output path this is a dry run: -p still draws the figure, and nothing is written.
     Returns:
-        - (profile of length total, peak over median of the profile, the view it was read from)
+        - 0 when the stream was handled, 1 when the input carried nothing to correct
     """
-    spectrum = np.fft.fft(cube, axis=0)
-    power = (np.abs(spectrum) ** 2).sum(axis=(1, 2, 3))
-    band = np.abs(spectrum[int(np.argmax(power))])               # (position, view, repeat)
-
-    if view is None:
-        view = int(np.argmax(band.sum(axis=(0, 2))))
-    profile = band[:, view, :].sum(axis=1)
-    median = np.median(profile)
-    return profile, (float(profile.max() / median) if median else np.inf), view
-
-
-def switch_profile(mrs: MRSdata):
-    """
-    How much signal sits at each position within a readout switch, over the whole readout.
-    Args:
-        - mrs: one parsed MRS file, read rather than probed
-    Returns:
-        - (profile of length total, peak over median of the profile)
-    Raises:
-        - ValueError when called on a file whose data block was never read
-    """
-    profile, snr, _ = spectral_peak(switch_cube(mrs))
-    return profile, snr
-
-
-def sliding_window(profile, kept: int):
-    """
-    Score every candidate sampling window of `kept` consecutive positions.
-
-    Windows wrap, because the last position of one switch is followed by the first position of the
-    next, so a window may legitimately straddle the boundary.
-    Args:
-        - profile: signal per position within the switch, from switch_profile
-        - kept: width of the window, i.e. the points the reconstruction keeps per switch
-    Returns:
-        - (signal summed inside each window, position of the profile peak within each window), both
-          indexed by the window's first position
-    """
-    total = len(profile)
-    offsets = np.arange(kept)
-    signal = np.array([profile[(start + offsets) % total].sum() for start in range(total)])
-    # where the echo lands inside the window; the window is right when this is its middle
-    peak_at = (int(np.argmax(profile)) - np.arange(total)) % total
-    return signal, peak_at
-
-
-def window_report(mrs: MRSdata) -> dict:
-    """
-    Pick the sampling window, both ways, and translate it for the reconstruction.
-
-    Two criteria, because they can disagree and the disagreement is the interesting part: the window
-    holding the most signal, and the window whose middle sits on the echo. mrd2recon addresses the
-    same window as an offset from discard_pre, so that conversion is reported alongside, as the
-    --pad that would select it
-    Returns:
-        - dict of the profile, the two winning window starts and the pads they imply
-    """
-    nswitch, total, kept = switch_layout(mrs)
-    profile, snr = switch_profile(mrs)
-    signal, peak_at = sliding_window(profile, kept)
-    middle = (kept - 1) / 2
-
-    by_signal = int(np.argmax(signal))
-    # distance from the middle measured the short way round, so a wrapped window is not penalised
-    # for having its peak reported as position 27 rather than -1
-    from_middle = np.abs((peak_at - middle + total / 2) % total - total / 2)
-    by_centre = int(np.argmin(from_middle))
-    # the same arithmetic generate_acquisition writes into the header, so the pads below address the
-    # window the converted stream actually carries
-    discard_pre = (total - kept) // 2
-
-    def pad_for(start: int) -> int:
-        """
-        The mrd2recon --pad that makes it read this window.
-
-        It addresses a window as discard_pre - pad, so the pad is that difference, wrapped the short
-        way round the switch: the positions are cyclic, so a window starting at 29 of 34 is 5 before
-        the boundary rather than 29 after it
-        """
-        return int((discard_pre - start + total // 2) % total - total // 2)
-
-    return dict(profile=profile, signal=signal, peak_at=peak_at, snr=snr,
-                nswitch=nswitch, total=total, kept=kept, discard_pre=discard_pre,
-                peak=int(np.argmax(profile)),
-                by_signal=by_signal, by_centre=by_centre,
-                pad_by_signal=pad_for(by_signal),
-                pad_by_centre=pad_for(by_centre))
-
-
-def plot_switch_profile(mrs: MRSdata) -> dict:
-    """
-    Plot the sliding window scan over the positions within a readout switch.
-
-    Three panels: the signal at each position with the chosen windows drawn on it, the sliding
-    window scan itself, and the same profile per switch so that an echo whose position drifts along
-    the echo train shows up rather than being averaged away. Opening the window blocks until it is
-    closed, so a whole experiment is walked one file at a time.
-    Returns:
-        - the window_report dict, so a caller can act on the numbers it plotted
-    """
-    # imported here rather than at module scope, so reporting needs no plotting stack unless plotted
-    import matplotlib.pyplot as plt
-
-    report = window_report(mrs)
-    total, kept = report['total'], report['kept']
-    profile, signal = report['profile'], report['signal']
-    middle = (kept - 1) / 2
-    positions = np.arange(total)
-
-    # figure, axes = plt.subplots(3, 1, figsize=(16, 9))
-    title = (f"{mrs.sequence_name or 'unknown sequence'}: {report['nswitch']} switches of "
-             f"{total} points, {kept} kept, peak/median {report['snr']:.2f}")
-    figure.suptitle(title)
-
-    axes[0].plot(positions, profile, 'o-', color='C0')
-    # the sequence's own answer to where the window goes, on the same axes as the two measured ones:
-    # from the end of the leading ramp through the flat top, which is where the signal was meant to be
-    window = sequence_window(mrs)
-    if window:
-        axes[0].axvspan(window[0] - 0.5, window[1] + 0.5, color='C7', alpha=0.15,
-                        label=f"the sequence samples {window[0]}..{window[1]}")
-    axes[0].axvline(report['peak'], color='C1', lw=2, label=f"echo peak at {report['peak']}")
-    for start, pad, colour, name in ((report['by_signal'], report['pad_by_signal'], 'C2', 'most signal'),
-                                     (report['by_centre'], report['pad_by_centre'], 'C3', 'echo centred')):
-        # drawn as the positions it covers, so a window that wraps appears at both ends
-        covered = (start + np.arange(kept)) % total
-        axes[0].plot(covered, profile[covered], 'o', ms=11, mfc='none', color=colour,
-                     label=f"{name}: start {start}, pad {pad}, "
-                           f"echo at {report['peak_at'][start]} of {kept}")
-    axes[0].set_xlabel(f"position within the {total} point switch")
-    axes[0].set_ylabel("signal")
-    axes[0].legend(fontsize=8)
-
-    axes[1].plot(positions, signal / signal.max(), 'o-', color='C0', label='signal in window')
-    axes[1].plot(positions, report['peak_at'] / total, 's--', ms=3, color='C4',
-                 label='where the peak lands in the window')
-    axes[1].axhline(middle / total, color='C3', ls=':', label='window middle')
-    axes[1].axvline(report['by_signal'], color='C2', lw=2)
-    axes[1].axvline(report['by_centre'], color='C3', lw=2)
-    axes[1].set_xlabel("first position of the window")
-    axes[1].set_ylabel("normalised")
-    axes[1].legend(fontsize=8)
-
-    cube = switch_cube(mrs)
-    axes[2].imshow(np.abs(cube).sum(axis=(2, 3)), aspect='auto', origin='lower',
-                   interpolation='nearest')
-    axes[2].axvline(report['by_centre'], color='C3', lw=1.5)
-    axes[2].axvline((report['by_centre'] + kept - 1) % total, color='C3', lw=1.5)
-    axes[2].set_xlabel(f"position within the switch")
-    axes[2].set_ylabel("switch")
-
-    figure.tight_layout()
-    fill_screen(figure)
-    plt.show()
-    return report
-
-
-# ---------- removing the echo drift along the switch train ----------------------------------
-
-
-def pooled_switch_cube(mrs_list: Sequence[MRSdata]) -> np.ndarray:
-    """
-    Every file of one scan laid out as a single (switch, position, view, repeats) cube.
-
-    The drift is a property of the gradient timing, so it is the same in every repetition, and one
-    repetition on its own does not carry enough signal to measure it. Pooling is what lets the two
-    ways a scan arrives be measured identically: an epsi experiment that puts one repetition in each
-    subdirectory pools across files, one that puts all 25 in a single file pools within it, and
-    switch_cube already folds the repetition axis into its last axis either way.
-    Args:
-        - mrs_list: the parsed files of one scan, all read rather than probed
-    Returns:
-        - the pooled cube, or None when there is nothing to pool
-    """
-    cubes = []
-    for mrs in mrs_list:
-        cube = switch_cube(mrs)
-        if cubes and cube.shape[:3] != cubes[0].shape[:3]:
-            print(f"WARNING leaving a {cube.shape[:3]} readout out of a {cubes[0].shape[:3]} drift "
-                  f"measurement", file=sys.stderr)
-            continue
-        cubes.append(cube)
-    if not cubes:
-        return None
-    return cubes[0] if len(cubes) == 1 else np.concatenate(cubes, axis=3)
-
-
-def roll_switches(block: np.ndarray, shifts: Sequence[int]) -> np.ndarray:
-    """
-    Move each switch of a readout by its own shift.
-
-    The only arrangement a drift fits in. Every other way of addressing the readout - discard_pre,
-    a --pad, the ramp time a reconstruction derives its window from - names one offset for the whole
-    readout, and a drift is precisely the case where one offset cannot be right in every switch.
-
-    The loop runs over switches rather than over the positions inside one, since that is where the
-    shift varies: within a switch it is a single number, and rolling the switch by it moves every
-    position together. Positions are cyclic within a switch, so this wraps rather than padding -
-    what leaves one end of a switch arrives at the other, which is where the neighbouring switch's
-    samples sat anyway
-    Args:
-        - block: (nswitch, positions within a switch, ...), a switch_cube or a reshaped readout
-        - shifts: integer shift per switch, from switch_shifts, positive moving samples later
-    Returns:
-        - a new array of the same shape, switch i rolled by shifts[i]
-    """
-    rolled = np.empty_like(block)
-    for iswitch, shift in enumerate(shifts):
-        rolled[iswitch] = np.roll(block[iswitch], int(shift), axis=0)
-    return rolled
-
-
-def shift_rawdata(mrs: MRSdata, shifts: Sequence[int]) -> None:
-    """
-    Take a measured drift out of one file's readout, in place.
-
-    The raw side twin of mrd2shift.roll_acquisition, which does this to a converted stream. Working
-    on rawdata rather than on a cube is what makes the correction outlive the measurement: every
-    axis is kept, so the file goes on converting, plotting and reconstructing exactly as it did,
-    only with its echoes lined up.
-
-    Samples past the last whole switch are left where they are, the same truncation switch_cube and
-    the conversion already apply: nsamples // nswitch leaves a remainder on some sequences, and
-    those trailing points belong to no switch to be rolled with
-    Args:
-        - mrs: one parsed MRS file of the epsi family, read rather than probed
-        - shifts: integer shift per switch, from switch_shifts
-    Returns:
-        - None; mrs.rawdata is rewritten
-    Raises:
-        - ValueError when called on a file whose data block was never read
-    """
-    if mrs.rawdata is None:
-        raise ValueError("no data to shift; read_from_file rather than probe_from_file")
-    nswitch, total, _ = switch_layout(mrs)
-    used = nswitch * total
-    tail = mrs.rawdata.shape[1:]
-    # reshaped through the sample axis, which comes first, so this is the switch-major order the
-    # samples were acquired in - the same split switch_cube reads the echo position from. Assigned
-    # back through a slice rather than rolled in place, since the reshape may be a copy
-    body = mrs.rawdata[:used].reshape((nswitch, total) + tail)
-    mrs.rawdata[:used] = roll_switches(body, shifts).reshape((used,) + tail)
-
-
-def acquisition_cube(acqs: Sequence["mrd.Acquisition"], nswitch: int, total: int) -> np.ndarray:
-    """
-    A converted stream's acquisitions as the same cube pooled_switch_cube builds from raw files.
-
-    The stream side twin of switch_cube. Laying the acquisitions out as
-    (switch, position, view, repeat) is what lets measure_echo_drift, drift_sharpness and
-    switch_shifts apply unchanged: the drift is measured the same way whether the scan is still
-    a tree of .MRD files or already one .mrd2.
-
-    Views and repetitions are taken from the indices the converter set rather than from their
-    counts, so a group missing a view still lands in the right column.
-    Args:
-        - acqs: the acquisitions of one encoding, all at the same matrix
-        - nswitch, total: the switch layout, total being the whole switch including its ramps
-    Returns:
-        - (switch, position, view, repeat) complex cube
-    """
-    views = sorted({a.head.idx.kspace_encode_step_1 or 0 for a in acqs})
-    reps = sorted({a.head.idx.repetition for a in acqs})
-    view_at = {view: i for i, view in enumerate(views)}
-    rep_at = {rep: i for i, rep in enumerate(reps)}
-
-    used = nswitch * total
-    cube = np.zeros((nswitch, total, len(views), len(reps)), dtype=complex)
-    for acq in acqs:
-        body = np.asarray(acq.data)[0, :used].reshape(nswitch, total)
-        cube[:, :, view_at[acq.head.idx.kspace_encode_step_1 or 0],
-             rep_at[acq.head.idx.repetition]] = body
-    return cube
-
-
-def roll_acquisition(acq: "mrd.Acquisition", shifts: Sequence[int],
-                     nswitch: int, total: int) -> None:
-    """
-    Take a measured drift out of one converted acquisition, in place.
-
-    The stream side twin of shift_rawdata. Samples past the last whole switch are left where they
-    are, the same truncation the cube and the conversion already apply: nsamples // nswitch leaves
-    a remainder on some sequences, and those trailing points belong to no switch to be rolled with.
-
-    Assigned through a fresh array rather than in place, since the reader hands back a view onto
-    the bytes it decoded
-    Args:
-        - acq: one acquisition, its data shaped (coils, samples)
-        - shifts: integer shift per switch, from switch_shifts
-        - nswitch, total: the switch layout this acquisition was acquired at
-    Returns:
-        - None; acq.data is replaced
-    """
-    used = nswitch * total
-    data = np.array(acq.data, copy=True)
-    body = data[0, :used].reshape(nswitch, total)
-    data[0, :used] = roll_switches(body, shifts).reshape(used)
-    acq.data = data
-
-
-def drift_sharpness(cube: np.ndarray, nswitch: int, slope: float, view: Optional[int]) -> float:
-    """
-    How well defined the echo is once a drift of `slope` is taken out of the switch train.
-
-    Scored by peak over median of the readout profile, which is what the echo drifting smears: every
-    switch contributes to that profile, so an echo that sits at one position in all of them gives a
-    sharp peak and one that walks across the switch gives something close to flat.
-
-    Scored through the same roll that is finally applied, so the sharpening measure_echo_drift
-    promises is the sharpening the corrected data has
-    Args:
-        - cube: (switch, position, view, repeats), as pooled_switch_cube returns
-        - nswitch: switches in the readout, i.e. cube.shape[0]
-        - slope: candidate drift in samples per switch
-        - view: the view to profile, held fixed across candidates so they compare
-    Returns:
-        - peak over median of the profile after the candidate correction
-    """
-    rolled = roll_switches(cube, switch_shifts(nswitch, cube.shape[1], slope))
-    return spectral_peak(rolled, view=view)[1]
-
-
-def measure_echo_drift(cube: np.ndarray, nswitch: int, total: int) -> dict:
-    """
-    Whether the echo moves along the switch train, and by how much per switch.
-
-    The reconstruction reads the same positions out of every switch of a readout: mrd2recon works
-    from `iswitch * points_per_switch + discard_pre - pad`, whose offset within the switch does not
-    depend on the switch. That is only right while the echo stays put, and on the kidney data it
-    does not: it walks about a dozen positions of a twenty position switch across the train, out of
-    the window the reconstruction keeps at one end and against its far edge at the other.
-
-    Measured by searching the drift itself rather than by locating the echo and fitting a line
-    through where it was found. Each candidate slope is applied and scored by how sharp it leaves the
-    readout profile, and the best scoring one wins. Locating the echo first cannot work here, because
-    every way of doing it needs a profile of the echo and a drift this large is what destroys that
-    profile: summed over the whole train the echo smears across two thirds of the switch and its peak
-    over median falls to 2.4, so a measurement that starts by requiring a clean profile refuses
-    exactly the scans that need correcting. Accumulating integer lags between neighbouring blocks of
-    switches avoids that but is biased by the rounding, reading +0.25 where the truth is +0.232.
-    Searching the correction has neither problem, and its acceptance test is the question actually
-    worth asking: did the echo get sharper.
-
-    Coarse pass over the whole range, then a fine pass either side of the winner, which is 61 and 21
-    candidates for the default settings and about a quarter of a second on a 64 by 20 by 12 by 25
-    cube.
-    Args:
-        - cube: (switch, position, view, repeats), as pooled_switch_cube returns
-        - nswitch, total: the switch layout the cube was built on, from switch_layout
-    Returns:
-        - dict of the measurement: usable, reason, the slope in samples per switch, the drift it
-          comes to over the whole train, peak over median before and after and their ratio, whether
-          the winner sat on the bound of the search, and the switch period the slope implies
-    """
-    # picked once and held for every candidate, so that the scores compare
-    view = spectral_peak(cube)[2]
-    base = drift_sharpness(cube, nswitch, 0.0, view)
-
-    coarse = np.arange(-DRIFT_SLOPE_LIMIT, DRIFT_SLOPE_LIMIT + DRIFT_COARSE_STEP / 2,
-                       DRIFT_COARSE_STEP)
-    scores = [drift_sharpness(cube, nswitch, slope, view) for slope in coarse]
-    around = coarse[int(np.argmax(scores))]
-    # clipped to the range, so the fine pass never proposes a slope the coarse one was not allowed
-    fine = np.arange(max(around - DRIFT_COARSE_STEP, -DRIFT_SLOPE_LIMIT),
-                     min(around + DRIFT_COARSE_STEP, DRIFT_SLOPE_LIMIT) + DRIFT_FINE_STEP / 2,
-                     DRIFT_FINE_STEP)
-    scores = [drift_sharpness(cube, nswitch, slope, view) for slope in fine]
-    best = int(np.argmax(scores))
-    slope, snr = float(fine[best]), float(scores[best])
-
-    drift = slope * (nswitch - 1)
-    report = dict(usable=False, reason="", slope=slope, drift=drift, snr=snr, base_snr=base,
-                  gain=(snr / base if base else 0.0), nswitch=nswitch, total=total, view=view,
-                  edge=abs(slope) >= DRIFT_SLOPE_LIMIT - DRIFT_FINE_STEP / 2,
-                  period=total + slope, reps=cube.shape[3])
-
-    if report['edge']:
-        report['reason'] = (f"the best drift found, {slope:+.3f} samples per switch, sits on the "
-                            f"{DRIFT_SLOPE_LIMIT} bound of the search, so either the real one is "
-                            f"outside that range or there is no echo here and noise won")
-        return report
-    if abs(drift) < 1.0:
-        report['reason'] = (f"the best drift found, {drift:+.2f} samples over {nswitch} switches, is "
-                            f"below the one sample a roll could move")
-        return report
-    if report['gain'] < DRIFT_MIN_GAIN:
-        report['reason'] = (f"removing {drift:+.2f} samples over {nswitch} switches only sharpens "
-                            f"the readout profile from {base:.2f} to {snr:.2f} peak/median, a "
-                            f"factor of {report['gain']:.2f} against the {DRIFT_MIN_GAIN} it needs "
-                            f"to be worth acting on")
-        return report
-    if snr < DRIFT_MIN_SNR:
-        report['reason'] = (f"removing {drift:+.2f} samples over {nswitch} switches leaves a "
-                            f"peak/median of only {snr:.2f}, below the {DRIFT_MIN_SNR} that says "
-                            f"there was an echo to sharpen rather than noise to line up")
-        return report
-
-    report['usable'] = True
-    report['reason'] = (f"{drift:+.2f} samples over {nswitch} switches, {slope:+.4f} per switch, "
-                        f"sharpening the readout profile from {base:.2f} to {snr:.2f} peak/median, "
-                        f"a factor of {report['gain']:.2f}")
-    return report
-
-
-def switch_shifts(nswitch: int, total: int, slope: float) -> np.ndarray:
-    """
-    How far to move each switch so the echo stops moving along the train.
-
-    Measured against the middle of the train rather than against the sampling window, so this
-    removes the drift and leaves the mean echo position exactly where it was. That keeps it
-    orthogonal to where the window sits: --pad, the pads this reports and the ramp time mrd2recon
-    derives its default from all go on meaning what they mean today, and a scan can be de-drifted
-    without its window having to be found again.
-
-    Shifts come back reduced the short way round the switch, since a position is cyclic within one
-    Args:
-        - nswitch, total: the switch layout, from switch_layout
-        - slope: drift to remove, in samples per switch
-    Returns:
-        - integer shift per switch, length nswitch, positive meaning the samples move later
-    """
-    middle = (nswitch - 1) / 2
-    shifts = np.rint(slope * (middle - np.arange(nswitch))).astype(int)
-    return (shifts + total // 2) % total - total // 2
-
-
-def ramp_samples(mrs: MRSdata) -> Optional[float]:
-    """
-    How many samples the readout gradient spends on one ramp, or None when the file cannot say.
-
-    tramp is recorded in microseconds and sample_period in units of 100 ns, hence the /10. The result
-    is deliberately left fractional: the kidney sequences run a 2.5 sample ramp, and rounding it here
-    would push both the echo position and the sampling window half a sample off before anything has
-    used them
-    """
-    if not mrs.tramp or not mrs.sample_period:
-        return None
-    return mrs.tramp / (mrs.sample_period / 10.0)
-
-
-def expected_echo_positions(mrs: MRSdata) -> Optional[Tuple[int, int]]:
-    """
-    Where the sequence says its two echoes sit inside a switch, from its own parameters.
-
-    Not a measurement. The readout loop runs ramp -> points_per_switch -> ramp -> ramp -> ramp and
-    repeats, so the switch holds the readout echo at the middle of the flat top and, after the
-    gradient rephases, a second crossing of k-space centre
-
-        readout   = tramp / sample_period + points_per_switch / 2
-        rephasing = 2 * tramp / sample_period + points_per_switch
-
-    On cirrhrat the loop closes exactly: tramp 112 over a 28 us sample period is a 4 sample ramp, and
-    4 ramps of 4 plus the 12 kept points fill a 28 point switch, putting the readout echo at 10 and
-    the rephasing one at 20. On the kidney data tramp 100 over 40 us is 2.5 samples, four of which
-    overshoot the 8 non-flat samples a 20 point switch has, and the two come out at 8.5 and 17 -
-    truncated here, since a roll moves whole samples.
-
-    The first index is the one to trust. Measured against the data the readout echo lands where this
-    says it does, but the rephasing echo reads a sample later than 17 on ischemia_179 and the two peak
-    families sit 9 to 13.5 positions apart where this predicts 8.5 to 10, so the second index is a
-    check to report rather than a position to move anything onto.
-
-    Read only off a sequence the formula was established against, by exact name: a variant that lays
-    its ramps out differently would be moved onto a position that is not its own, and being left
-    alone is the better failure. That is why ischemia_121_1, which records epsigre43_FB_13C, is
-    de-drifted but never moved
-    Args:
-        - mrs: one parsed or probed MRS file of the epsi family
-    Returns:
-        - (readout echo, rephasing echo) within a switch, or None when this file carries no
-          established formula
-    """
-    ramp = ramp_samples(mrs)
-    if mrs.sequence_name != 'epsigre' or ramp is None:
-        return None
-    _, _, kept = switch_layout(mrs)
-    return int(ramp + kept / 2), int(2 * ramp + kept)
-
-
-def sequence_window(mrs: MRSdata) -> Optional[Tuple[int, int]]:
-    """
-    The stretch of a switch the sequence actually samples on the gradient plateau.
-
-    From the first position clear of the leading ramp through the end of the flat top, so
-    ceil(tramp / sample_period) .. that + points_per_switch - 1. Rounded up rather than down because
-    the sample the ramp is still running through is not a plateau sample: on the kidney layout that
-    puts the window at 3..14, whose centre is the 8.5 expected_echo_positions reports, where rounding
-    down would centre it on 7.5.
-
-    This is not the window a conversion writes. generate_acquisition centres its discard_pre in the
-    switch instead - 4..15 on the kidney layout, 8..19 on cirrhrat - and window_report's pads are all
-    anchored to that. The difference between the two is exactly the mrd2recon --pad that would move
-    the reconstruction onto the plateau: 1 sample on the kidney data, 4 on cirrhrat, where the centred
-    window sits well past the flat top
-    Args:
-        - mrs: one parsed or probed MRS file of the epsi family
-    Returns:
-        - (first position, last position) inclusive, or None when the file carries no ramp time
-    """
-    ramp = ramp_samples(mrs)
-    # npoints_per_switch read straight off the file rather than through MRStomrd2.switch_layout,
-    # which is the width that layout would report anyway: this module is imported by MRStomrd2, so
-    # importing back would be circular, and the window is undrawable without a recorded width in
-    # any case
-    if mrs.sequence_name != 'epsigre' or ramp is None or not mrs.npoints_per_switch:
-        return None
-    kept = mrs.npoints_per_switch
-    start = int(np.ceil(ramp))
-    return start, start + kept - 1
-
-
-def aligned_echo_position(cube: np.ndarray, view: Optional[int] = None) -> Tuple[int, float]:
-    """
-    Where the echo actually sits inside a switch, over the switches given.
-
-    Read off the coherent profile spectral_peak builds rather than off a magnitude sum, because this
-    position is what a constant move is measured against and so it has to be the sharper of the two
-    estimators: on ischemia_179 the coherent profile reaches 13.26 peak over median where the
-    magnitude sum manages 1.84, and a position read off the flatter one is a position read off noise.
-
-    The sharpness comes back with it so that a move resting on a smeared profile is visible in the
-    report rather than silent
-    Args:
-        - cube: (switch, position, view, repeats), already rolled straight if it is going to be
-        - view: the view to read, or None for the one carrying the most signal
-    Returns:
-        - (position within the switch, peak over median of the profile it was read from)
-    """
-    profile, sharpness, _ = spectral_peak(cube, view=view)
-    return int(np.argmax(profile)), sharpness
-
-
-def peak_families(signal: np.ndarray, slope: float, anchor: Optional[int] = None,
-                  fallback_separation: Optional[float] = None) -> dict:
-    """
-    Sort the per-switch peaks into the two echoes a switch carries, against switch 0.
-
-    The brightest position in one switch is whichever of its two echoes happened to win, so a plot of
-    those peaks looks like scatter when the echo is in fact perfectly orderly: on ischemia_179 they
-    read 3,4,5... and 14,15,16..., two families each stepping one position every ~4.3 switches exactly
-    as its +0.232 drift should. Splitting them is what makes that legible, and it is why nothing here
-    needs a switch to peak on the readout echo - a switch peaking on the rephasing echo still says
-    where the train is.
-
-    Which family is which is decided by switch 0 and nothing else. The signal decays along the train -
-    peak magnitude per switch runs 0.70 to 1.00 relative at the front of ischemia_179 against 0.17 to
-    0.27 at the back - so the first switch is the most reliable reading there is, and the drift is
-    linear from it. Sorting by "whichever mode holds more switches" instead gets the front of the train
-    backwards: with the drift left in the residuals it labelled switches 0 to 3 of ischemia_179, all
-    peaking at 3 on the readout echo, as the second one.
-
-    The separation between the families is measured rather than taken from the ramp formula, which
-    predicts 8.5 to 10 where the data reads 9 to 11 on the kidney scans and about 14 on cirrhrat
-    Args:
-        - signal: (switch, position) magnitude summed over views and repetitions
-        - slope: the drift still present in `signal`, in samples per switch, so that a switch on the
-          readout echo has a residual near zero whatever the drift. Zero for a corrected readout
-        - anchor: the readout echo's position in switch 0, or None to read it off switch 0's own peak
-        - fallback_separation: the spacing the sequence gives its two echoes, used when the data is
-          too smeared to measure one; None falls back to half a switch
-    Returns:
-        - dict of the per-switch peaks, the anchor, the separation and whether it was measured or
-          fallen back on, which family each switch fell in and how many that is, and the slope the
-          peaks refit to on their own
-    """
-    nswitch, total = signal.shape
-    peaks = np.argmax(signal, axis=1)
-    switches = np.arange(nswitch)
-    if anchor is None:
-        anchor = int(peaks[0])
-    # distance from the line the anchor and the slope draw, the short way round the switch
-    residual = (peaks - anchor - slope * switches + total / 2) % total - total / 2
-
-    # where the switches that did not peak on the readout echo cluster. Taken as the most populated
-    # whole position rather than as a mean, since the set holds noise as well as the second echo and
-    # one stray residual drags a mean a long way - on ischemia_179 the mean reads -5.2 where the
-    # cluster sits at +9. A quarter of a switch either side of zero is left out because the readout
-    # family itself spreads that far: on ischemia_179 its residuals walk from 0 to -3 across the
-    # train, and at an exclusion of 3 that tail held 9 switches and won the mode outright, reading a
-    # separation of -3 where the second echo plainly sits at +9
-    census = np.zeros(total, dtype=int)
-    for value in residual:
-        census[int(round(value)) % total] += 1
-    radius = max(3, total // 4)
-    apart = [position for position in range(total)
-             if min(position % total, (-position) % total) >= radius]
-    mode = max(apart, key=lambda position: census[position]) if apart else 0
-    # counted over the mode and its neighbours, since the family spreads across two or three whole
-    # positions as the drift walks it: on ischemia_179 its 12 switches sit at +8, +9 and +10, and the
-    # strongest single position holds only 5 of them
-    population = int(sum(census[(mode + offset) % total] for offset in (-1, 0, 1)))
-    # believed only when enough switches sit there. On cirrhrat_43_1 the census is flat, because that
-    # readout is too smeared for a per switch argmax to mean anything, and a separation read off noise
-    # would then decide which echo switch 0 peaked on. The sequence's own spacing is the fallback, and
-    # the report says which was used
-    trusted = population >= max(6, nswitch // 8)
-    if trusted:
-        separation = float((mode + total / 2) % total - total / 2)
-    else:
-        separation = float(fallback_separation if fallback_separation else total / 2)
-
-    # each switch to whichever line is nearer, so every one lands in a family
-    to_readout = np.abs(residual)
-    to_second = np.abs((residual - separation + total / 2) % total - total / 2)
-    readout_family = to_readout <= to_second
-    on_readout = int(readout_family.sum())
-
-    # the slope the peaks alone say, with the or-condition: a switch counts when it sits within a
-    # sample of either line, so switches that peaked on the rephasing echo constrain it too
-    candidates = np.arange(-DRIFT_SLOPE_LIMIT, DRIFT_SLOPE_LIMIT + DRIFT_FINE_STEP / 2,
-                           DRIFT_FINE_STEP)
-    inliers = []
-    for candidate in candidates:
-        offset = (peaks - anchor - candidate * switches + total / 2) % total - total / 2
-        near_readout = np.abs(offset) <= 1
-        near_second = np.abs((offset - separation + total / 2) % total - total / 2) <= 1
-        inliers.append(int((near_readout | near_second).sum()))
-    best = int(np.argmax(inliers))
-    return dict(peaks=peaks, anchor=int(anchor), separation=separation, measured=bool(trusted),
-                population=population, readout_family=readout_family, on_readout=on_readout,
-                on_second=nswitch - on_readout,
-                fitted_slope=float(candidates[best]), inliers=int(inliers[best]))
-
-
-def rephasing_peak(profile: np.ndarray, readout: int, gap: int) -> Tuple[int, float]:
-    """
-    The strongest position of the readout profile that is not the readout echo.
-
-    Searched outside readout +- gap so the answer cannot be the flank of the echo it is being compared
-    against. The amplitude comes back as a fraction of the readout peak rather than being tested
-    against a threshold, because that fraction is what tells a real second echo from a plateau: it
-    reads 0.36 on ischemia_179 and 0.52 on ischemia_121_1, both a clear peak half a switch away from
-    the readout one, against 0.83 on cirrhrat_43_1 - which is not a second echo at all but the
-    shoulder of a profile too smeared to have two of anything
-    Args:
-        - profile: signal per position within the switch, as spectral_peak returns
-        - readout: the position of the readout echo
-        - gap: how far either side of it to exclude
-    Returns:
-        - (position, its amplitude as a fraction of the profile's peak)
-    """
-    total = len(profile)
-    searchable = np.ones(total, dtype=bool)
-    for offset in range(-gap, gap + 1):
-        searchable[(readout + offset) % total] = False
-    if not searchable.any():
-        return readout, 1.0
-    positions = np.arange(total)[searchable]
-    found = int(positions[np.argmax(profile[searchable])])
-    return found, float(profile[found] / profile.max()) if profile.max() else 0.0
-
-
-def measure_group_drift(mrs_list: Sequence[MRSdata]
-                       ) -> Optional[Tuple[dict, Tuple[int, int, int], np.ndarray]]:
-    """
-    Measure the echo drift of one dataset, from every repetition of every file of it pooled.
-
-    One call for the three steps a drift measurement always takes together - pool, read the switch
-    layout, search the correction - so that a caller walking datasets stays a loop and every caller
-    measures the same way. The layout comes back with the measurement because the shifts that take
-    the drift out depend on it: the same slope lands on different integers in a 28 point switch than
-    in a 20 point one.
-
-    What goes into one call is the caller's decision and it is not a free one. The drift is a
-    property of the gradient timing, so it is the same in every repetition of a scan and pooling
-    them is what gives it enough signal to be found; an averaged prescan pooled in with 25
-    repetitions of real data measures neither of them
-    The pooled cube comes back with the measurement rather than being built and dropped, because
-    every caller reads the echo position out of it straight afterwards and pooling 25 repetitions of
-    12 views twice to answer two questions about the same samples is work for nothing
-    Args:
-        - mrs_list: the parsed files of one dataset, read rather than probed
-    Returns:
-        - (the measurement from measure_echo_drift, (nswitch, total, kept), the pooled cube), or None
-          when the list held no EPSI readout to pool
-    """
-    epsi = [mrs for mrs in mrs_list if is_epsi(mrs) and mrs.rawdata is not None]
-    if not epsi:
-        return None
-    cube = pooled_switch_cube(epsi)
-    if cube is None:
-        return None
-    nswitch, total, kept = switch_layout(epsi[0])
-    return measure_echo_drift(cube, nswitch, total), (nswitch, total, kept), cube
-
-
-def echo_alignment(mrs_list: Sequence[MRSdata], slope: Optional[float] = None) -> Optional[dict]:
-    """
-    Everything needed to put one dataset's echo where it belongs: the drift to take out, and the
-    constant move that lands the result on the position the sequence asks for.
-
-    Two corrections, worked out together and returned as one shift per switch, so applying them is a
-    single roll and neither can be applied without the other:
-
-      - the drift, which is the echo walking along the switch train. Removed by switch_shifts, whose
-        middle-of-the-train anchor is left exactly as it is: the anchor decides nothing here, since
-        the constant below moves the aligned echo onto its target whatever the anchor chose, and
-        measure_echo_drift's accept gates are calibrated against the scores that anchor produces.
-      - the constant, which is the whole readout sitting at the wrong position within the switch.
-        expected_echo_position says where the echo belongs, aligned_echo_position measures where it
-        is, and the difference is the move.
-
-    The two are independent, so the constant is worked out whether or not the drift was usable: a
-    scan whose echo does not walk still has it somewhere other than where the sequence puts it. What
-    says whether that move can be trusted is the profile sharpness reported beside it.
-
-    On the two datasets this was established against the constant reproduces, from the sequence
-    parameters alone, the per-tramp prepend the conversion path hard-codes: switch 0 comes out moved
-    by +5 on the tramp 100 kidney data and +7 on tramp 112 cirrhrat
-    Args:
-        - mrs_list: the parsed files of one dataset, read rather than probed
-        - slope: roll rate in samples per switch to apply instead of the measured one, for correcting
-          a scan case by case. Zero is a real answer, meaning take no drift out but still make the
-          constant move; None leaves the measurement in charge
-    Returns:
-        - dict of the drift, the layout, the expected and measured positions, the constant, the total
-          shift per switch, where the echo ends up, the two peak families, the rephasing check and
-          the sequence's own sampling window, or None when there was nothing to pool
-    """
-    measured = measure_group_drift(mrs_list)
-    if measured is None:
-        return None
-    drift, layout, cube = measured
-    nswitch, total, kept = layout
-    reference = next(mrs for mrs in mrs_list if is_epsi(mrs) and mrs.rawdata is not None)
-
-    # a slope given by hand wins over the measured one, and the measurement still runs and is still
-    # reported: the operator correcting a scan case by case wants to see what the data said next to
-    # what they asked for. Given zero is a real answer and not a missing one, hence the `is not None`
-    given = slope is not None
-    # zero, not the measured slope, when the measurement refused it: what is applied has to be what
-    # the shifts below actually carry, or every number reported against it describes something else
-    applied = float(slope) if given else (drift['slope'] if drift['usable'] else 0.0)
-    # zeros rather than a skip when there is no drift to take out, so that the constant below is
-    # applied to a readout that was left alone as readily as to one that was straightened
-    shifts = (switch_shifts(nswitch, total, applied) if applied
-              else np.zeros(nswitch, dtype=int))
-    straightened = roll_switches(cube, shifts)
-    aligned, sharpness = aligned_echo_position(straightened)
-
-    # the two echoes as the data shows them, read in the de-drifted frame the constant is added in.
-    # The sequence's own spacing goes in as the fallback for a readout too smeared to measure one
-    positions = expected_echo_positions(reference)
-    expected, expected_rephasing = positions if positions else (None, None)
-    by_sequence = (expected_rephasing - expected) if positions else None
-    signal = np.abs(straightened).sum(axis=(2, 3))
-    families = peak_families(signal, 0.0, fallback_separation=by_sequence)
-    separation = families['separation']
-
-    # switch 0 is the anchor: the signal decays along the train, so the first switch is the most
-    # reliable reading of where the echo is, and the drift is linear from it. But switch 0 peaks on
-    # whichever of its two echoes was brighter, and on cirrhrat_43_1 that is the rephasing one - its
-    # peak reads 17 where its neighbours read 3, 4, 5 - so which echo it landed on is decided against
-    # the pooled profile before the anchor is believed, and the separation backed out when it was the
-    # second. Anchoring on it blindly would move that scan's readout echo to position 1 of 28
-    anchor = int(families['anchor'])
-    to_readout = abs((anchor - aligned + total / 2) % total - total / 2)
-    to_second = abs((anchor - aligned - separation + total / 2) % total - total / 2)
-    anchor_on_readout = to_readout <= to_second
-    if not anchor_on_readout:
-        anchor = int(round(anchor - separation)) % total
-
-    # measured from switch 0 rather than from the pooled profile, so the switch carrying the most
-    # signal is the one that lands exactly where the sequence says. Reduced the short way round the
-    # switch, since a position is cyclic within one: moving an echo from 18 to 2 of 20 is 4 samples
-    # later, not 16 earlier
-    constant = int((expected - anchor + total // 2) % total - total // 2) if expected is not None else 0
-    shifts = shifts + constant
-
-    # the same families read off the readout as acquired, with the applied slope taken out of the
-    # residuals rather than out of the samples: that leaves the slope this refits an estimate from the
-    # peaks alone rather than one the correction has already been baked into
-    raw_families = peak_families(np.abs(cube).sum(axis=(2, 3)), applied,
-                                 fallback_separation=by_sequence)
-    corrected = roll_switches(cube, shifts) if constant else straightened
-    rephasing, rephasing_amplitude = (rephasing_peak(spectral_peak(corrected)[0],
-                                                     (anchor + constant) % total,
-                                                     max(int(round(abs(separation) / 2)), 1))
-                                      if expected is not None else (None, 0.0))
-
-    discard_pre = (total - kept) // 2
-    landed = (anchor + constant) % total
-    # judged against the window the sequence samples where there is one, since that is where the echo
-    # was meant to land; a conversion's centred window is the fallback and the --pad above is the gap
-    window = sequence_window(reference)
-    window_start = window[0] if window else discard_pre
-    return dict(drift=drift, layout=layout, shifts=shifts, cube=cube,
-                applied=applied, given=given,
-                expected=expected, expected_rephasing=expected_rephasing,
-                aligned=aligned, sharpness=sharpness, constant=constant,
-                anchor=anchor, anchor_on_readout=bool(anchor_on_readout), separation=separation,
-                separation_measured=bool(families['measured']),
-                rephasing=rephasing, rephasing_amplitude=rephasing_amplitude,
-                families=raw_families, window=window, window_start=window_start,
-                landed=landed, discard_pre=discard_pre,
-                inside=bool(((landed - window_start) % total) < kept),
-                sequence_name=reference.sequence_name, tramp=reference.tramp,
-                sample_period=reference.sample_period)
-
-
-def shift_report(alignment: dict, label: str = "") -> None:
-    """
-    Print what a dataset's echo does, and what correcting it comes to.
-
-    The shift range is printed against the discarded ramp on purpose: rolling a switch brings in the
-    samples of its neighbour, which are ramp points rather than signal, so once the shift exceeds
-    the ramp the ends of the train have nothing valid left to move in. That is the number that says
-    whether a measured drift can be corrected by moving whole samples at all
-    Args:
-        - alignment: the dict echo_alignment returns
-        - label: what to call this dataset, e.g. a meas_id
-    Returns:
-        - None; everything goes to stdout beside the figures
-    """
-    drift, (nswitch, total, kept) = alignment['drift'], alignment['layout']
-    shifts, expected = alignment['shifts'], alignment['expected']
-    families = alignment['families']
-
-    print(f"\necho of {label or 'the pooled readout'}, {drift['reps']} repetitions pooled")
-    print(f"  {'drift' if drift['usable'] else 'no usable drift'}: {drift['reason']}")
-    print(f"  best slope {drift['slope']:+.4f} samples per switch, a switch period of "
-          f"{drift['period']:.2f} samples where nsamples/{nswitch} records {total}")
-    if alignment['given']:
-        print(f"  applying {alignment['applied']:+.4f} per switch as asked for, where the search "
-              f"measured {drift['slope']:+.4f}")
-    # the same train read a second way: peaks per switch, sorted into the two echoes a switch holds
-    how = ("measured" if alignment['separation_measured']
-           else "too smeared to measure, taken from the sequence")
-    print(f"  per switch peaks: {families['on_readout']} of {nswitch} on the readout echo and "
-          f"{families['on_second']} on the second, {alignment['separation']:+.0f} positions apart "
-          f"({how}), which refits a slope of {families['fitted_slope']:+.4f} "
-          f"({families['inliers']} of {nswitch} switches within a sample) against the "
-          f"{alignment['applied']:+.4f} applied")
-    # what the constant below is measured from: switch 0, which carries the most signal of any switch
-    landed_on = 'the readout echo' if alignment['anchor_on_readout'] else 'the rephasing echo'
-    print(f"  switch 0 peaks on {landed_on}, so the readout echo of switch 0 sits at "
-          f"{alignment['anchor']} once the drift is out"
-          + ('' if alignment['anchor_on_readout']
-             else f", backed out by the {alignment['separation']:.1f} between the two"))
-    if alignment['window']:
-        start, end = alignment['window']
-        pad = alignment['discard_pre'] - start
-        print(f"  the sequence samples {start}..{end} of the switch, where a conversion keeps "
-              f"{alignment['discard_pre']}..{alignment['discard_pre'] + kept - 1}: mrd2recon --pad "
-              f"{pad} reads the plateau rather than a window {pad} sample(s) past it")
-    if expected is None:
-        print(f"  no expected position for sequence '{alignment['sequence_name']}', so the echo is "
-              f"left where it was acquired: the ramp layout is only established for epsigre")
-    else:
-        ramp_us = alignment['sample_period'] / 10.0
-        print(f"  the sequence puts the echo at {expected} = tramp {alignment['tramp']}us / "
-              f"{ramp_us:.0f}us sample period + {kept}/2, against the {alignment['anchor']} switch 0 "
-              f"reads (the pooled profile agrees at {alignment['aligned']}, peak/median "
-              f"{alignment['sharpness']:.2f})")
-        start = alignment['window_start']
-        print(f"  so the whole readout moves {alignment['constant']:+d}, landing the echo at "
-              f"{alignment['landed']}, {'inside' if alignment['inside'] else 'OUTSIDE'} the "
-              f"{start}..{start + kept - 1} the sequence samples")
-        # the second echo checks the first rather than moving anything: the readout echo is what the
-        # constant above was measured from, and this says whether the switch looks like the sequence
-        # says it should once that move is made
-        off = alignment['rephasing'] - alignment['expected_rephasing']
-        print(f"  the rephasing echo lands at {alignment['rephasing']} against the "
-              f"{alignment['expected_rephasing']} the sequence puts it at, {off:+d} off, at "
-              f"{alignment['rephasing_amplitude']:.2f} of the readout peak")
-        if abs(off) > 1:
-            print(f"WARNING the rephasing echo of {label or 'this readout'} sits {off:+d} samples "
-                  f"from where the sequence puts it, so the ramp layout this correction was worked "
-                  f"out from does not describe this scan; the move was applied anyway",
-                  file=sys.stderr)
-    discard = (total - kept) // 2
-    print(f"  correcting it moves switch 0 by {int(shifts[0]):+d} and switch {nswitch - 1} by "
-          f"{int(shifts[-1]):+d}, a range of {int(shifts.min())} to {int(shifts.max())} samples "
-          f"against {discard} discarded ramp points either side")
-
-
-def read_inputs(args) -> Iterable[Tuple[str, MRSdata]]:
-    """
-    Every .MRD the input resolves to, parsed, in acquisition order.
-
-    Grouping is deliberately not run: this reports one file at a time, so nothing here needs to know
-    which stream a file would end up in, and both mrs_organize.collect_mrd_paths and read_scan_tar
-    already drop the AppleDouble shadows and order what is left the way conversion would read it
-    Args:
-        - args: the parsed command line, in exactly one of the three input modes
-    Returns:
-        - (name, parsed file) pairs, the name being a path or a tar member name
-    """
-    if args.tar:
-        with open(args.tar, "rb") as tar_stream:
-            _, spr_frequency, members = read_scan_tar(tar_stream)
-        for name, payload in members:
-            mrs = MRSdata()
-            mrs.parse_from_buffer(payload)
-            mrs.set_base_frequency(spr_frequency)   # the .MRD may defer its frequency to the sidecar
-            yield name, mrs
-    elif args.input:
-        mrs = MRSdata()
-        mrs.read_from_file(args.input)
-        yield str(args.input), mrs
-    else:
-        for filepath in mrs_organize.collect_mrd_paths(args.folder):
-            mrs = MRSdata()
-            mrs.read_from_file(filepath)
-            yield filepath, mrs
-
-
-def report_windows(named_files: Iterable[Tuple[str, MRSdata]]) -> int:
-    """
-    Report the EPSI sampling window for every file, converting nothing.
-    Args:
-        - named_files: (name, parsed file) pairs, as read_inputs yields them
-    Returns:
-        - how many files were reported on
-    """
-    # materialised rather than streamed, because the drift is measured from all of them pooled
-    epsi: List[Tuple[str, MRSdata]] = []
-    for name, mrs in named_files:
-        if not is_epsi(mrs):
-            print(f"Skipping {name}: {mrs.sequence_name or 'unknown sequence'} is not an EPSI "
-                  f"readout, so it has no gradient switches to place a window in", file=sys.stderr)
-            continue
-        if mrs.rawdata is None or mrs.rawdata.size == 0:
-            print(f"Skipping {name}: no raw data was read", file=sys.stderr)
-            continue
-        epsi.append((name, mrs))
-    if not epsi:
-        return 0
-
-    # this walks its input file by file and never groups it, so an experiment folder arrives here as
-    # its data and its averaged phantom together. The averaged readouts are left out of the drift,
-    # because pooling one of them in with the repetitions would measure something neither of them is.
-    # Their windows are still reported below like any other file's
-    data = [(name, mrs) for name, mrs in epsi if mrs.naverages <= 1]
-    phantoms = len(epsi) - len(data)
-    if phantoms:
-        print(f"Leaving {phantoms} averaged file(s) out of the drift measurement, since pooling one "
-              f"in with the repetitions would measure neither", file=sys.stderr)
-
-    # one measurement for the whole input, from every repetition of every unaveraged file pooled
-    alignment = echo_alignment([mrs for _, mrs in data]) if data else None
-    if alignment is None:
-        print("\nno unaveraged EPSI readout to measure the echo drift from", file=sys.stderr)
-    else:
-        shift_report(alignment, label=f"{len(data)} file(s)")
-
-    reported = 0
-    for name, mrs in epsi:
-        # one figure per file, each blocking until it is closed, so a whole experiment is walked
-        # rather than averaged into one picture
-        report = plot_switch_profile(mrs)
-        print(f"\n{name}")
-        print(f"  {report['nswitch']} switches of {report['total']} points, keeping "
-              f"{report['kept']}, discard_pre={report['discard_pre']}, profile peak/median "
-              f"{report['snr']:.2f}")
-        print(f"  echo peak at position {report['peak']}")
-        print(f"  most signal:  window starts at {report['by_signal']}, echo lands at "
-              f"{report['peak_at'][report['by_signal']]} of {report['kept']}, "
-              f"mrd2recon --pad {report['pad_by_signal']}")
-        print(f"  echo centred: window starts at {report['by_centre']}, echo lands at "
-              f"{report['peak_at'][report['by_centre']]} of {report['kept']}, "
-              f"mrd2recon --pad {report['pad_by_centre']}")
-        if report['snr'] < 1.5:
-            print(f"  WARNING the profile of {name} is nearly flat, so this scan carries too little "
-                  f"signal to place the window; check it against one that does", file=sys.stderr)
-        reported += 1
-    return reported
-
-
-def correct_stream(input_path: Path, output_path: Path) -> bool:
-    """
-    Take the echo drift out of a converted stream and write it back out.
-
-    The acquisitions are grouped by the encoding they point at, because a file holds more than one
-    acquisition matrix - the series and the averaged prescan beside it - and their switch layouts
-    differ. The drift is a property of the gradient timing, so it is measured once per matrix over
-    every acquisition of that group pooled, and the same shifts are applied to all of them.
-
-    A measurement that fails its own acceptance tests is reported and not applied: the stream is
-    copied through unchanged rather than rolled by a slope nobody trusts.
-    Args:
-        - input_path: a converted .mrd2
-        - output_path: where the corrected stream goes
-    Returns:
-        - True when a stream was written
-    """
-    with mrd.BinaryMrdReader(str(input_path)) as reader:
-        header = reader.read_header()
-        acqs = [item.value for item in reader.read_data()
-                if isinstance(item, mrd.StreamItem.Acquisition)]
+    header, items = read_stream(input_path)
+    acqs = [item.value for item in items if isinstance(item, mrd.StreamItem.Acquisition)]
     if not acqs:
         print(f"no acquisitions in {input_path}", file=sys.stderr)
-        return False
-
-    params = ({q.name: int(q.value) for q in header.user_parameters.user_parameter_long}
-              if header.user_parameters is not None else {})
-    nswitch = params.get("nswitches", 0)
-    if nswitch <= 1:
-        print(f"{input_path} records nswitches={nswitch}; there is no switch train to de-drift",
+        return 1
+    if header.measurement_information.sequence_name == "epsigre43_FB_13C":
+        print(f"{input_path} EVO1 data so there is no drift to take out",
               file=sys.stderr)
-        return False
+        if output_path:
+            write_stream(output_path, header, items)
+        return 0
+    if (header_long(header, "nswitches") or 1) <= 1:
+        print(f"{input_path} records no switch train, so there is no drift to take out",
+              file=sys.stderr)
+        if output_path:
+            write_stream(output_path, header, items)
+        return 0
 
-    # one group per acquisition matrix, which is what encoding_space_ref names
-    groups: dict = {}
+    groups: Dict[Tuple[int, int, int, int], List[mrd.Acquisition]] = {}
     for acq in acqs:
-        groups.setdefault(acq.head.encoding_space_ref or 0, []).append(acq)
+        groups.setdefault(switch_layout(header, acq), []).append(acq)
+    biggest = max(groups, key=lambda key: len(groups[key]))
+    nswitch, total, kept, start = biggest
+    pool = [a for a in groups[biggest] if not is_prescan(a)] or groups[biggest]
 
-    for ref, group in sorted(groups.items()):
-        total = group[0].samples() // nswitch
-        cube = acquisition_cube(group, nswitch, total)
-        drift = measure_echo_drift(cube, nswitch, total)
-        shifts = switch_shifts(nswitch, total, drift['slope'])
+    cube, missing = acquisition_cube(pool, nswitch, total)
+    if missing:
+        print(f"  {missing} view/repetition slot(s) no acquisition filled, read as zero",
+              file=sys.stderr)
+    raw_signal = np.abs(cube).sum(axis=(2, 3))
+    # put the readouts aside before the correction writes back into them, so -p draws every method
+    # over the raw data rather than over whichever one was already applied to the stream
+    raw_lines = pooled_lines(pool) if plot else []
+    drift = measure_drift(cube, nswitch, total)
+    anchor = readout_anchor(drift['lines'], raw_signal, total)
+    measured_pad = measure_pad(anchor, total, start, kept)
+    applied_pad = measured_pad if pad is None else int(pad)
+    expected = start + kept // 2
 
-        print(f"\nencoding {ref}: {len(group)} acquisitions, {nswitch} switches of {total} "
-              f"samples, {drift['reps']} repetitions pooled")
-        print(f"  {'drift' if drift['usable'] else 'no usable drift'}: {drift['reason']}")
-        print(f"  best slope {drift['slope']:+.4f} samples per switch, a switch period of "
-              f"{drift['period']:.2f} where nsamples/{nswitch} records {total}")
-        if not drift['usable']:
-            print("  left uncorrected")
-            continue
-        print(f"  shifts {shifts.min():+d} to {shifts.max():+d} samples, "
-              f"peak/median {drift['base_snr']:.2f} -> {drift['snr']:.2f}")
-        for acq in group:
-            roll_acquisition(acq, shifts, nswitch, total)
+    print(f"{nswitch} switches of {total} samples, reading {start}..{start + kept - 1}; "
+          f"{len(pool)} acquisitions pooled", file=sys.stderr)
+    print(f"  {'drift' if drift['usable'] else 'no usable drift'}: {drift['reason']}",
+          file=sys.stderr)
+    print(f"  slope {drift['slope']:+.4f} per switch, a period of {drift['period']:.4f} "
+          f"where nsamples/{nswitch} records {total}", file=sys.stderr)
+    # the measurement beside the `ramp + 3` an older converter hard-coded per tramp, which is what it
+    # should reproduce: +7 on the tramp 112 cirrhrat data, +5 on the tramp 100 kidney data
+    print(f"  switch 0's readout echo sits at {anchor:.2f} and the sequence puts it at {expected} "
+          f"(ramp {start} + {kept}/2), so the base is {measured_pad:+d} zeros against the "
+          f"{start + 3:+d} of ramp+3"
+          + (f"; --pad {applied_pad:+d} overrides it" if pad is not None else ""), file=sys.stderr)
 
-    with mrd.BinaryMrdWriter(str(output_path)) as writer:
-        writer.write_header(header)
-        writer.write_data(mrd.StreamItem.Acquisition(acq) for acq in acqs)
-    print(f"\nWriting corrected stream at {output_path}", file=sys.stderr)
-    return True
+    applied = drift['slope'] if drift['usable'] else 0.0
+    already = header_double(header, SLOPE_PARAMETER)
+    corrected_signal = raw_signal
+    if not drift['usable'] and not applied_pad:
+        print("  nothing to take out, copying the stream through unchanged", file=sys.stderr)
+    elif already is not None and not force:
+        print(f"  this stream already records {already:+.4f} taken out of it, so it is copied "
+              f"through unchanged; pass --force to correct it again", file=sys.stderr)
+    else:
+        print(f"  padding {applied_pad:+d} zeros and taking {applied:+.4f} per switch out of the "
+              f"{total} point layout, --method {method}", file=sys.stderr)
+        corrected = 0
+        skipped_prescan = 0
+        for key, group in groups.items():
+            n, t, k, s = key
+            # The prescan is calibration, not data: it is a separate acquisition that happens to
+            # travel in the same file, the drift measured off the series says nothing about it, and
+            # the scaling the reconstruction takes from it has to mean the same thing before and
+            # after a correction.  Left alone on cirrhrat_43_1 it reads 625.678 whatever --method
+            # ran; corrected along with the series it read 284.540 to 599.589, a calibration moving
+            # with the thing it is supposed to calibrate.
+            real = [a for a in group if not is_prescan(a)]
+            skipped_prescan += len(group) - len(real)
+            if not real:
+                continue
+            group = real
+            if key == biggest:
+                scaled, pad_here = applied, applied_pad
+            else:
+                # Measured on this layout's own data rather than scaled off the biggest group's.
+                # The drift is a fractional timebase disagreement, so scaling by switch length is
+                # the right shape of answer, but only where the layout agrees: on cirrhrat_43_1 the
+                # scaled +0.2352 fits the prescan's own peaks worse than its own +0.0937 does, and
+                # both fit it badly.  A layout that cannot measure its own drift is left alone
+                # rather than corrected by extrapolation - being left alone is the better failure.
+                own_cube, _ = acquisition_cube(group, n, t)
+                own_signal = np.abs(own_cube).sum(axis=(2, 3))
+                own = measure_drift(own_cube, n, t)
+                scaled = own['slope'] if own['usable'] else 0.0
+                # the pad needs `start + kept // 2`, which means nothing when the layout's own
+                # numbers do not account for its switch
+                pad_here = (measure_pad(readout_anchor(own['lines'], own_signal, t), t, s, k)
+                            if geometry_closes(t, k, s) else 0)
+                if not own['usable'] or not pad_here:
+                    print(f"    the {t} point layout is left as it is: "
+                          + ("its geometry does not close, "
+                             f"{s} + {k} + 3*{s} is {4 * s + k} of {t}, so where its echo belongs "
+                             "cannot be worked out" if not geometry_closes(t, k, s)
+                             else f"no usable drift, {own['reason']}"), file=sys.stderr)
+                if not own['usable'] and not pad_here:
+                    continue
+                print(f"    the {t} point layout is corrected on its own measurement, "
+                      f"{scaled:+.4f} per switch on a {pad_here:+d} base", file=sys.stderr)
+            offsets = switch_offsets(n, scaled)
+            for acq in group:
+                data = np.asarray(acq.data)
+                moved = apply_base_and_method(data, pad_here, offsets, scaled, n, t, method)
+                acq.data = moved.astype(data.dtype)
+                if drop_first:
+                    # the first FID point is the integral of the spectrum, which a sum of
+                    # Lorentzians plus a constant baseline fits badly; the legacy reconstruction
+                    # drops it and that alone accounts for much of its cleaner fit
+                    zeroed = np.array(acq.data, copy=True)
+                    zeroed[:, :t] = 0
+                    acq.data = zeroed
+                corrected += 1
+        record(header, applied, applied_pad, method)
+        print(f"  corrected {corrected} acquisition(s)"
+              + (f", leaving {skipped_prescan} prescan acquisition(s) as they are"
+                 if skipped_prescan else ""), file=sys.stderr)
+        corrected_cube, _ = acquisition_cube([a for a in groups[biggest] if not is_prescan(a)]
+                                             or groups[biggest], nswitch, total)
+        corrected_signal = np.abs(corrected_cube).sum(axis=(2, 3))
+
+    # Where the echo ends up, against the window the reconstruction reads.  With the pad applied
+    # these should agree: the pad is what puts the echo on the position the sequence asks for, and
+    # the method is what holds the rest of the train there, so a warning here is now a real finding
+    # rather than the standing complaint it was when nothing moved the readout at all.
+    landed = int(np.argmax(corrected_signal.sum(axis=0)))
+    inside = start <= landed <= start + kept - 1
+    print(f"  the echo lands at {landed}, against the {expected} the sequence puts it at "
+          f"(ramp {start} + {kept}/2) and the {start}..{start + kept - 1} the reconstruction reads",
+          file=sys.stderr)
+    if not inside:
+        print(f"WARNING the echo sits OUTSIDE the window the reconstruction reads, so the drift is "
+              f"straight but the readout is in the wrong place; a base of "
+              f"{applied_pad + expected - landed:+d} rather than {applied_pad:+d} would centre it",
+              file=sys.stderr)
+
+    if plot:
+        # every method over the same padded base, each on a copy, so the figure compares them
+        # against one another and against the raw readout without touching the stream.  The base on
+        # its own is not drawn: it translates the whole picture by `pad` and leaves the walk exactly
+        # as it was, which the raw panel already shows
+        offsets = switch_offsets(nswitch, applied)
+        panels = [("raw", raw_signal)]
+        for name in METHODS:
+            panels.append((name, pooled_signal(
+                raw_lines, nswitch, total,
+                lambda line, m=name: apply_base_and_method(
+                    line, applied_pad, offsets, applied, nswitch, total, m))))
+        plot_method_matrix(panels, drift['lines'], nswitch, total, start, kept,
+                           f"{Path(input_path).name}: {drift['slope']:+.4f} per switch, "
+                           f"base {applied_pad:+d}", Path(plot))
+
+    if output_path:
+        write_stream(output_path, header, items)
+        print(f"wrote {output_path}", file=sys.stderr)
+    else:
+        print("  no output path, so nothing was written", file=sys.stderr)
+    return 0
 
 
 def main() -> int:
-    """
-    Take the echo drift out of a converted .mrd2 and write the corrected stream beside it.
-    Returns:
-        - 0 when a stream was written, 1 when nothing was
-    """
     parser = argparse.ArgumentParser(
         description="Take the EPSI echo drift out of a converted MRD2 stream")
-    parser.add_argument("-i", "--input", type=Path, required=True,
-                        help="converted .mrd2 stream to correct")
-    parser.add_argument("-o", "--output", type=Path,
-                        help="where to write the corrected stream "
-                             "(default: <input>_corrected.mrd2 beside the input)")
+    parser.add_argument("-i", "--input", default=os.environ.get("INPUT_PIPE"),
+                        help="the .mrd2 to correct, a FIFO carrying one, or - for stdin "
+                             "(default: $INPUT_PIPE)")
+    parser.add_argument("-o", "--output", default=os.environ.get("OUTPUT_PIPE"),
+                        help="where to write, or - for stdout (default: $OUTPUT_PIPE)")
+    parser.add_argument("--method", choices=METHODS, default=DEFAULT_METHOD,
+                        help=f"where to apply the displacement (default: {DEFAULT_METHOD})")
+    parser.add_argument("--pad", type=int, default=None, metavar="SAMPLES",
+                        help="prepend this many zeros instead of the measured base, moving the "
+                             "whole readout that many samples later; 0 turns the base off. The "
+                             "measurement reproduces the ramp+3 an older converter hard-coded "
+                             "(cirrhrat 7, ischemia 5)")
+    parser.add_argument("--drop-first-switch", action="store_true",
+                        help="zero the first switch, whose sample is the integral of the spectrum "
+                             "and fits a sum of Lorentzians badly")
+    parser.add_argument("-p", "--plot", metavar="PNG",
+                        help="write a figure of the echo position per switch: the raw readout "
+                             "and every method over the zero-pad base. Without -o this is a dry "
+                             "run and no stream is written")
+    parser.add_argument("--force", action="store_true",
+                        help="correct a stream that already records a drift taken out of it")
     args = parser.parse_args()
 
-    if not args.input.is_file():
-        parser.error(f"{args.input} is not a file")
-    output = args.output or args.input.with_name(f"{args.input.stem}_corrected{args.input.suffix}")
-    if output == args.input:
-        parser.error("--output would overwrite the input")
+    if not args.input:
+        parser.error("--input is required when $INPUT_PIPE is unset")
+    if not args.output and not args.plot:
+        parser.error("--output is required when $OUTPUT_PIPE is unset, unless --plot is given")
+    # neither a FIFO the sidecar has not created yet nor stdin is a path that exists
+    if args.input not in ("-", os.environ.get("INPUT_PIPE")) and not Path(args.input).exists():
+        parser.error(f"{args.input} does not exist")
 
-    return 0 if correct_stream(args.input, output) else 1
+    try:
+        return correct_stream(args.input, args.output, args.method, args.force,
+                              args.drop_first_switch, args.plot, args.pad)
+    except RuntimeError as failure:
+        print(f"Cannot read {args.input}: {failure}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

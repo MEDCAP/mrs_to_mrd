@@ -154,21 +154,30 @@ class LorentzianFitter:
                    centers_init: np.ndarray,
                    widths_init: np.ndarray,
                    width_bounds: tuple = None,
-                   center_window: float = 0.5) -> PeakParams:
+                   center_window: float | tuple | None = (0.1, 1.0)) -> PeakParams:
         """Fit all Lorentzian parameters (centers, widths, phases, amplitudes, baseline).
 
-        A center may move by at most center_window from where it was placed and a width is held
+        A center may move by at most its window from where it was placed and a width is held
         inside width_bounds, which is what holds the fit together when several peaks are close
         enough to trade signal. The placement is the strongest prior the fit has, since the peak
         offsets are known chemistry and only the pattern's position is unknown; leave a center
         unbounded and a tiny peak slides onto a strong neighbour to be fitted as a second
         component of its line, which lowers the residual and ruins both peaks' maps.
+
+        As a (lo, hi) pair the window is each peak's own width clipped into that range, so a
+        narrow line is held tighter than a broad one - a 0.13 ppm peak's center is determined
+        far better than a 0.87 ppm peak's, and one fixed window cannot be right for both. The
+        clip is what stops a very narrow peak being pinned to nothing and a very broad one
+        being free to wander onto its neighbour. At the global fit every peak starts from the
+        same width guess, so the windows only differ once per-peak widths do.
         Stores the result in self.params and returns it.
         Args:
             - centers_init: where each peak is thought to be, in ppm
             - widths_init: the width guess each peak starts from, in ppm
             - width_bounds: an absolute (lo, hi) width range in ppm, applied to every peak
-            - center_window: how far a center may move from centers_init, in ppm
+            - center_window: how far a center may move from centers_init. A (lo, hi) pair clips
+              each peak's own width into that range, in ppm; a float is that window for every
+              peak; None leaves centers unbounded
         """
         npeaks = len(centers_init)
         c0 = np.asarray(centers_init, dtype=float)
@@ -179,9 +188,20 @@ class LorentzianFitter:
         amps_init = np.array([np.abs(spectrum[i]) for i in nearest])
         v0 = np.concatenate((np.zeros(npeaks), w0, phases_init, amps_init, [0.0, 0.0]))
 
+        # one window per peak: a pair clips that peak's width into it, a scalar applies as is
+        if center_window is None:
+            windows = None
+        elif np.isscalar(center_window):
+            windows = np.full(npeaks, float(center_window))
+        else:
+            lo, hi = center_window
+            windows = np.clip(w0, float(lo), float(hi))
+
         bounds = [(None, None)] * (4 * npeaks + 2)
         for j in range(npeaks):
-            bounds[j] = (-center_window, center_window)
+            # None leaves a center free to go anywhere, which is what the legacy did
+            bounds[j] = ((None, None) if windows is None
+                         else (-windows[j], windows[j]))
             # a width is an absolute value here, so an unbounded optimizer can walk one through
             # zero and the model diverges. The default is the range the arctan parameterization
             # this replaces used to enforce implicitly

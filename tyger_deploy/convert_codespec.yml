@@ -1,0 +1,39 @@
+# Stage 1. Convert a tar of one scan directory to an MRD2 stream.
+#
+#   tar cf - -C /data ischemia_121_1 \
+#     | tyger run exec -f tyger_deploy/convert_codespec.yml > raw.mrd2
+#
+# EPSI only for now. MRStomrd2.py documents an -i/--input mode for spectral fid data, where one
+# .MRD already holds every repetition, but that mode is not wired into its argument parser on this
+# branch, so there is no spectral codespec to point at.
+#
+# Tyger turns each declared buffer into a named FIFO and passes its path in <NAME>_PIPE. -t reads
+# the tar from the input pipe and -o writes the stream to the output pipe.
+job:
+  codespec:
+    image: ghcr.io/medcap/mrs-convert:latest
+    buffers:
+      inputs: ["input"]
+      outputs: ["output"]
+    args:
+      - -t
+      - $(INPUT_PIPE)
+      - -o
+      - $(OUTPUT_PIPE)
+    resources:
+      requests:
+        cpu: 1
+        # the whole scan is held in memory: the format's parameter block sits after the data at
+        # EOF, and the header needs the phantom count across every file before the first write
+        memory: 2G
+
+  tags:
+    version: "1.0"
+
+  nodePool: cpunp
+
+  replicas: 1
+
+cluster: tep-centralus-1
+
+timeoutSeconds: 3600

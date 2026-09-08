@@ -1,24 +1,25 @@
 """
 Display the contents of an mrd2 file.
 
-Reads whatever a file happens to hold and draws the figures that apply to it, so the same
-command works on a reconstruction, on a raw conversion, and on the legacy image-based output:
+Three figures, each drawn when the file carries what it needs, so the same command works on a
+converted stream, on a shift-corrected one and on a reconstruction:
 
-    python mrdplot.py -i c13mouse_epsigre_27927_recon.mrd2
+    python mrdplot.py -i ischemia_179_epsigre_26575_recon.mrd2
 
-mrd2recon.py writes its results as NdArrays tagged with a description, which is what picks the
-figure here:
+    acquisitions                       the k-space itself, folded on the gradient switch with
+                                       the window the fft keeps drawn on it, so a converter or a
+                                       shift output plots with nothing else in the file. A recon
+                                       carries its acquisitions through unchanged, so it shows
+                                       the same samples the fit was run on. The averaged prescan
+                                       is left out, and --switches folds a file whose header
+                                       records no switch count
+    metabolite_global_spect / _fit     the summed spectrum and the Lorentzian model fitted to it,
+                                       sample by sample, with each peak's offset and the distance
+                                       the fit had to move it
+    metabolite_amplitude               one map per metabolite across the repetitions
 
-    global_spect / global_spect_fit / lorentzian_*  the fitted spectrum and its peaks
-    metabolite_amplitude, metabolite_area          maps, drawn as a peak x repetition montage
-    epsi_image                                     the reconstructed volumes
-    phantom peak area, singular_values, noise      calibration and diagnostics
-
-An EPSI reconstruction has one global spectrum and a metabolite map; a single voxel FID series
-has one spectrum per time point and no map, so the two are told apart by what is present rather
-than by a flag.
-
-With --save the figures are written as PNGs instead of shown, for running without a display.
+With --save the figures are written as PNGs instead of shown, for running without a display, and
+the transformed readouts are written beside them as a .mat.
 """
 
 import argparse
@@ -30,12 +31,13 @@ from typing import BinaryIO, Dict, List
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
-from scipy.ndimage import zoom
+from scipy.io import savemat
 
 import mrd
 
-ZOOM_FACTOR = 2         # image interpolation for the metabolite montage
-PEAK_COLORS = ['r', 'b', 'g', 'c', 'm', 'y', 'k']
+# the recon fits the series and the averaged prescan separately into one stream and names every
+# array for its encoding. The series is what these figures are about
+LABEL = "metabolite"
 
 
 # ---------- reading ------------------------------------------------------
@@ -64,7 +66,6 @@ class Contents:
     def __init__(self):
         self.header = None
         self.acquisitions: List[mrd.Acquisition] = []
-        self.images: List[mrd.Image] = []
         self.arrays: Dict[str, List[mrd.NdArray]] = {}
 
     def first(self, description: str):
@@ -81,57 +82,202 @@ def read_contents(input: BinaryIO) -> Contents:
             value = item.value
             if isinstance(value, mrd.Acquisition):
                 contents.acquisitions.append(value)
-            elif isinstance(value, mrd.Image):
-                contents.images.append(value)
             elif isinstance(value, mrd.NdArray):
                 contents.arrays.setdefault(describe(value), []).append(value)
     contents.acquisitions.sort(key=lambda a: a.head.acquisition_time_stamp_ns)
     return contents
 
 
+def header_nswitches(header: mrd.Header) -> int:
+    """The switch count the converter recorded, or 0 for a file with no EPSI readout."""
+    if header is None or header.user_parameters is None:
+        return 0
+    for item in header.user_parameters.user_parameter_long:
+        if item.name == "nswitches":
+            return int(item.value)
+    return 0
+
+
 # ---------- figures ------------------------------------------------------
 
 
-def plot_fitted_spectrum(contents: Contents, filename: str) -> bool:
+def plot_kspace(contents: Contents, filename: str, *, switches: int = 0) -> bool:
     """
-    The summed spectrum, the Lorentzian model fitted to it, and where the peaks landed.
+    The k-space the acquisitions carry, as an image, for a file that holds any.
 
-    This is the figure the fit is judged by: if the model does not sit on the data, or a peak
-    center is not on a peak, the metabolite maps below are not worth reading.
+    Folded on the gradient switch when the switch count is known: every sample of an EPSI readout
+    falls at one of `total` positions inside a switch, and the reconstruction keeps the same
+    stretch of positions out of each of them, so the picture the window is judged by is position
+    within the switch against switch. The echo should sit on one column in every row, inside the
+    window and on the expected echo position, and an echo that walks across the columns is the
+    drift mrd2shift takes out. That makes this the figure to run on a converter or a shift
+    output, where there is nothing else in the file yet.
+
+    A file whose header records no switch count cannot be folded, so its readouts are drawn end
+    to end instead, one row per acquisition. Most conversions older than the current converter
+    are in that state; --switches folds them anyway.
+
+    The averaged prescan is left out. It calibrates a reconstruction rather than being
+    reconstructed, and its own drift says nothing about the series beside it.
+    Args:
+        - switches: the switch count to fold on, overriding whatever the header records
     """
-    spectra = contents.arrays.get("global_spect")
-    if not spectra or len(spectra) > 1:
-        return False    # no spectrum, or a time series, which plot_spectral_series draws
+    if not contents.acquisitions:
+        return False
+    nswitch = switches or header_nswitches(contents.header)
+
+    groups: Dict[int, List[mrd.Acquisition]] = {}
+    for acq in contents.acquisitions:
+        groups.setdefault(acq.head.encoding_space_ref or 0, []).append(acq)
+
+    drawn = False
+    for ref, acqs in sorted(groups.items()):
+        if acqs[0].head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT:
+            print(f'leaving the {len(acqs)} prescan acquisitions of encoding {ref} out',
+                  file=sys.stderr)
+            continue
+        samples = acqs[0].samples()
+        # acquisitions at another geometry belong in no row of this image
+        readouts = [np.abs(np.asarray(acq.data)[0]) for acq in acqs if acq.samples() == samples]
+        total = samples // nswitch if nswitch > 1 else 0
+
+        figure, axes = plt.subplots(figsize=(7, 9))
+        if total >= 2:
+            used = nswitch * total
+            # summed over views and repetitions, which is the aggregate a single readout is too
+            # noisy to show
+            signal = np.sum([row[:used].reshape(nswitch, total) for row in readouts], axis=0)
+            discard_pre = acqs[0].head.discard_pre or 0
+            # what make_buffer keeps: whatever the two discards leave of the switch, which is the
+            # readout axis the reconstruction transforms
+            kept = total - discard_pre - (acqs[0].head.discard_post or 0)
+            figure.suptitle(f'k-space per switch of encoding {ref}: {filename}')
+            image = axes.imshow(signal, vmin=0, origin='lower', aspect='auto',
+                                interpolation='nearest')
+            axes.plot(np.argmax(signal, axis=1), np.arange(nswitch), 'xr', ms=4,
+                      label='brightest sample')
+            if kept > 0:
+                # edges as well as a wash, so the window is legible without dimming the samples
+                # inside it
+                axes.axvspan(discard_pre - 0.5, discard_pre + kept - 0.5, color='w', alpha=0.12,
+                             label=f'the {kept} points the fft reads')
+                for edge in (discard_pre - 0.5, discard_pre + kept - 0.5):
+                    axes.axvline(edge, color='w', lw=1.2, ls='--', alpha=0.8)
+                # the echo belongs at the middle of the kept window, where k-space crosses zero
+                echo = discard_pre + kept // 2
+                axes.axvline(echo, color='r', lw=1.5, alpha=0.6,
+                             label=f'expected echo at {echo}')
+            axes.set_xlabel(f'position within the {total} point switch')
+            axes.set_ylabel('switch')
+            axes.set_title(f'{len(readouts)} of {len(acqs)} acquisitions summed, '
+                           f'{nswitch} switches of {total} points, '
+                           f'discard_pre {discard_pre}', fontsize=8)
+            axes.legend(fontsize=8, loc='upper right')
+            figure.colorbar(image, ax=axes, label='signal summed over views and repetitions')
+        else:
+            figure.suptitle(f'readouts of encoding {ref}: {filename}')
+            rows = np.stack(readouts)
+            # a handful of samples at the head of the first repetitions are hundreds of times the
+            # rest, and scaling to them leaves every other row flat
+            image = axes.imshow(rows, vmin=0, vmax=np.percentile(rows, 99.5), origin='lower',
+                                aspect='auto', interpolation='nearest')
+            axes.set_xlabel(f'sample of the {samples} point readout')
+            axes.set_ylabel('acquisition, in the order the file holds them')
+            axes.set_title(f'{len(readouts)} of {len(acqs)} acquisitions, no switch count '
+                           f'recorded: pass --switches to fold them on the switch', fontsize=8)
+            figure.colorbar(image, ax=axes, label='signal')
+        figure.tight_layout()
+        drawn = True
+
+    return drawn
+
+
+def placed_centers(spect: np.ndarray, xscale: np.ndarray, offsets: np.ndarray,
+                   biggest: int) -> np.ndarray:
+    """
+    Where the fit put each peak before it was allowed to move, in ppm.
+
+    The same arithmetic candidate_centers ran: the offsets are a rigid pattern of known
+    chemistry, so the fit starts by anchoring the peak it believes is the tallest on the tallest
+    point of the spectrum and hanging the others off it. Wrapped modulo the spectral width,
+    because the axis is relative and a peak past the end folds round rather than falling off.
+    Args:
+        - spect: the summed spectrum the fit was run on
+        - xscale: its ppm axis, evenly spaced
+        - offsets: the peak offsets in ppm, in peak order
+        - biggest: which peak the winning hypothesis anchored on
+    Returns:
+        - one placed center per peak, in ppm
+    """
+    bw_ppm = float(xscale[-1] - xscale[0] + (xscale[1] - xscale[0]))
+    anchor = float(xscale[int(np.argmax(np.abs(spect)))])
+    return (anchor - (np.asarray(offsets, dtype=float) - offsets[biggest])) % bw_ppm
+
+
+def plot_lorentzian_fit(contents: Contents, filename: str) -> bool:
+    """
+    The summed spectrum and the model fitted to it, sample by sample.
+
+    Drawn as the samples that were fitted rather than as a curve through them: the spectrum is
+    one point per switch, so a smooth line would be drawing resolution the data does not have,
+    and a peak two samples wide is exactly the case worth seeing honestly.
+
+    Each peak is labelled with the offset it was named by and the distance the fit moved it from
+    where that offset placed it. That delta is what says whether the pattern landed: a peak that
+    had to walk a long way to fit is a peak fitted to somebody else's line, whatever the residual
+    says about the model as a whole.
+    """
+    spectra = contents.arrays.get(f"{LABEL}_global_spect")
+    if not spectra:
+        return False
+    if len(spectra) > 1:
+        print(f'{len(spectra)} {LABEL}_global_spect arrays; drawing the first', file=sys.stderr)
 
     spect = spectra[0]
+    data = np.asarray(spect.data)
     xscale = np.array(meta_values(spect, "xscale_ppm"))
-    if xscale.size != spect.data.size:
-        xscale = np.arange(spect.data.size)
+    if xscale.size != data.size:
+        xscale = np.arange(data.size)
 
-    fig = plt.figure(figsize=(10, 5))
-    fig.suptitle(f'fitted spectrum: {filename}')
-    plt.plot(xscale, np.real(spect.data), 'r', label='real')
-    plt.plot(xscale, np.imag(spect.data), 'g', label='imag')
-    plt.plot(xscale, np.abs(spect.data), color='0.7', label='magnitude')
+    figure = plt.figure(figsize=(11, 5))
+    figure.suptitle(f'fitted spectrum: {filename}')
+    plt.plot(xscale, np.real(data), 'r.-', ms=4, lw=0.8, label='real')
+    plt.plot(xscale, np.imag(data), 'g.-', ms=4, lw=0.8, label='imag')
 
-    fit = contents.first("global_spect_fit")
+    fit = contents.first(f"{LABEL}_global_spect_fit")
     if fit is not None:
-        plt.plot(xscale, np.real(fit.data), 'k', label='fit')
-        plt.plot(xscale, np.imag(fit.data), 'k', linestyle='--', label='_nolegend_')
+        model = np.asarray(fit.data)
+        plt.plot(xscale, np.real(model), 'k.--', ms=3, lw=0.8, label='fit real')
+        plt.plot(xscale, np.imag(model), '.--', ms=3, lw=0.8, color='0.5', label='fit imag')
 
-    centers = contents.first("lorentzian_centers_ppm")
+    centers = contents.first(f"{LABEL}_lorentzian_centers_ppm")
     if centers is not None:
+        fitted = np.asarray(centers.data).real
         names = meta_values(centers, "peak_names")
-        widths = contents.first("lorentzian_widths_ppm")
-        top = np.max(np.abs(spect.data))
+        # the offsets the peaks were named by, which only the maps carry
+        maps = contents.first(f"{LABEL}_amplitude") or contents.first(f"{LABEL}_area")
+        offsets = np.array(meta_values(maps, "peak_offsets_ppm")) if maps is not None else None
+        biggest = meta_value(spect, "biggest_peak_index")
+        deltas = None
+        if offsets is not None and offsets.size == fitted.size and biggest is not None:
+            placed = placed_centers(data, xscale, offsets, int(biggest))
+            bw_ppm = float(xscale[-1] - xscale[0] + (xscale[1] - xscale[0]))
+            # the short way round the axis, since a center that folded past the end moved a
+            # sample rather than a whole spectral width
+            deltas = (fitted - placed + bw_ppm / 2) % bw_ppm - bw_ppm / 2
+
+        blended = plt.gca().get_xaxis_transform()
         # peaks can sit close together, so the labels run vertically and alternate height
-        for ip, center in enumerate(centers.data):
+        for ip, center in enumerate(fitted):
             plt.axvline(center, color='0.4', linewidth=0.8)
             label = names[ip] if ip < len(names) else str(ip)
-            if widths is not None:
-                label += f' {center:.2f}+-{widths.data[ip]:.2f}'
-            plt.text(center, top * (0.35 + 0.30 * (ip % 2)), label,
-                     rotation=90, va='bottom', ha='right', fontsize=7,
+            if deltas is not None:
+                label += f' {deltas[ip]:+.3f}'
+            label += f' @{center:.2f}'
+            # placed in axis fractions and clipped, so a long label stays inside the axes
+            # rather than climbing over the title
+            plt.text(center, 0.22 + 0.34 * (ip % 2), label, transform=blended,
+                     rotation=90, va='bottom', ha='right', fontsize=7, clip_on=True,
                      bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=0.5))
 
     anchor = meta_value(spect, "biggest_peak_name")
@@ -139,7 +285,8 @@ def plot_fitted_spectrum(contents: Contents, filename: str) -> bool:
     loss = meta_value(fit, "fit_loss") if fit is not None else None
     if loss is not None:
         subtitle += f', residual {loss:.3f}'
-    plt.title(subtitle)
+    plt.title(f'{subtitle}. one marker per sample, d is how far the fit moved each peak',
+              fontsize=8)
     plt.xlabel('frequency (ppm)')
     plt.ylabel('amplitude')
     # outside the axes, so it cannot sit on top of a peak
@@ -148,250 +295,162 @@ def plot_fitted_spectrum(contents: Contents, filename: str) -> bool:
     return True
 
 
-def plot_spectral_series(contents: Contents, filename: str) -> bool:
-    """
-    A single voxel FID series, as a stack of spectra and as a time-frequency image.
-
-    The stack shows the line shape and the image shows how it evolves, which is what the
-    metabolic flux experiment is actually about.
-    """
-    spectra = contents.arrays.get("global_spect")
-    if not spectra or len(spectra) < 2:
-        return False
-
-    data = np.stack([s.data for s in spectra])
-    xscale = np.array(meta_values(spectra[0], "xscale_ppm"))
-    if xscale.size != data.shape[1]:
-        xscale = np.arange(data.shape[1])
-
-    fig, (stacked, image) = plt.subplots(1, 2, figsize=(13, 5))
-    fig.suptitle(f'spectral time series: {filename}')
-
-    offset = np.max(np.abs(data)) * 0.35
-    for i, spect in enumerate(data):
-        stacked.plot(xscale, np.abs(spect) + i * offset, color=plt.cm.viridis(i / len(data)),
-                     linewidth=0.8)
-    stacked.set_xlabel('frequency (ppm)')
-    stacked.set_ylabel('time point')
-    stacked.set_yticks([])
-    stacked.set_title(f'{len(data)} spectra')
-
-    handle = image.imshow(np.abs(data), aspect='auto', origin='lower', cmap='viridis',
-                          extent=[xscale[0], xscale[-1], 0, len(data)])
-    image.set_xlabel('frequency (ppm)')
-    image.set_ylabel('time point')
-    image.set_title('magnitude')
-    fig.colorbar(handle, ax=image)
-
-    # the peaks occupy a small part of the spectral width, so show that part rather than
-    # leaving the interesting structure a few pixels wide
-    occupied = np.abs(data).sum(axis=0)
-    inside = np.flatnonzero(occupied > 0.01 * occupied.max())
-    if inside.size:
-        pad = max(1, int(0.15 * (inside[-1] - inside[0] + 1)))
-        lo = xscale[max(0, inside[0] - pad)]
-        hi = xscale[min(len(xscale) - 1, inside[-1] + pad)]
-        if hi > lo:
-            stacked.set_xlim(lo, hi)
-            image.set_xlim(lo, hi)
-    return True
-
-
-def montage(maps: np.ndarray, zoom_factor: int = ZOOM_FACTOR) -> np.ndarray:
+def montage(maps: np.ndarray) -> np.ndarray:
     """
     Lay (npeaks, nreps, ny, nx) out as one image, peaks down and repetitions across.
 
     Each peak is scaled by its own maximum, so a weak metabolite is still visible next to the
-    substrate, and a bright line separates the rows.
+    substrate, and a bright line separates the rows. The voxels are laid out at the size they
+    were fitted at: a map is a dozen voxels across, and interpolating it up would draw structure
+    the reconstruction never produced.
     """
     npeaks, nreps, ny, nx = maps.shape
-    height, width = ny * zoom_factor, nx * zoom_factor
-    out = np.zeros((npeaks * height, nreps * width))
+    out = np.zeros((npeaks * ny, nreps * nx))
     for ipeak in range(npeaks):
         peak_max = np.max(np.abs(maps[ipeak]))
         if peak_max == 0:
             continue
         for irep in range(nreps):
-            tile = zoom(maps[ipeak, irep], zoom_factor, order=2) / peak_max
-            out[ipeak * height:(ipeak + 1) * height, irep * width:(irep + 1) * width] = tile
-        out[ipeak * height, :] = 1
+            out[ipeak * ny:(ipeak + 1) * ny, irep * nx:(irep + 1) * nx] = (
+                maps[ipeak, irep] / peak_max)
+        out[ipeak * ny, :] = 1
     return out
 
 
 def plot_metabolite_maps(contents: Contents, filename: str) -> bool:
-    """Every metabolite map in the file, one montage per map."""
-    drawn = False
-    for description in ("metabolite_amplitude", "metabolite_area"):
-        arr = contents.first(description)
-        if arr is None:
-            continue
-        maps = np.asarray(arr.data)
-        if maps.ndim != 4:
-            continue
-        names = meta_values(arr, "peak_names")
-        npeaks, nreps, ny, nx = maps.shape
-
-        tiles = montage(maps)
-        # voxels stay square, so the figure is sized to the montage rather than the other way
-        # round, which is what keeps a wide, short montage from floating in empty space
-        width_in = float(np.clip(nreps * 0.7, 6, 16))
-        fig = plt.figure(figsize=(width_in, width_in * tiles.shape[0] / tiles.shape[1] + 1.2))
-        fig.suptitle(f'{description}: {filename}')
-        plt.imshow(tiles, cmap='gray')
-        plt.xlabel('repetition')
-        plt.xticks(np.arange(nreps) * nx * ZOOM_FACTOR + nx * ZOOM_FACTOR / 2,
-                   [str(i) for i in range(nreps)], fontsize=6)
-        plt.yticks(np.arange(npeaks) * ny * ZOOM_FACTOR + ny * ZOOM_FACTOR / 2,
-                   [names[i] if i < len(names) else str(i) for i in range(npeaks)])
-        plt.title('each row scaled to its own maximum', fontsize=8)
-        plt.tight_layout()
-        drawn = True
-    return drawn
-
-
-def plot_time_courses(contents: Contents, filename: str) -> bool:
-    """
-    Each metabolite summed over the voxels, against repetition.
-
-    The substrate is drawn solid and the metabolites marked _m dashed, so a product rising as
-    the substrate decays is visible without fitting anything.
-    """
-    arr = contents.first("metabolite_amplitude")
-    if arr is None or np.asarray(arr.data).ndim != 4:
+    """Each metabolite's map across the repetitions, one row per peak."""
+    arr = contents.first(f"{LABEL}_amplitude") or contents.first(f"{LABEL}_area")
+    if arr is None:
+        return False
+    maps = np.asarray(arr.data).real
+    if maps.ndim != 4:
         return False
 
-    maps = np.asarray(arr.data)
     names = meta_values(arr, "peak_names")
-    source = meta_value(arr, "source_peak_index")
-    metabolites = set(meta_values(arr, "metabolite_indices"))
-    courses = maps.reshape(maps.shape[0], maps.shape[1], -1).sum(axis=2)
-    scale = np.max(courses) or 1.0
+    npeaks, nreps, ny, nx = maps.shape
+    tiles = montage(maps)
 
-    fig = plt.figure(figsize=(9, 5))
-    fig.suptitle(f'metabolite time courses: {filename}')
-    for ip in range(courses.shape[0]):
-        name = names[ip] if ip < len(names) else str(ip)
-        color = PEAK_COLORS[ip % len(PEAK_COLORS)]
-        style = '-' if ip == source else ('--' if ip in metabolites else ':')
-        plt.plot(courses[ip] / scale, color + style, label=name, marker='.')
+    # voxels stay square, so the figure is sized to the montage rather than the other way round,
+    # which is what keeps a wide, short montage from floating in empty space
+    width_in = float(np.clip(nreps * 0.7, 6, 16))
+    figure = plt.figure(figsize=(width_in, width_in * tiles.shape[0] / tiles.shape[1] + 1.2))
+    figure.suptitle(f'{describe(arr)}: {filename}')
+    plt.imshow(tiles, cmap='gray', interpolation='nearest')
     plt.xlabel('repetition')
-    plt.ylabel('summed amplitude (normalized)')
-    plt.legend(fontsize=8)
+    plt.xticks(np.arange(nreps) * nx + nx / 2, [str(i) for i in range(nreps)], fontsize=6)
+    plt.yticks(np.arange(npeaks) * ny + ny / 2,
+               [names[i] if i < len(names) else str(i) for i in range(npeaks)])
+    plt.title('each row scaled to its own maximum', fontsize=8)
+    plt.tight_layout()
     return True
 
 
-def plot_diagnostics(contents: Contents, filename: str) -> bool:
-    """The phantom map and the SVD singular values, when the run produced them."""
-    drawn = False
-
-    phantom = contents.first("phantom peak area")
-    if phantom is not None:
-        maps = np.asarray(phantom.data)
-        if maps.ndim == 3:
-            maps = maps[np.newaxis, ...]
-        fig = plt.figure(figsize=(7, 4))
-        scaling = meta_value(phantom, "phantom_scaling")
-        fig.suptitle(f'phantom peak area (scaling {scaling:.3f}): {filename}'
-                     if scaling is not None else f'phantom peak area: {filename}')
-        plt.imshow(montage(maps), cmap='gray')
-        plt.xticks([])
-        plt.yticks([])
-        drawn = True
-
-    singular = contents.arrays.get("singular_values")
-    if singular:
-        fig = plt.figure(figsize=(7, 4))
-        fig.suptitle(f'SVD singular values: {filename}')
-        for arr in singular:
-            rank = meta_value(arr, "svd_rank")
-            plt.semilogy(np.asarray(arr.data), '.-', linewidth=0.8,
-                         color='0.6' if len(singular) > 1 else 'b')
-            if rank is not None:
-                plt.axvline(rank - 0.5, color='r', linewidth=0.8)
-        plt.xlabel('index')
-        plt.ylabel('singular value')
-        plt.title('red line marks the retained rank')
-        drawn = True
-
-    return drawn
-
-
-def plot_legacy_images(contents: Contents, filename: str) -> bool:
+def kspace_cube(acqs: List[mrd.Acquisition], nswitch: int) -> np.ndarray:
     """
-    The mrd.Image output the legacy reconstruction wrote, kept so old files still open.
+    One encoding's acquisitions as the complex cube the reconstruction fills.
 
-    The legacy recon streamed screenshots of its own figures as uint32 images with ARGB packed
-    one pixel per word, and metabolite images as everything else. There is no image type that
-    says "bitmap" - it wrote ImageType.COMPLEX for both - so the dtype is what tells them apart.
+    Indexed (repetition, view, readout point, switch), which is the arrangement every stage
+    downstream reads: the readout axis is the points the fft keeps out of each switch, and the
+    switch axis is the spectral one, since one spectral point is acquired per switch. Views and
+    repetitions come off the indices the converter set rather than off their counts, so a group
+    missing a view still lands in the right row.
+
+    The samples are the ones the file holds, with no line broadening: that is a reconstruction
+    parameter rather than a property of the data.
+    Args:
+        - acqs: the acquisitions of one encoding, all at the same geometry
+        - nswitch: the switch count the readout was acquired at
+    Returns:
+        - the cube, or None when the discards leave no readout to keep
     """
-    if not contents.images:
+    samples = acqs[0].samples()
+    total = samples // nswitch
+    discard_pre = acqs[0].head.discard_pre or 0
+    kept = total - discard_pre - (acqs[0].head.discard_post or 0)
+    if total < 1 or kept <= 0:
+        return None
+
+    views = sorted({acq.head.idx.kspace_encode_step_1 or 0 for acq in acqs})
+    reps = sorted({acq.head.idx.repetition or 0 for acq in acqs})
+    view_at = {view: i for i, view in enumerate(views)}
+    rep_at = {rep: i for i, rep in enumerate(reps)}
+
+    used = nswitch * total
+    cube = np.zeros((len(reps), len(views), kept, nswitch), dtype=complex)
+    for acq in acqs:
+        if acq.samples() != samples:
+            continue
+        # reshaped through the sample axis, which comes first, so this is the switch-major order
+        # the samples were acquired in, then cut to the window the fft reads
+        body = np.asarray(acq.data)[0, :used].reshape(nswitch, total)
+        cube[rep_at[acq.head.idx.repetition or 0],
+             view_at[acq.head.idx.kspace_encode_step_1 or 0]] = (
+                 body[:, discard_pre:discard_pre + kept].T)
+    return cube
+
+
+def save_mat(contents: Contents, stem: str, save: Path, *, switches: int = 0) -> bool:
+    """
+    Write the transformed data beside the figures as a .mat, for reading it somewhere else.
+
+    One array per encoding and nothing else: `rawdata` for the series and `phantom` for the
+    averaged prescan, each complex and indexed (repetition, view, readout point, switch). The
+    prescan is written here though the figures skip it, since it is data somebody may want; what
+    it is not is evidence about where the series' echo sits.
+
+    Transformed the way mrd2recon transforms it, one repetition at a time over all three of its
+    axes at once, because a DFT along the view axis is a sum over every view and no single
+    acquisition holds more than one of them. The shape is unchanged by that, so the axes stay as
+    named above and read as (repetition, y, x, frequency) afterwards.
+
+    No line broadening is applied. That is a reconstruction parameter rather than a property of
+    the samples, and applying one here would bake a choice the recon still has to make into the
+    export.
+    Returns:
+        - True when a file was written
+    """
+    nswitch = switches or header_nswitches(contents.header)
+    if nswitch <= 1:
         return False
 
-    bitmaps = [i for i in contents.images if np.asarray(i.data).dtype == np.uint32]
-    metabolite_images = [i for i in contents.images if np.asarray(i.data).dtype != np.uint32]
-
-    for image in bitmaps:
-        packed = np.squeeze(image.data)
-        unpacked = np.zeros(packed.shape[:2] + (4,), dtype=np.uint8)
-        for channel, shift in enumerate((0, 8, 16, 24)):
-            unpacked[:, :, channel] = ((packed >> shift) & 0xFF).astype(np.uint8)
-        fig = plt.figure()
-        fig.suptitle(f'File: {filename}')
-        plt.xticks([])
-        plt.yticks([])
-        plt.imshow(unpacked)
-
-    if metabolite_images:
-        # each image is (rows, cols, metabolites) once the leading singleton axes are dropped
-        stacked = np.stack([np.squeeze(i.data) for i in metabolite_images])
-        if stacked.ndim == 4:
-            fig = plt.figure()
-            fig.suptitle(f'metabolic images File: {filename}')
-            plt.imshow(montage(np.moveaxis(stacked, 3, 0)), cmap='gray')
-            plt.xticks([])
-            plt.yticks([])
-
-    return True
-
-
-def plot_acquisitions(contents: Contents, filename: str) -> bool:
-    """The raw acquisition data, drawn end to end in acquisition order."""
-    if not contents.acquisitions:
-        return False
-    fig = plt.figure(figsize=(11, 4))
-    fig.suptitle(f'acquisitions: {filename}')
+    groups: Dict[int, List[mrd.Acquisition]] = {}
     for acq in contents.acquisitions:
-        data = np.asarray(acq.data)
-        trace = data[0] if data.ndim > 1 else data
-        start = acq.head.acquisition_time_stamp_ns * 1.0e-9
-        t = start + np.arange(trace.size) * acq.head.sample_time_ns * 1.0e-9
-        plt.plot(t, np.real(trace), 'r', linewidth=0.4)
-        plt.plot(t, np.imag(trace), 'g', linewidth=0.4)
-    plt.xlabel('time (s)')
-    plt.ylabel('signal')
+        groups.setdefault(acq.head.encoding_space_ref or 0, []).append(acq)
+
+    payload: Dict[str, np.ndarray] = {}
+    for ref, acqs in sorted(groups.items()):
+        cube = kspace_cube(acqs, nswitch)
+        if cube is None:
+            continue
+        for rep in range(cube.shape[0]):
+            axes = (0, 1, 2)
+            cube[rep] = np.fft.fftshift(np.fft.fftn(cube[rep], axes=axes), axes=axes)
+        key = 'phantom' if acqs[0].head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT \
+              else 'rawdata'
+        # a file with two encodings of the same kind would otherwise write one over the other
+        payload[key if key not in payload else f'{key}_{ref}'] = cube
+
+    if not payload:
+        return False
+    path = save / f'{stem}.mat'
+    savemat(str(path), payload)
+    print(f'wrote {path}: {", ".join(payload)}', file=sys.stderr)
     return True
 
 
 # ---------- driver -------------------------------------------------------
 
 
-def plot_mrd(input: BinaryIO, filename: str, *, raw: bool = False, save: Path = None) -> None:
+def plot_mrd(input: BinaryIO, filename: str, *, switches: int = 0,
+             save: Path = None) -> None:
     contents = read_contents(input)
 
-    counts = ', '.join(f'{len(v)} {k or "untagged"}' for k, v in contents.arrays.items())
-    print(f'found {len(contents.acquisitions)} acquisitions, {len(contents.images)} images'
-          + (f', {counts}' if counts else ''), file=sys.stderr)
-
-    drawn = False
-    for figure in (plot_fitted_spectrum, plot_spectral_series, plot_metabolite_maps,
-                   plot_time_courses, plot_diagnostics, plot_legacy_images):
-        drawn |= figure(contents, filename)
-    if raw:
-        drawn |= plot_acquisitions(contents, filename)
+    drawn = plot_kspace(contents, filename, switches=switches)
+    drawn |= plot_lorentzian_fit(contents, filename)
+    drawn |= plot_metabolite_maps(contents, filename)
 
     if not drawn:
-        print('nothing in this file has a figure to draw; pass --raw to see the acquisitions',
-              file=sys.stderr)
+        print('nothing in this file has a figure to draw', file=sys.stderr)
         return
 
     if save is not None:
@@ -405,6 +464,7 @@ def plot_mrd(input: BinaryIO, filename: str, *, raw: bool = False, save: Path = 
             fig.savefig(path, dpi=150, bbox_inches='tight')
             print(f'wrote {path}', file=sys.stderr)
         plt.close('all')
+        save_mat(contents, stem, save, switches=switches)
     else:
         plt.show()
 
@@ -412,7 +472,7 @@ def plot_mrd(input: BinaryIO, filename: str, *, raw: bool = False, save: Path = 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Plot MRD file contents')
     parser.add_argument('-i', '--input', type=str, required=False, help='Input file, defaults to stdin')
-    parser.add_argument('--raw', action='store_true', help='Also plot the raw acquisition data')
+    parser.add_argument('--switches', type=int, default=0, help='Fold the readouts on this many gradient switches, for a file whose header records no switch count')
     parser.add_argument('-s', '--save', type=Path, default=None, help='Write the figures to this directory instead of showing them')
     args = parser.parse_args()
 
@@ -422,8 +482,8 @@ if __name__ == "__main__":
     if args.input is None:
         input = sys.stdin.buffer
         filename = ''
-        plot_mrd(input, filename, raw=args.raw, save=args.save)
+        plot_mrd(input, filename, switches=args.switches, save=args.save)
     else:
         filename = Path(args.input).stem
         with open(args.input, 'rb') as input:
-            plot_mrd(input, filename, raw=args.raw, save=args.save)
+            plot_mrd(input, filename, switches=args.switches, save=args.save)

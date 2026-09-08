@@ -1,0 +1,49 @@
+# Stage 3. Reconstruct a corrected EPSI MRD2 stream into peak fits and metabolite maps.
+#
+#   tyger run exec -f tyger_deploy/recon_codespec.yml < corrected.mrd2 > recon.mrd2
+#
+# The peak arguments below are the set mrd2recon.py documents. They are the experiment's chemistry,
+# not a default, so change them with the study rather than leaving them as they are:
+#   _s source peak (the injected substrate), _t tiny peak, _m derived metabolite.
+job:
+  codespec:
+    image: ghcr.io/medcap/mrs-recon:latest
+    buffers:
+      inputs: ["input"]
+      outputs: ["output"]
+    args:
+      - -i
+      - $(INPUT_PIPE)
+      - -o
+      - $(OUTPUT_PIPE)
+      # ARGS_BEGIN  (run-tyger.sh replaces everything between the markers)
+      - -bic_tm
+      - "0.0"
+      - -urea
+      - "2.3"
+      - -pyr_s
+      - "9.7"
+      - -ala_tm
+      - "15.2"
+      - -hyd_tm
+      - "18.1"
+      - -lac_m
+      - "21.8"
+      # ARGS_END
+    resources:
+      requests:
+        # the fit runs once on the summed spectrum and then once per voxel per repetition, and the
+        # whole acquisition set is buffered before any of it is written
+        cpu: 4
+        memory: 8G
+
+  tags:
+    version: "1.0"
+
+  nodePool: cpunp
+
+  replicas: 1
+
+cluster: tep-centralus-1
+
+timeoutSeconds: 3600
