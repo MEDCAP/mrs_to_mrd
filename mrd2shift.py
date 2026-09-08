@@ -16,6 +16,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+import mrd
 from MRSreader import MRSdata
 from MRSorganize import ScanGroup, organize_folder, read_scan_tar
 
@@ -449,6 +450,62 @@ def shift_rawdata(mrs: MRSdata, shifts: Sequence[int]) -> None:
     # back through a slice rather than rolled in place, since the reshape may be a copy
     body = mrs.rawdata[:used].reshape((nswitch, total) + tail)
     mrs.rawdata[:used] = roll_switches(body, shifts).reshape((used,) + tail)
+
+
+def acquisition_cube(acqs: Sequence["mrd.Acquisition"], nswitch: int, total: int) -> np.ndarray:
+    """
+    A converted stream's acquisitions as the same cube pooled_switch_cube builds from raw files.
+
+    The stream side twin of switch_cube. Laying the acquisitions out as
+    (switch, position, view, repeat) is what lets measure_echo_drift, drift_sharpness and
+    switch_shifts apply unchanged: the drift is measured the same way whether the scan is still
+    a tree of .MRD files or already one .mrd2.
+
+    Views and repetitions are taken from the indices the converter set rather than from their
+    counts, so a group missing a view still lands in the right column.
+    Args:
+        - acqs: the acquisitions of one encoding, all at the same matrix
+        - nswitch, total: the switch layout, total being the whole switch including its ramps
+    Returns:
+        - (switch, position, view, repeat) complex cube
+    """
+    views = sorted({a.head.idx.kspace_encode_step_1 or 0 for a in acqs})
+    reps = sorted({a.head.idx.repetition for a in acqs})
+    view_at = {view: i for i, view in enumerate(views)}
+    rep_at = {rep: i for i, rep in enumerate(reps)}
+
+    used = nswitch * total
+    cube = np.zeros((nswitch, total, len(views), len(reps)), dtype=complex)
+    for acq in acqs:
+        body = np.asarray(acq.data)[0, :used].reshape(nswitch, total)
+        cube[:, :, view_at[acq.head.idx.kspace_encode_step_1 or 0],
+             rep_at[acq.head.idx.repetition]] = body
+    return cube
+
+
+def roll_acquisition(acq: "mrd.Acquisition", shifts: Sequence[int],
+                     nswitch: int, total: int) -> None:
+    """
+    Take a measured drift out of one converted acquisition, in place.
+
+    The stream side twin of shift_rawdata. Samples past the last whole switch are left where they
+    are, the same truncation the cube and the conversion already apply: nsamples // nswitch leaves
+    a remainder on some sequences, and those trailing points belong to no switch to be rolled with.
+
+    Assigned through a fresh array rather than in place, since the reader hands back a view onto
+    the bytes it decoded
+    Args:
+        - acq: one acquisition, its data shaped (coils, samples)
+        - shifts: integer shift per switch, from switch_shifts
+        - nswitch, total: the switch layout this acquisition was acquired at
+    Returns:
+        - None; acq.data is replaced
+    """
+    used = nswitch * total
+    data = np.array(acq.data, copy=True)
+    body = data[0, :used].reshape(nswitch, total)
+    data[0, :used] = roll_switches(body, shifts).reshape(used)
+    acq.data = data
 
 
 def drift_sharpness(cube: np.ndarray, nswitch: int, slope: float, view: Optional[int]) -> float:
@@ -1120,24 +1177,92 @@ def report_windows(named_files: Iterable[Tuple[str, MRSdata]]) -> int:
     return reported
 
 
+def correct_stream(input_path: Path, output_path: Path) -> bool:
+    """
+    Take the echo drift out of a converted stream and write it back out.
+
+    The acquisitions are grouped by the encoding they point at, because a file holds more than one
+    acquisition matrix - the series and the averaged prescan beside it - and their switch layouts
+    differ. The drift is a property of the gradient timing, so it is measured once per matrix over
+    every acquisition of that group pooled, and the same shifts are applied to all of them.
+
+    A measurement that fails its own acceptance tests is reported and not applied: the stream is
+    copied through unchanged rather than rolled by a slope nobody trusts.
+    Args:
+        - input_path: a converted .mrd2
+        - output_path: where the corrected stream goes
+    Returns:
+        - True when a stream was written
+    """
+    with mrd.BinaryMrdReader(str(input_path)) as reader:
+        header = reader.read_header()
+        acqs = [item.value for item in reader.read_data()
+                if isinstance(item, mrd.StreamItem.Acquisition)]
+    if not acqs:
+        print(f"no acquisitions in {input_path}", file=sys.stderr)
+        return False
+
+    params = ({q.name: int(q.value) for q in header.user_parameters.user_parameter_long}
+              if header.user_parameters is not None else {})
+    nswitch = params.get("nswitches", 0)
+    if nswitch <= 1:
+        print(f"{input_path} records nswitches={nswitch}; there is no switch train to de-drift",
+              file=sys.stderr)
+        return False
+
+    # one group per acquisition matrix, which is what encoding_space_ref names
+    groups: dict = {}
+    for acq in acqs:
+        groups.setdefault(acq.head.encoding_space_ref or 0, []).append(acq)
+
+    for ref, group in sorted(groups.items()):
+        total = group[0].samples() // nswitch
+        cube = acquisition_cube(group, nswitch, total)
+        drift = measure_echo_drift(cube, nswitch, total)
+        shifts = switch_shifts(nswitch, total, drift['slope'])
+
+        print(f"\nencoding {ref}: {len(group)} acquisitions, {nswitch} switches of {total} "
+              f"samples, {drift['reps']} repetitions pooled")
+        print(f"  {'drift' if drift['usable'] else 'no usable drift'}: {drift['reason']}")
+        print(f"  best slope {drift['slope']:+.4f} samples per switch, a switch period of "
+              f"{drift['period']:.2f} where nsamples/{nswitch} records {total}")
+        if not drift['usable']:
+            print("  left uncorrected")
+            continue
+        print(f"  shifts {shifts.min():+d} to {shifts.max():+d} samples, "
+              f"peak/median {drift['base_snr']:.2f} -> {drift['snr']:.2f}")
+        for acq in group:
+            roll_acquisition(acq, shifts, nswitch, total)
+
+    with mrd.BinaryMrdWriter(str(output_path)) as writer:
+        writer.write_header(header)
+        writer.write_data(mrd.StreamItem.Acquisition(acq) for acq in acqs)
+    print(f"\nWriting corrected stream at {output_path}", file=sys.stderr)
+    return True
+
+
 def main() -> int:
     """
-    Report the EPSI sampling window and echo drift for what the input resolves to, converting
-    nothing.
+    Take the echo drift out of a converted .mrd2 and write the corrected stream beside it.
     Returns:
-        - 0 when at least one file was reported on, 1 when nothing was
+        - 0 when a stream was written, 1 when nothing was
     """
     parser = argparse.ArgumentParser(
-        description="Report the EPSI sampling window and echo drift for MR Solutions MRS data")
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("-i", "--input", type=Path,
-                      help="single MRS .MRD file")
+        description="Take the EPSI echo drift out of a converted MRD2 stream")
+    parser.add_argument("-i", "--input", type=Path, required=True,
+                        help="converted .mrd2 stream to correct")
+    parser.add_argument("-o", "--output", type=Path,
+                        help="where to write the corrected stream "
+                             "(default: <input>_corrected.mrd2 beside the input)")
     args = parser.parse_args()
 
-    if args.input and not args.input.is_file():
+    if not args.input.is_file():
         parser.error(f"{args.input} is not a file")
-    
-    return 0
+    output = args.output or args.input.with_name(f"{args.input.stem}_corrected{args.input.suffix}")
+    if output == args.input:
+        parser.error("--output would overwrite the input")
+
+    return 0 if correct_stream(args.input, output) else 1
 
 
 if __name__ == "__main__":

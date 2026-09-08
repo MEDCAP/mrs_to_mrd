@@ -36,7 +36,7 @@ import numpy as np
 # mrd python package
 import mrd
 from MRSreader import MRSdata
-from MRSorganize import read_scan_tar, organize_folder, report_group
+from MRSorganize import ScanGroup, read_scan_tar, organize_folder, report_group
 from mrd2shift import check_peak_position
 
 
@@ -117,23 +117,18 @@ def generate_acquisition(mrs: MRSdata,
         yield mrd.StreamItem.Acquisition(acq)
 
 
-def generate_header(mrs: MRSdata, meas_id: str, group) -> mrd.Header:
+def generate_header(mrs: MRSdata, group: ScanGroup) -> mrd.Header:
     """
     Fill in the MRD header from one file's parameters. Every file in a group was acquired at the
     same matrix, which is what let them be combined, so any of them describes the geometry
     Args:
         - mrs: the file the header describes, chosen by convert_group_to_mrd
-        - meas_id: measurement id, e.g. cirrhrat_43_1
         - group: the ScanGroup, read for the acquisition matrices it recorded. One encoding is
           written per matrix, so the prescan's is described without any prescan file being read
     Returns:
         - mrd.Header
     """
     header = mrd.Header()
-
-    subject = mrd.SubjectInformationType()
-    subject.patient_id = meas_id            # e.g.) cirrhrat_43_1, KIC_Huh7msps5_08-15-2025.mrs
-    header.subject_information = subject
 
     seq = mrd.SequenceParametersType()
     seq.t_r = [mrs.tr]
@@ -143,8 +138,8 @@ def generate_header(mrs: MRSdata, meas_id: str, group) -> mrd.Header:
 
     meas = mrd.MeasurementInformationType()
     meas.sequence_name = mrs.sequence_name
-    meas.measurement_id = meas_id
-    meas.protocol_name = meas_id.split("_")[0]
+    meas.measurement_id = group.meas_id         # e.g.) cirrhrat_43_1, KIC_Huh7msps5_08-15-2025.mrs
+    meas.protocol_name = group.meas_id.split("_")[0]
     meas.relative_table_position = mrd.ThreeDimensionalFloat(x=mrs.FOVoffset[0] * 1e3,
                                                              y=mrs.FOVoffset[1] * 1e3,
                                                              z=mrs.FOVoffset[2] * 1e3)  # m -> mm
@@ -153,26 +148,18 @@ def generate_header(mrs: MRSdata, meas_id: str, group) -> mrd.Header:
     header.experimental_conditions.h1resonance_frequency_hz = mrs.base_frequency
     
     user_param = mrd.UserParametersType()
-    for name, value in (("tramp", mrs.tramp),
+    for name, value in (("tramp_us", mrs.tramp),
                         ("nswitches", mrs.nswitches),
                         ("npoints_per_switch", mrs.npoints_per_switch)):
         user_param.user_parameter_long.append(
                 mrd.UserParameterLongType(name=name, value=int(value)))
     header.user_parameters = user_param
 
-    # one encoding per acquisition matrix the group holds, taken from the {dimension name: length}
-    # dicts MRSorganize recorded. The averaged prescan need not share the series' matrix - on
-    # cirrhrat_43_1 it is 12 views of 2176 samples against 8 of 1792 - and one encoding cannot
-    # describe both, since encoding_limits.phase would contradict the prescan outright. Reading the
-    # shapes off the group rather than a parsed file is what lets the header describe the prescan
-    # before any prescan file has been read. Its field of view is the acquisition's, which is not
-    # recorded per matrix and which nothing downstream reads off that entry
+    # group stores rawdata and prescan data shape as dict since rawdata and prescan differ in dimension
     for shape in (group.rawdata_shape, group.prescan_shape):
-        if not shape:
+        if not shape:   # if no prescan exist skip
             continue
         encoded_space = mrd.EncodingSpaceType()
-        encoded_space.matrix_size = mrd.MatrixSizeType(x=shape["nsamples"], y=shape["nviews"],
-                                                       z=shape["nsliceviews"])
         encoded_space.field_of_view_mm = mrd.FieldOfViewMm(x=mrs.FOV * 1e3, y=mrs.FOV * 1e3, z=0)
 
         # each limit is the size of one rawdata dimension, as a maximum index, and every dimension
@@ -180,7 +167,6 @@ def generate_header(mrs: MRSdata, meas_id: str, group) -> mrd.Header:
         limits.kspace_encoding_step_0 = mrd.LimitType(maximum=shape["nsamples"] - 1)
         limits.kspace_encoding_step_1 = mrd.LimitType(maximum=shape["nviews"] - 1)
         limits.kspace_encoding_step_2 = mrd.LimitType(maximum=shape["nsliceviews"] - 1)
-        # reconstruction sizes its k-space off the phase limit, so it carries the view count too
         limits.phase = mrd.LimitType(maximum=shape["nviews"] - 1)
         limits.slice = mrd.LimitType(maximum=shape["nslices"] - 1)
         limits.contrast = mrd.LimitType(maximum=shape["nechoes"] - 1)
@@ -189,6 +175,7 @@ def generate_header(mrs: MRSdata, meas_id: str, group) -> mrd.Header:
         encoding = mrd.EncodingType()
         encoding.encoded_space = encoded_space
         encoding.encoding_limits = limits
+        # header.encoding is a list of mrd.EncodingType(). rawdata shape gets stored first and then prescan
         header.encoding.append(encoding)
     return header
 
@@ -237,7 +224,7 @@ def convert_folder_to_mrd(folder: Path,
             if writer is None:
                 print(f'Writing file at {grouped_files.output_path}', file=sys.stderr)
                 writer = mrd.BinaryMrdWriter(grouped_files.output_path)
-                writer.write_header(generate_header(mrs, grouped_files.meas_id, grouped_files))
+                writer.write_header(generate_header(mrs, grouped_files))
             writer.write_data(generate_acquisition(mrs, rep_idx, rep_count, encoding_ref=0))
             rep_idx += mrs.nrepetitions
         # next, convert the phantom files in the group navg>1 if they exist. They only ever join a
@@ -305,7 +292,7 @@ def convert_tar_to_mrd(tar_path: Path, output_path: Path) -> bool:
             if writer is None:
                 print(f'Writing file at {output_path}', file=sys.stderr)
                 writer = mrd.BinaryMrdWriter(str(output_path))
-                writer.write_header(generate_header(mrs, grouped_files.meas_id, grouped_files))
+                writer.write_header(generate_header(mrs, grouped_files))
             writer.write_data(generate_acquisition(mrs, rep_idx, rep_count))
             rep_idx += mrs.nrepetitions
         if writer is not None:
