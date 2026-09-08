@@ -145,9 +145,11 @@ def append_recon_header(header: mrd.Header, *,
                         spec: PeakSpec,
                         fit_df: float = 0.0,
                         fit_dw: float = 0.0,
-                        fit_dph: float = 0.0) -> mrd.Header:
+                        fit_dph: float = 0.0,
+                        global_df: float = 0.5,
+                        width_scale: Tuple[float, float] = (0.1, 1.9)) -> mrd.Header:
     """
-    Record what this reconstruction was asked to do on the header it passes through.
+    Record the additional parameters required to run on recon on existing header
 
     The peak list goes on as one double per peak, named '<name>_<modifiers>', so a downstream
     consumer can recover which peak each map belongs to.
@@ -162,6 +164,12 @@ def append_recon_header(header: mrd.Header, *,
         mrd.UserParameterDoubleType(name="linewidth_window_ppm", value=float(fit_dw)))
     header.user_parameters.user_parameter_double.append(
         mrd.UserParameterDoubleType(name="phase_window_rad", value=float(fit_dph)))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="global_frequency_window_ppm", value=float(global_df)))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="width_bound_lo", value=float(width_scale[0])))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="width_bound_hi", value=float(width_scale[1])))
     for i, name in enumerate(spec.names):
         full = f"{name}_{spec.modifiers[i]}" if spec.modifiers[i] else name
         header.user_parameters.user_parameter_double.append(
@@ -380,7 +388,9 @@ def phase_align(volumes: np.ndarray,
 def fit_global_multipeak(global_spect: np.ndarray,
                          xscale: np.ndarray,
                          spec: PeakSpec,
-                         center_window: float = 0.0) -> Tuple[LorentzianFitter, int, float]:
+                         center_window: float = 0.5,
+                         width_scale: Tuple[float, float] = (0.1, 1.9)
+                         ) -> Tuple[LorentzianFitter, int, float]:
     """
     Fit the summed spectrum, trying each candidate for which peak is the tallest one.
 
@@ -393,7 +403,17 @@ def fit_global_multipeak(global_spect: np.ndarray,
     offsets are known chemistry, so a center is nearly determined before the fit starts; left
     unbounded, a tiny peak slides onto a strong neighbour and is fitted as a second component
     of its line. On a 6 peak kidney series hyd_tm walked 1.2 ppm onto urea, took a third of its
-    amplitude, and cut the residual doing it. At 0 the placement is final.
+    amplitude, and cut the residual doing it. At 0 the placement is final. The default 0.5 is
+    what lorn.py enforced implicitly through `c = centers + arctan(x0)/pi * wigglefactor` at
+    the wigglefactor of 1.0 the EPSI path always ran at.
+
+    width_scale is the (lo, hi) width bound as multiples of the width guess. It is what stops
+    the optimizer walking a width through zero, and it is a real constraint on the fit: too
+    narrow a range and a peak sits on a bound instead of on its own linewidth, which makes the
+    model line the wrong shape and its height wrong with it. The default (0.1, 1.9) is the
+    range `w = w0 * (1 + arctan(x0) * 1.8 / pi)` allowed. The (0.5, 1.5) this replaces came
+    from mrd2_recon_to_incorporate.py, which linearised the transforms and re-supplied a
+    narrower bound; on cirrhrat_43_1 it clamped four of six peaks and cost 0.7 of residual.
     Returns:
         - (fitter holding the winning fit, index of the winning peak, the width guess in ppm)
     """
@@ -404,7 +424,7 @@ def fit_global_multipeak(global_spect: np.ndarray,
     bw_ppm = float(xscale[-1] - xscale[0] + (xscale[1] - xscale[0]))
     width_guess = estimate_width_fwhm(xscale, norm)
     widths_init = np.full(len(spec), width_guess)
-    width_bounds = (width_guess / 2, width_guess * 1.5)
+    width_bounds = (width_guess * width_scale[0], width_guess * width_scale[1])
 
     candidates = spec.biggest_idx or list(range(len(spec)))
     best_fitter = None
@@ -466,6 +486,8 @@ def fit_and_emit_peaks(aligned: np.ndarray,
                        fit_df: float = 0.0,
                        fit_dw: float = 0.0,
                        fit_dph: float = 0.0,
+                       global_df: float = 0.5,
+                       width_scale: Tuple[float, float] = (0.1, 1.9),
                        phantom_scaling: float = 1.0) -> Iterable[mrd.StreamItem]:
     """
     Fit the peaks on an aligned series and emit everything that describes the fit.
@@ -485,7 +507,8 @@ def fit_and_emit_peaks(aligned: np.ndarray,
 
     print(f"Fitting {len(spec)} peaks to the global spectrum", file=sys.stderr)
     fitter, biggest_idx, width_guess = fit_global_multipeak(global_spect, xscale, spec,
-                                                            center_window=fit_dw)
+                                                            center_window=global_df,
+                                                            width_scale=width_scale)
     params = fitter.params
     global_scaling = float(np.max(np.abs(global_spect)))
 
@@ -543,7 +566,9 @@ def fit_and_emit_peaks(aligned: np.ndarray,
 
 
 def reconstruct_phantom(phantom_kspaces: List[np.ndarray],
-                        xscale: np.ndarray) -> Tuple[float, Optional[np.ndarray]]:
+                        xscale: np.ndarray,
+                        width_scale: Tuple[float, float] = (0.1, 1.9)
+                        ) -> Tuple[float, Optional[np.ndarray]]:
     """
     Reconstruct the urea phantom prescan and derive the scaling factor it exists to provide.
 
@@ -552,6 +577,10 @@ def reconstruct_phantom(phantom_kspaces: List[np.ndarray],
     times width: that is what makes two experiments comparable. No noise gate applies here -
     every voxel of a phantom is signal, which is why the legacy sets a phantom's noise to zero
     outright. Several phantom sets average into one number.
+
+    width_scale is the same (lo, hi) bound the metabolite fit uses, as multiples of the width
+    guess. It matters more here than there: the scaling is the peak's area, amplitude times
+    width, so a width held off its true value scales every experiment this number normalises.
     Returns:
         - (the scaling, 1.0 when there is no phantom to derive one from,
            the per-voxel area map of the last phantom set, or None)
@@ -572,7 +601,8 @@ def reconstruct_phantom(phantom_kspaces: List[np.ndarray],
         fitter = LorentzianFitter(xscale)
         center = np.array([xscale[int(np.argmax(np.abs(norm)))]])
         params = fitter.fit_global(norm, center, np.array([width_guess]),
-                                   width_bounds=(width_guess / 2, width_guess * 1.5))
+                                   width_bounds=(width_guess * width_scale[0],
+                                                 width_guess * width_scale[1]))
         scalings.append(float(np.abs(params.amplitudes[0] * params.widths[0]) * scaling))
 
         # the same area, per voxel, with the line shape held at the one the set settled on
@@ -597,7 +627,10 @@ def reconstruct_epsi(header: mrd.Header,
                      spec: PeakSpec,
                      fit_df: float = 0.0,
                      fit_dw: float = 0.0,
-                     fit_dph: float = 0.0) -> Iterable[mrd.StreamItem]:
+                     fit_dph: float = 0.0,
+                     global_df: float = 0.5,
+                     width_scale: Tuple[float, float] = (0.1, 1.9)
+                     ) -> Iterable[mrd.StreamItem]:
     """
     Reconstruct an EPSI acquisition into spectra, a global peak fit and metabolite maps.
 
@@ -684,7 +717,7 @@ def reconstruct_epsi(header: mrd.Header,
         phantom_xscale, _ = spectral_axis(header, phantom_acqs[0],
                                           phantom_nswitches, phantom_total)
         phantom_scaling, phantom_map = reconstruct_phantom(
-            [phantoms[rep] for rep in sorted(phantoms)], phantom_xscale)
+            [phantoms[rep] for rep in sorted(phantoms)], phantom_xscale, width_scale)
     print(f"Phantom scaling {phantom_scaling:.6g} "
           f"from {len(phantom_acqs)} prescan acquisition(s)", file=sys.stderr)
     if phantom_map is not None:
@@ -719,6 +752,7 @@ def reconstruct_epsi(header: mrd.Header,
     yield from fit_and_emit_peaks(aligned, global_spect, xscale, spec,
                                   noise_threshold=noise_threshold,
                                   fit_df=fit_df, fit_dw=fit_dw, fit_dph=fit_dph,
+                                  global_df=global_df, width_scale=width_scale,
                                   phantom_scaling=phantom_scaling)
 
 
@@ -729,7 +763,9 @@ def reconstruct_mrs(input: BinaryIO,
                     spec: PeakSpec,
                     fit_df: float = 0.0,
                     fit_dw: float = 0.0,
-                    fit_dph: float = 0.0) -> None:
+                    fit_dph: float = 0.0,
+                    global_df: float = 0.5,
+                    width_scale: Tuple[float, float] = (0.1, 1.9)) -> None:
     """
     Reconstruct one converted EPSI file.
 
@@ -764,7 +800,9 @@ def reconstruct_mrs(input: BinaryIO,
                             spec=spec,
                             fit_df=fit_df,
                             fit_dw=fit_dw,
-                            fit_dph=fit_dph)
+                            fit_dph=fit_dph,
+                            global_df=global_df,
+                            width_scale=width_scale)
         writer.write_header(header)
         # the raw acquisitions pass through unchanged, in a stream call of their own
         writer.write_data(mrd.StreamItem.Acquisition(acq) for acq in acquisitions)
@@ -774,7 +812,9 @@ def reconstruct_mrs(input: BinaryIO,
                              spec=spec,
                              fit_df=fit_df,
                              fit_dw=fit_dw,
-                             fit_dph=fit_dph))
+                             fit_dph=fit_dph,
+                             global_df=global_df,
+                             width_scale=width_scale))
 
 
 if __name__ == "__main__":
@@ -788,9 +828,14 @@ if __name__ == "__main__":
     parser.add_argument("-df", "--fit-df", type=float, default=0.0, required=False, 
                         help="How far a peak center may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
     parser.add_argument("-dw", "--fit-dw", type=float, default=0.0, required=False, 
-                        help="How far a peak width may move from the global fit during the per-voxel fit, in ppm, and how far the global fit may move a peak center from where the known offsets place it. Default 0, i.e. widths held at the global fit and centers held at their placement")
+                        help="How far a peak width may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
     parser.add_argument("-dph", "--fit-dph", type=float, default=0.0, required=False, 
                         help="How far a peak phase may move from the global fit during the per-voxel fit, in radians. Default 0, i.e. held at the global fit")
+    parser.add_argument("-gdf", "--global-df", type=float, default=0.5, required=False,
+                        help="How far the GLOBAL fit may move a peak center from where the known offsets place it, in ppm. Default 0.5, which is what main's wigglefactor enforced; 0 pins every center to its placement")
+    parser.add_argument("--width-bounds", type=float, nargs=2, default=[0.1, 1.9],
+                        metavar=("LO", "HI"), required=False,
+                        help="Global-fit width bounds, as multiples of the estimated width guess. Default 0.1 1.9, the range main's arctan parameterization enforced")
 
     # the peak arguments have to come out before argparse sees them, since a peak's value may be
     # negative and argparse would read that as another option
@@ -802,7 +847,9 @@ if __name__ == "__main__":
                         spec=spec,
                         fit_df=args.fit_df,
                         fit_dw=args.fit_dw,
-                        fit_dph=args.fit_dph)
+                        fit_dph=args.fit_dph,
+                        global_df=args.global_df,
+                        width_scale=tuple(args.width_bounds))
 
     if args.folder and args.input:
         raise ValueError("Cannot specify both --folder (local only) and --input")

@@ -132,7 +132,6 @@ def check_peak_position(scan_groups: ScanGroup) -> bool:
         elif i<63:
             shift=13
         elif i == 63:
-            print(corrected_rawdata[i,shift:].shape)
             drift_corrected_rawdata[i] = np.concatenate((corrected_rawdata[i,shift:],np.zeros(shift)))
             continue
         drift_corrected_rawdata[i] = np.concatenate((corrected_rawdata[i,shift:], corrected_rawdata[i+1,:shift]))

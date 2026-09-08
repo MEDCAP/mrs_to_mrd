@@ -36,14 +36,15 @@ import numpy as np
 # mrd python package
 import mrd
 from MRSreader import MRSdata
-from MRSorganize import ScanGroup, read_scan_tar, organize_folder, report_group
+from MRSorganize import (ScanGroup, read_scan_tar, organize_folder, organize_members,
+                         report_group)
 from mrd2shift import check_peak_position
 
 
 def generate_acquisition(mrs: MRSdata,
                          rep_idx: int = 0,
-                         rep_count: int = 0,
-                         encoding_ref: int = 0) -> Iterable[mrd.StreamItem]:
+                         encoding_ref: int = 0,
+                         total_rep: int = 0) -> Iterable[mrd.StreamItem]:
     """
     Emit one acquisition per adc event from one MRS file.
 
@@ -61,42 +62,43 @@ def generate_acquisition(mrs: MRSdata,
     Args:
         - mrs: one parsed MRS file, rawdata indexed
                (nsamples, nviews, nsliceviews, nslices, nechoes, nrepetitions)
-        - rep_idx: where this file's repetitions start in the group. A file holding one repetition
-          walks range(1) and takes its number from here, so the file's position in the list is the
-          repetition it becomes
-        - rep_count: repetitions in the whole group, for the LAST_IN_REPETITION flag. Defaults to
-          this file being the whole group
+        - rep_idx: idx position of this file in the total repetition
         - encoding_ref: which header encoding describes this file's matrix. 0 is the series, 1 the
           averaged prescan. The prescan flag says what an acquisition is; this says what geometry
           it has, and a reader needs both
+        - total_rep: total number of repetitions in the whole group, for the LAST_IN_REPETITION flag
+        Defaults to this file being the whole group
     Returns:
         - Iterable of mrd.StreamItem.Acquisition
     """
-    # pre_scan data does not encode rep_count
-    if rep_count is None:
-        rep_count = mrs.nrepetitions
-    # this file's own repetitions, not the group's: one file per repetition walks a single value
-    # and is placed by rep_idx, and a file already holding the axis walks all of them at rep_idx 0
+    # acquisitions in one repetition: the grid below the repetition axis, in the order product()
+    # walks it, so counter decomposes as irep * per_rep + the position inside that repetition
     per_rep = mrs.nechoes * mrs.nslices * mrs.nsliceviews * mrs.nviews
     grid = product(range(mrs.nrepetitions), range(mrs.nechoes), range(mrs.nslices),
                    range(mrs.nsliceviews), range(mrs.nviews))
     for counter, (irep, iecho, islice, isliceview, iview) in enumerate(grid):
         acq = mrd.Acquisition()
-        acq.head.encoding_space_ref = encoding_ref
+        acq.head.encoding_space_ref = encoding_ref  # header.encoding[idx]: 0 for rawdata, 1 for prescan data
         acq.head.acquisition_time_stamp_ns = np.uint64(mrs.acquisition_timestamp * 100) # mrs timestamp is in 100ns
         acq.head.sample_time_ns = mrs.sample_period * 100       # sample_period in units of 100ns
         acq.head.idx.average = mrs.naverages                    # number of averages, not index
-        acq.head.idx.repetition = rep_idx + irep
-        if rep_idx + irep == 0:
+        # irep=0 for single repetition file and rep_idx=0..N-1 is the position in the group of N files
+        # irep=0...N-1 for N repetition file and rep_idx=0 as position in the group
+        abs_rep = rep_idx + irep
+        if total_rep and abs_rep >= total_rep:
+            raise ValueError(f"repetition {abs_rep} is past the {total_rep} the group declared")
+        acq.head.idx.repetition = abs_rep
+        # position inside each repetition
+        in_rep = counter % per_rep
+        if abs_rep == 0:
             acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_REPETITION
-        if rep_idx + irep == rep_count - 1:
+        if abs_rep == per_rep - 1:
             acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_REPETITION
         acq.head.idx.kspace_encode_step_1 = iview
         acq.head.idx.kspace_encode_step_2 = isliceview
         acq.head.idx.slice = islice
-        acq.head.idx.contrast = iecho                           # index of echoes
-        # unique and increasing across the whole group, since rep_idx places this file's block
-        acq.head.scan_counter = rep_idx * per_rep + counter
+        acq.head.idx.contrast = iecho
+        acq.head.scan_counter = counter + rep_idx * per_rep
         if iview == 0:
             acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_PHASE
         if iview == mrs.nviews - 1:
@@ -111,7 +113,7 @@ def generate_acquisition(mrs: MRSdata,
             acq.head.discard_post = ramp * 3    # rampdown + rephasing, which is two ramps
         # Only for epsi data, treat this file as prescan phantom data when navg>1 and nrep==1
         if mrs.naverages > 1 and mrs.nrepetitions == 1 and 'epsi' in mrs.sequence_name:
-            acq.head.flags |= mrd.AcquisitionFlags.IS_NAVIGATION_DATA
+            acq.head.flags |= mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT
         # MRS acquires on one channel, so add the coil axis: acq.data.shape=(coils=1, samples)
         acq.data = np.expand_dims(mrs.rawdata[:, iview, isliceview, islice, iecho, irep], axis=0)
         yield mrd.StreamItem.Acquisition(acq)
@@ -171,11 +173,11 @@ def generate_header(mrs: MRSdata, group: ScanGroup) -> mrd.Header:
         limits.slice = mrd.LimitType(maximum=shape["nslices"] - 1)
         limits.contrast = mrd.LimitType(maximum=shape["nechoes"] - 1)
         limits.repetition = mrd.LimitType(minimum=0, maximum=shape["nrepetitions"] - 1)
-
         encoding = mrd.EncodingType()
         encoding.encoded_space = encoded_space
         encoding.encoding_limits = limits
-        # header.encoding is a list of mrd.EncodingType(). rawdata shape gets stored first and then prescan
+        # header.encoding is a list of mrd.EncodingType()
+        # Which encoding to use is stored as idx in acq.head.encoding_space_ref
         header.encoding.append(encoding)
     return header
 
@@ -210,30 +212,29 @@ def convert_folder_to_mrd(folder: Path,
     # plot signals for each switch
     if check_window:
         check_peak_position(grouped_files)
-
     # summed over the rawdata files by the grouping, so it resolves both arrival shapes without
     # asking which one this is: one file per repetition, or one file already holding the axis
-    rep_count = grouped_files.rawdata_shape["nrepetitions"]
-    rep_idx = 0                 # where the next file's repetitions start in the group
     writer: Optional[mrd.BinaryMrdWriter] = None
+    rep_base = 0
     try:
         # first convert raw data files before phantom files in the group
-        for filepath in grouped_files.rawdata_file_list:
+        for i, filepath in enumerate(grouped_files.rawdata_file_list):
             mrs = MRSdata()                     # one at a time, released once written
             mrs.read_from_file(filepath)
             if writer is None:
                 print(f'Writing file at {grouped_files.output_path}', file=sys.stderr)
                 writer = mrd.BinaryMrdWriter(grouped_files.output_path)
                 writer.write_header(generate_header(mrs, grouped_files))
-            writer.write_data(generate_acquisition(mrs, rep_idx, rep_count, encoding_ref=0))
-            rep_idx += mrs.nrepetitions
+            writer.write_data(generate_acquisition(mrs, rep_idx=i, encoding_ref=0,
+                                                   total_rep=grouped_files.rawdata_shape["nrepetitions"]))
         # next, convert the phantom files in the group navg>1 if they exist. They only ever join a
         # stream the rawdata already opened, since the header is never built from a prescan
         if writer is not None:
-            for filepath in grouped_files.prescan_file_list:
+            for i, filepath in enumerate(grouped_files.prescan_file_list):
                 mrs = MRSdata()
                 mrs.read_from_file(filepath)
-                writer.write_data(generate_acquisition(mrs, 0, None, encoding_ref=1))
+                writer.write_data(generate_acquisition(mrs, rep_idx=i, encoding_ref=1,
+                                                       total_rep=grouped_files.prescan_shape["nrepetitions"]))
     finally:
         if writer is not None:
             writer.close()
@@ -272,7 +273,7 @@ def convert_tar_to_mrd(tar_path: Path, output_path: Path) -> bool:
         print("No base frequency from a .SPR sidecar in the tar", file=sys.stderr)
 
     payloads = dict(members)
-    grouped_files = mrs_organize.organize_members(members, fallback_meas_id=fallback)
+    grouped_files = organize_members(members, fallback_meas_id=fallback)
     if grouped_files is None:
         # nothing grouped, but on Tyger the output buffer's FIFO still has to open and close, or
         # the sidecar is left blocked on a stream that never opens
@@ -293,7 +294,8 @@ def convert_tar_to_mrd(tar_path: Path, output_path: Path) -> bool:
                 print(f'Writing file at {output_path}', file=sys.stderr)
                 writer = mrd.BinaryMrdWriter(str(output_path))
                 writer.write_header(generate_header(mrs, grouped_files))
-            writer.write_data(generate_acquisition(mrs, rep_idx, rep_count))
+            writer.write_data(generate_acquisition(mrs, rep_idx=rep_idx, encoding_ref=0,
+                                                   total_rep=rep_count))
             rep_idx += mrs.nrepetitions
         if writer is not None:
             # a prescan is not a repetition of the acquisition it calibrates and is not counted in
@@ -303,7 +305,9 @@ def convert_tar_to_mrd(tar_path: Path, output_path: Path) -> bool:
                 mrs = MRSdata()
                 mrs.parse_from_buffer(payloads[name])
                 mrs.set_base_frequency(spr_frequency)
-                writer.write_data(generate_acquisition(mrs, 0, rep_count, encoding_ref=1))
+                writer.write_data(generate_acquisition(
+                        mrs, rep_idx=0, encoding_ref=1,
+                        total_rep=grouped_files.prescan_shape["nrepetitions"]))
     finally:
         if writer is not None:
             writer.close()
