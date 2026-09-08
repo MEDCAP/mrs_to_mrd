@@ -41,11 +41,22 @@ read once by a header-only probe to decide the grouping, and everything past tha
 one file at a time. That is what lets a 27 file series convert without ever holding more than one
 of them in memory, and it is why nrepetitions is recorded here rather than recomputed downstream.
 rawdata_shape is recorded for the same reason: the probe already knows the axes one file is reshaped
-onto, so the shape the whole series comes to is known before a single file is read back.
+onto, so the shape the whole series comes to is known before a single file is read back. naverages
+rides along with those axes without being one, since MR Solutions collapses the averages into the
+acquisition - it is recorded because it is what tells a prescan from the series beside it.
 
-Which files are real data and which are prescan is decided structurally, by the acquisition matrix.
-The two shapes a scan arrives in are told apart by nothing more than how many paths the rawdata list
-ends up holding:
+Which files are real data and which are prescan is decided structurally, by the acquisition matrix:
+(naverages, nrepetitions) sorts every file in the experiment, and sorts them exhaustively
+
+    naverages=1                   real acquisition data, whatever its repetition count
+    naverages>1, nrepetitions=1   the averaged prescan, MR Solutions' way of recording a scan that
+                                  was averaged rather than repeated
+    naverages>1, nrepetitions>1   neither, dropped with a warning. A scan both averaged and repeated
+                                  is no repetition of the series and not the calibration beside it,
+                                  so there is no axis here for it to join
+
+The two shapes real data arrives in are told apart by nothing more than how many paths the rawdata
+list ends up holding:
 
     case 1  many files, each nrepetitions=1, one per scan directory - the EPSI series, combined
     case 2  one file whose nrepetitions axis already holds them all - spectral, and EPSI acquired
@@ -53,18 +64,23 @@ ends up holding:
 
 Both cases resolve to one repetition count without either being recognised, by summing nrepetitions
 over the rawdata files: case 1 contributes 1 per file, so the count is how many files arrived, and
-case 2 contributes the whole axis from the one file. That sum is ScanGroup.nrepetitions, and it is
-the only repetition count a group carries. The prescans are outside it - an averaged calibration
-scan is not a repetition of the acquisition it calibrates, so however many prescan files a group
-holds, none of them lengthens the repetition axis the header declares.
+case 2 contributes the whole axis from the one file. That sum is rawdata_shape['nrepetitions'].
+
+The prescans sum the same way, on an axis of their own. An averaged calibration scan is not a
+repetition of the acquisition it calibrates, so however many prescan files a group holds they
+lengthen prescan_shape['nrepetitions'] and never the repetition axis the rawdata is written on.
+Arriving one per scan folder at nrepetitions=1, their count is how many folders held one: two on
+cirrhrat_39_4 and cirrhrat_1_1, one on cirrhrat_0_1.
 
 Every rawdata file must share one acquisition matrix, since the whole point of the group is that
 they concatenate on the repetition axis; a second distinct matrix among them is misfiled data and
 group_experiment raises rather than silently lengthening the series with it. That raise is the check
 standing where the grouping key used to: with one group per input there is nowhere for an odd file
-to go, so it has to be said rather than absorbed. The prescan list carries no such rule - a scan can
-be calibrated by any number of differently shaped prescans, and none of them is concatenated onto
-anything.
+to go, so it has to be said rather than absorbed. The prescans are held to a weaker rule: they need
+not match the acquisition they calibrate, since neither is concatenated onto the other, but because
+they sum on an axis of their own they have to match each other. The first in acquisition order is
+the one the header describes, and a prescan shaped differently is dropped with a warning rather than
+raising, since dropping it takes nothing else with it.
 
 experiment_name is not read out of the path, it is what the caller pointed at: -f names one
 experiment folder and a tar holds one, so its root is the experiment. Whatever sits between the
@@ -102,7 +118,7 @@ import sys
 import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Callable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import BinaryIO, Callable, List, Optional, Sequence, Tuple
 
 from MRSreader import MRSdata
 
@@ -111,44 +127,34 @@ SPR_SUFFIX = ".SPR"
 OUTPUT_SUFFIX = ".mrd2"
 
 
-class Signature(NamedTuple):
+def shape_of(mrs: MRSdata) -> dict:
     """
-    The acquisition matrix of one file: everything that distinguishes one kind of scan from another.
+    The acquisition matrix of one probed or fully parsed file, as {parameter: length}.
 
-    Two files whose signatures differ cannot concatenate on the repetition axis - a calibration scan
-    at 2176x12 beside a 1792x8 series, or a file that already carries 25 repetitions of its own. The
-    leading fields are the axes rawdata is reshaped onto, in that order
-    (MRSreader.MRSdata.rawdata), so a difference reads in the same order as the shape it describes
-    """
-    nsamples: int
-    nviews: int
-    nsliceviews: int
-    nslices: int
-    nechoes: int
-    nrepetitions: int
-    naverages: int
-    datatype: int
+    The first six are the axes rawdata is reshaped onto, in that order (MRSreader.MRSdata.rawdata),
+    so a difference reads in the same order as the shape it describes. naverages is not one of them
+    - MR Solutions collapses the averages into the acquisition rather than giving them an axis - but
+    it rides along, because it is what tells an averaged prescan from the series it calibrates and a
+    group carrying it can say what its prescan was without a file being read back.
 
-
-def signature_of(mrs: MRSdata) -> Signature:
-    """
-    The acquisition matrix of one probed or fully parsed file
+    Two files whose matrices differ cannot concatenate on the repetition axis: a calibration scan at
+    2176x12 beside a 1792x8 series, or a file that already carries 25 repetitions of its own
     Args:
         - mrs: the file, probed or fully parsed
     Returns:
-        - its Signature
+        - its acquisition matrix
     """
-    # a probe that failed on a malformed header leaves the dimensions at their zero default, and a
-    # scan of no repetitions still holds one
-    return Signature(nsamples=int(mrs.nsamples), nviews=int(mrs.nviews),
-                     nsliceviews=int(mrs.nsliceviews), nslices=int(mrs.nslices),
-                     nechoes=int(mrs.nechoes), nrepetitions=max(int(mrs.nrepetitions), 1),
-                     naverages=int(mrs.naverages), datatype=int(mrs.datatype))
+    # a probe that failed on a malformed header leaves the dimensions at their zero default, a scan
+    # of no repetitions still holds one, and so does one whose block records no NO_AVERAGES
+    return {"nsamples": int(mrs.nsamples), "nviews": int(mrs.nviews),
+            "nsliceviews": int(mrs.nsliceviews), "nslices": int(mrs.nslices),
+            "nechoes": int(mrs.nechoes), "nrepetitions": max(int(mrs.nrepetitions), 1),
+            "naverages": max(int(mrs.naverages), 1)}
 
 
-def describe_signature(signature: Signature) -> str:
+def describe_shape(shape: dict) -> str:
     """The acquisition matrix as a line, so a report or error can show what a group holds"""
-    return ", ".join(f"{name}={value}" for name, value in signature._asdict().items())
+    return ", ".join(f"{name}={value}" for name, value in shape.items())
 
 
 def scan_id_of(path: str) -> Optional[int]:
@@ -258,19 +264,21 @@ class ScanGroup:
     # averaged prescans, converting into the same stream after the data above rather than a file of
     # their own. The header is never built from one of these
     prescan_file_list: List[str] = field(default_factory=list)
-    signature: Optional[Signature] = None   # the rawdata acquisition matrix, for reporting
     # the shape the whole group's rawdata comes to once its files are concatenated, as
-    # {dimension name: length}. The shared acquisition matrix's axes, carrying the group's
-    # repetition count rather than one file's: one file per repetition contributes 1 each so the
-    # count is how many files arrived, and a file already holding the axis contributes all of them
-    # at once. That is the only repetition count a group carries, and the one number the two
-    # arrival shapes do not read the same way. Recorded here so conversion can write the header
-    # without having read every file first. {} for a group whose signature was never filled in
+    # {parameter: length}. The shared acquisition matrix's axes and its naverages, carrying the
+    # group's repetition count rather than one file's: one file per repetition contributes 1 each so
+    # the count is how many files arrived, and a file already holding the axis contributes all of
+    # them at once, which is the one number the two arrival shapes do not read the same way.
+    # Recorded here so conversion can write the header without having read every file first.
+    # {} for a group holding no rawdata, i.e. one that is nothing but prescan
     rawdata_shape: dict = field(default_factory=dict)
-    # the same for the averaged prescan. A prescan is a calibration beside the acquisition rather
-    # than a repetition of it, so its repetitions are counted separately and never folded into
-    # rawdata_shape. Its matrix need not match the acquisition's: on cirrhrat_43_1 the series is
-    # 8 views of 1792 samples and the prescan beside it is 12 of 2176. {} when there is no prescan
+    # the same for the averaged prescan, summed over the prescan files exactly as rawdata is. A
+    # prescan is a calibration beside the acquisition rather than a repetition of it, so its
+    # repetitions lengthen this axis and are never folded into rawdata_shape: two prescan folders in
+    # one experiment, as cirrhrat_39_4 and cirrhrat_1_1 hold, read as nrepetitions=2. Its matrix
+    # need not match the acquisition's - on cirrhrat_43_1 the series is 8 views of 1792 samples and
+    # the prescans beside it are 12 of 2176 - but the prescans must match each other, and one that
+    # does not is left out of prescan_file_list as well as this count. {} when there is no prescan
     prescan_shape: dict = field(default_factory=dict)
     output_name: str = ""
 
@@ -317,25 +325,6 @@ def collect_mrd_paths(root) -> List[str]:
     return sorted(paths, key=natural_key)
 
 
-def shape_of(signature: Signature, nrepetitions: Optional[int] = None) -> dict:
-    """
-    One acquisition matrix as {dimension name: length}, in the order rawdata is indexed.
-
-    The names are the ones MRSdata.rawdata is documented with, so a caller can read a shape off a
-    group without knowing the axis order.
-    Args:
-        - signature: the matrix one file was acquired at
-        - nrepetitions: overrides the signature's own, for a group whose files concatenate on that
-          axis
-    """
-    return {"nsamples": signature.nsamples,
-            "nviews": signature.nviews,
-            "nsliceviews": signature.nsliceviews,
-            "nslices": signature.nslices,
-            "nechoes": signature.nechoes,
-            "nrepetitions": signature.nrepetitions if nrepetitions is None else nrepetitions}
-
-
 def group_experiment(paths: Sequence[str],
                      probe: Callable[[str], MRSdata],
                      root: str = "",
@@ -375,21 +364,34 @@ def group_experiment(paths: Sequence[str],
         return None
     root_dir = str(_posix(os.path.abspath(str(root)))) if root and resolve else str(_posix(root))
     # probed in acquisition order, since a file's position in the rawdata list becomes its
-    # repetition index. (path, signature, sequence name) is everything the group is built from
-    entries: List[Tuple[str, tuple, str]] = []
+    # repetition index. (path, matrix, sequence name) is everything the group is built from
+    entries: List[Tuple[str, dict, str]] = []
     for path in sorted(paths, key=natural_key):
         mrs = probe(path)
-        entries.append((str(path), signature_of(mrs), mrs.sequence_name))
+        entries.append((str(path), shape_of(mrs), mrs.sequence_name))
     # MR Solutions collapses averages into a single acquisition, so an averaged scan arrives as
     # naverages>1 at one repetition, where the acquisition it calibrates arrives as naverages=1
-    # repeated - across scan directories, or on the nrepetitions axis of one file
-    rawdata = [entry for entry in entries
-               if not (entry[1].naverages > 1 and entry[1].nrepetitions == 1)]
-    prescan = [entry for entry in entries
-               if entry[1].naverages > 1 and entry[1].nrepetitions == 1]
+    # repeated - across scan directories, or on the nrepetitions axis of one file. (naverages,
+    # nrepetitions) therefore sorts every file, and the third combination of the two is neither
+    # kind: a scan both averaged and repeated is no repetition of the series and not the calibration
+    # beside it, so it is dropped rather than lengthening an axis it has no place on
+    rawdata, prescan = [], []
+    for entry in entries:
+        path, shape, _ = entry
+        if shape["naverages"] <= 1:
+            rawdata.append(entry)
+        elif shape["nrepetitions"] == 1:
+            prescan.append(entry)
+        else:
+            print(f"WARNING ignoring {path}: {describe_shape(shape)} is neither a repeated "
+                  f"acquisition nor an averaged prescan, so it joins no repetition axis",
+                  file=sys.stderr)
+    if not rawdata and not prescan:
+        print("Every .MRD file was ignored, nothing left to convert", file=sys.stderr)
+        return None
     # real data first so write_header builds the header from an acquisition rather than a prescan,
     # unless the experiment is nothing but prescan
-    reference_path, reference_signature, reference_sequence = (rawdata or prescan)[0]
+    reference_path, reference_shape, reference_sequence = (rawdata or prescan)[0]
     # every file belongs to the one experiment the caller named, so this is read once rather than
     # per file. The caller naming it outright wins over the folder it was read from, which is what
     # names a file that arrived without an experiment folder around it
@@ -399,10 +401,13 @@ def group_experiment(paths: Sequence[str],
 
     # the rawdata files concatenate on the repetition axis, so they have to be the same acquisition;
     # a second matrix among them is misfiled data rather than a longer series. The prescans are held
-    # to nothing, since none of them is concatenated onto anything
-    matrices = {signature for _, signature, _ in rawdata}
+    # only to each other, since none of them is concatenated onto the acquisition
+    matrices = []
+    for _, shape, _ in rawdata:
+        if shape not in matrices:       # dicts do not hash, and this keeps acquisition order
+            matrices.append(shape)
     if len(matrices) > 1:
-        described = "; ".join(sorted(describe_signature(matrix) for matrix in matrices))
+        described = "; ".join(describe_shape(matrix) for matrix in matrices)
         raise ValueError(f"{meas_id} holds {len(matrices)} distinct acquisition matrices of real "
                          f"data, which cannot be repetitions of one scan: {described}. Point -f or "
                          f"-t at one experiment, or convert the odd scan on its own with -i")
@@ -410,7 +415,7 @@ def group_experiment(paths: Sequence[str],
     # file, prescan included - it is not what tells data and calibration apart. It no longer decides
     # anything, so a file carrying another one now joins this stream instead of starting its own,
     # and the header can only record the one
-    sequences = {sequence_name for _, _, sequence_name in entries}
+    sequences = {sequence_name for _, _, sequence_name in rawdata + prescan}
     if len(sequences) > 1:
         print(f"WARNING {meas_id} holds {len(sequences)} sequence names "
               f"({', '.join(sorted(sequences))}), converting them into one stream recorded as "
@@ -426,20 +431,30 @@ def group_experiment(paths: Sequence[str],
         sequence_name=reference_sequence,
         experiment_dir=experiment_dir,
         output_dir=experiment_dir if inside_root else root_dir,
-        rawdata_file_list=[path for path, _, _ in rawdata],
-        prescan_file_list=[path for path, _, _ in prescan],
-        signature=reference_signature)
+        rawdata_file_list=[path for path, _, _ in rawdata])
     # the repetition axis is the only one the files concatenate on, so it is summed over the
     # rawdata files while every other axis comes from the shared matrix
     if rawdata:
-        group.rawdata_shape = shape_of(reference_signature,
-                                       nrepetitions=sum(signature.nrepetitions
-                                                        for _, signature, _ in rawdata))
-    # the prescans are summed over by nothing: none of them is a repetition of the acquisition, and
-    # they are written at repetition 0 however many arrived. Their matrix is read off the first,
-    # which is the one the header describes
+        group.rawdata_shape = dict(reference_shape,
+                                   nrepetitions=sum(shape["nrepetitions"]
+                                                    for _, shape, _ in rawdata))
+    # the prescans are summed the same way, on an axis of their own: none of them is a repetition of
+    # the acquisition, so however many arrived they lengthen prescan_shape and never rawdata_shape.
+    # One prescan per scan folder at nrepetitions=1 means the count is how many folders held one.
+    # They need not match the acquisition's matrix, but since they sum they have to match each
+    # other, so the first in acquisition order is the one the header describes and one shaped
+    # differently is left out of the file list as well as the count
     if prescan:
-        group.prescan_shape = shape_of(prescan[0][1])
+        reference_prescan = prescan[0][1]
+        matching = []
+        for path, shape, _ in prescan:
+            if shape == reference_prescan:
+                matching.append(path)
+            else:
+                print(f"WARNING ignoring prescan {path}: {describe_shape(shape)} differs from the "
+                      f"first prescan's {describe_shape(reference_prescan)}", file=sys.stderr)
+        group.prescan_file_list = matching
+        group.prescan_shape = dict(reference_prescan, nrepetitions=len(matching))
     # one group per input, so a name cannot collide with a sibling's and nothing has to be broken
     group.output_name = base_name(group) + OUTPUT_SUFFIX
     return group
@@ -607,7 +622,6 @@ def report_group(group: Optional[ScanGroup]) -> None:
     print(f"  sequence  {group.sequence_name}")
     print(f"  files     {len(group.rawdata_file_list)} data, "
           f"{len(group.prescan_file_list)} prescan")
-    print(f"  matrix    {describe_signature(group.signature)}")
     print(f"  shape     {group.rawdata_shape}")
     if group.prescan_shape:
         print(f"  prescan   {group.prescan_shape}")
