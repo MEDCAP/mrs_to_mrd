@@ -258,18 +258,20 @@ class ScanGroup:
     # averaged prescans, converting into the same stream after the data above rather than a file of
     # their own. The header is never built from one of these
     prescan_file_list: List[str] = field(default_factory=list)
-    # repetitions the acquisition holds, counted across rawdata_file_list alone, and the only
-    # repetition count a group carries. Recorded so conversion can write the header without having
-    # read every file first. A prescan is a calibration beside the acquisition rather than a
-    # repetition of it, so it is never counted here however many prescan files arrived
-    nrepetitions: int = 0
     signature: Optional[Signature] = None   # the rawdata acquisition matrix, for reporting
-    # the shape the whole group's rawdata comes to once its files are concatenated: the shared
-    # acquisition matrix's axes carrying nrepetitions above rather than one file's. Recorded here so
-    # a caller can size what a group holds without probing its files itself, which is the one number
-    # the two cases (a series of files, or one file already holding the axis) do not read the same
-    # way. () for a group whose signature was never filled in
-    rawdata_shape: tuple = ()
+    # the shape the whole group's rawdata comes to once its files are concatenated, as
+    # {dimension name: length}. The shared acquisition matrix's axes, carrying the group's
+    # repetition count rather than one file's: one file per repetition contributes 1 each so the
+    # count is how many files arrived, and a file already holding the axis contributes all of them
+    # at once. That is the only repetition count a group carries, and the one number the two
+    # arrival shapes do not read the same way. Recorded here so conversion can write the header
+    # without having read every file first. {} for a group whose signature was never filled in
+    rawdata_shape: dict = field(default_factory=dict)
+    # the same for the averaged prescan. A prescan is a calibration beside the acquisition rather
+    # than a repetition of it, so its repetitions are counted separately and never folded into
+    # rawdata_shape. Its matrix need not match the acquisition's: on cirrhrat_43_1 the series is
+    # 8 views of 1792 samples and the prescan beside it is 12 of 2176. {} when there is no prescan
+    prescan_shape: dict = field(default_factory=dict)
     output_name: str = ""
 
     @property
@@ -313,6 +315,25 @@ def collect_mrd_paths(root) -> List[str]:
     paths = [str(path) for path in root.rglob("*")
              if path.is_file() and path.suffix == MRD_SUFFIX and not _is_junk(path)]
     return sorted(paths, key=natural_key)
+
+
+def shape_of(signature: Signature, nrepetitions: Optional[int] = None) -> dict:
+    """
+    One acquisition matrix as {dimension name: length}, in the order rawdata is indexed.
+
+    The names are the ones MRSdata.rawdata is documented with, so a caller can read a shape off a
+    group without knowing the axis order.
+    Args:
+        - signature: the matrix one file was acquired at
+        - nrepetitions: overrides the signature's own, for a group whose files concatenate on that
+          axis
+    """
+    return {"nsamples": signature.nsamples,
+            "nviews": signature.nviews,
+            "nsliceviews": signature.nsliceviews,
+            "nslices": signature.nslices,
+            "nechoes": signature.nechoes,
+            "nrepetitions": signature.nrepetitions if nrepetitions is None else nrepetitions}
 
 
 def group_experiment(paths: Sequence[str],
@@ -407,18 +428,18 @@ def group_experiment(paths: Sequence[str],
         output_dir=experiment_dir if inside_root else root_dir,
         rawdata_file_list=[path for path, _, _ in rawdata],
         prescan_file_list=[path for path, _, _ in prescan],
-        # summing over the rawdata files resolves both arrival shapes without asking which one this
-        # is: one file per repetition contributes 1 each, so the count is how many files there are,
-        # and a file already carrying the axis contributes all of them at once. The prescans are
-        # summed over by nothing, since none of them is a repetition of the acquisition
-        nrepetitions=sum(signature.nrepetitions for _, signature, _ in rawdata),
         signature=reference_signature)
-    # the shape the group's rawdata comes to once its files are concatenated: the shared acquisition
-    # matrix's axes, carrying the group's repetition count on the last one rather than one file's,
-    # since that is the only axis the files concatenate on
-    group.rawdata_shape = (reference_signature.nsamples, reference_signature.nviews,
-                           reference_signature.nsliceviews, reference_signature.nslices,
-                           reference_signature.nechoes, group.nrepetitions)
+    # the repetition axis is the only one the files concatenate on, so it is summed over the
+    # rawdata files while every other axis comes from the shared matrix
+    if rawdata:
+        group.rawdata_shape = shape_of(reference_signature,
+                                       nrepetitions=sum(signature.nrepetitions
+                                                        for _, signature, _ in rawdata))
+    # the prescans are summed over by nothing: none of them is a repetition of the acquisition, and
+    # they are written at repetition 0 however many arrived. Their matrix is read off the first,
+    # which is the one the header describes
+    if prescan:
+        group.prescan_shape = shape_of(prescan[0][1])
     # one group per input, so a name cannot collide with a sibling's and nothing has to be broken
     group.output_name = base_name(group) + OUTPUT_SUFFIX
     return group
@@ -588,7 +609,8 @@ def report_group(group: Optional[ScanGroup]) -> None:
           f"{len(group.prescan_file_list)} prescan")
     print(f"  matrix    {describe_signature(group.signature)}")
     print(f"  shape     {group.rawdata_shape}")
-    print(f"  reps      {group.nrepetitions}")
+    if group.prescan_shape:
+        print(f"  prescan   {group.prescan_shape}")
     print(f"  first     {group.reference_path}")
     if len(all_files) > 1:
         print(f"  last      {all_files[-1]}")
