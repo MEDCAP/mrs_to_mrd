@@ -89,10 +89,9 @@ def generate_acquisition(mrs: MRSdata,
             raise ValueError(f"repetition {abs_rep} is past the {total_rep} the group declared")
         acq.head.idx.repetition = abs_rep
         # position inside each repetition
-        in_rep = counter % per_rep
-        if abs_rep == 0:
+        if counter % per_rep == 0:
             acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_REPETITION
-        if abs_rep == per_rep - 1:
+        if counter % per_rep == per_rep - 1:
             acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_REPETITION
         acq.head.idx.kspace_encode_step_1 = iview
         acq.head.idx.kspace_encode_step_2 = isliceview

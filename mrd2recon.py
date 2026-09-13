@@ -4,7 +4,7 @@ Reconstruct a converted EPSI .mrd2 file into lorentzian peak fits and metabolite
 EPSI only: anything else raises.
 
 tyger args:
-    - python mrd2recon.py
+- python mrd2recon.py
     - -i
     - $(INPUT_PIPE)
     - -o
@@ -27,9 +27,11 @@ given by three windows, all zero by default, which is to say the line shape is p
 only the amplitudes vary:
 
     -df   how far a peak center may move from the global fit, in ppm
-    -dw   how far a peak width may move from the global fit, in ppm, and how far the global
-          fit itself may move a peak center from its rigid-pattern placement
+    -dw   how far a peak width may move from the global fit, in ppm
     -dph  how far a peak phase may move from the global fit, in radians
+
+The global fit has its own two knobs, -gdf for how far it may move a center from the rigid
+placement and --width-bounds for the linewidth range, both as multiples of the width guess.
 
 An averaged phantom prescan, flagged IS_NOISE_MEASUREMENT by the converter, is reconstructed
 on its own rather than as a repetition of the series. It contributes a phantom_image and a
@@ -45,7 +47,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -226,92 +228,231 @@ def apply_line_broadening(acq: mrd.Acquisition,
                           *,
                           nswitches: int,
                           totalppswitch: int,
-                          kept: int) -> np.ndarray:
+                          npoints_per_switch: int) -> np.ndarray:
     """
-    Split one EPSI readout into its switches and apply the line broadening apodization.
+    Reshape channel 0 of one readout into (kept points, switches) and apodize it.
 
-    An EPSI readout packs every switch into a single acquisition; each switch carries one point
-    of the spectral dimension, so the apodization decays over switches, not over the points
-    within one of them. Each switch is read from discard_pre for the kept width, which is the
-    flat top: no window correction is applied here, since the echo position shift is a separate
-    step upstream of the reconstruction.
+    The readout is laid out as (discard_pre, npoints_per_switch, discard_post) repeated once per
+    switch, so cirrhrat_43_1's 1280 samples are 64 switches of 20 points with 12 kept. Only
+    discard_pre and npoints_per_switch are needed to find that flat top; what follows it is
+    whatever is left over, and the layout the caller passes has already been checked against
+    every acquisition of the group.
 
-    The layout is passed in rather than read per acquisition: it is a property of the sequence,
-    recorded once on the header, and constant across the stream.
-    Returns a (kept points, switches) complex array, discard points trimmed off each switch.
+    The apodization decays along the switch axis, because one spectral point is acquired per
+    switch and so tk advances by a whole switch: that axis is the FID time axis. Which is why
+    the exponent is applied after the transpose, where the switch axis is last. Moving the
+    transpose would silently apodize along the readout instead.
+    Returns a (npoints_per_switch, nswitches) complex array
+    Raises:
+        - ValueError if the readout is too short to hold the switches it should
     """
-    # example data: 64 switches of 20 points over 1280 samples, 12 of each switch kept
+    samples = acq.data[0, :]
+    if samples.shape[0] < nswitches * totalppswitch:
+        raise ValueError(f"this readout holds {samples.shape[0]} samples, too few for "
+                         f"{nswitches} switches of {totalppswitch} points")
+    # a readout carrying a remainder keeps its whole switches and drops the tail, which is what
+    # the offset arithmetic this replaced did
+    switches = samples[:nswitches * totalppswitch].reshape(nswitches, totalppswitch)
     discard_pre = acq.head.discard_pre or 0
-    result = np.zeros((kept, nswitches), dtype='complex')
-    for iswitch in range(nswitches):
-        tk = iswitch * acq.head.sample_time_ns * totalppswitch / 1.0e+9
-        start = iswitch * totalppswitch + discard_pre
-        result[:, iswitch] = acq.data[0, start:start + kept] * np.exp(-tk * line_broadening)
-    return result
+    flat_top = switches[:, discard_pre:discard_pre + npoints_per_switch]
+    tk = np.arange(nswitches) * acq.head.sample_time_ns * totalppswitch / 1.0e+9
+    return flat_top.T * np.exp(-tk * line_broadening)
 
 
-def group_layout(header: mrd.Header,
-                 acqs: List[mrd.Acquisition]) -> Tuple[int, int, int, int]:
+def header_nswitches(header: mrd.Header) -> int:
     """
-    The acquisition matrix one group of acquisitions was acquired at.
+    The switch count, which is shared by every matrix in a file and recorded once on the header.
 
-    Three of the four numbers come from the readout, and are right for any matrix: nswitches is
+    Separate from layout_from_acq because the EPSI test in reconstruct_mrs has to run on the
+    header alone, before the writer is opened and so before any acquisition has been read.
+    Returns 0 when the header records none, which is how a non-EPSI file reads.
+    """
+    if header.user_parameters is None:
+        return 0
+    for item in header.user_parameters.user_parameter_long:
+        if item.name == "nswitches":
+            return int(item.value)
+    return 0
+
+
+@dataclass(frozen=True)
+class Layout:
+    """The acquisition matrix one group of acquisitions was acquired at."""
+    nswitches: int
+    totalppswitch: int      # the whole switch, flat top and discards together
+    kept: int               # points of the flat top, which is the readout axis
+    nviews: int
+    nreps: int
+
+
+def acq_geometry(acq: mrd.Acquisition) -> Tuple:
+    """The readout geometry every acquisition of one group has to agree on."""
+    return (acq.samples(), acq.head.discard_pre or 0, acq.head.discard_post or 0,
+            acq.head.encoding_space_ref)
+
+
+def layout_from_acq(header: mrd.Header, acq: mrd.Acquisition) -> Layout:
+    """
+    The acquisition matrix a group was acquired at, read from one of its acquisitions.
+
+    Three of the five numbers come from the readout, and are right for any matrix: nswitches is
     shared by every matrix in a file and is on the header as a user parameter, the whole switch
     is nsamples / nswitches, and the kept flat top is that less the discard counts. On
     cirrhrat_43_1 that gives 12 points a switch for the series and 18 for the averaged prescan
-    beside it, which is correct for both.
+    beside it, which is correct for both - where the header's single npoints_per_switch, being
+    one number for the whole file, can only be right for one of them.
 
-    The view count is the one number a readout cannot supply, and the one that differs: 8 for
-    that series, 12 for its prescan. The converter records a matrix per encoding and points each
-    acquisition at its own through encoding_space_ref, so read it from there. Files converted
-    before that leave the ref null and carry a single encoding describing the series only, so
-    fall back to the highest view index actually present - right whenever a group is complete,
-    and an undercount on a scan missing a view.
-    Returns (nswitches, total points per switch, points kept per switch, views).
+    The view and repetition counts are the two a readout cannot supply, and the views are what
+    differs between the matrices: 8 for that series, 12 for its prescan. The converter records a
+    matrix per encoding and points each acquisition at its own through encoding_space_ref, so
+    read them from there. Files converted before that leave the ref null and carry a single
+    encoding describing the series only, so fall back to that one.
+
+    The views are counted from kspace_encoding_step_1 rather than from phase, because
+    kspace_encode_step_1 is the index the acquisitions are actually filed under. MRStomrd2
+    writes the same count to both limits but never sets idx.phase at all, so phase is the field
+    that would go stale first; it stays as the fallback, for a converter that set only it.
+
+    One acquisition is enough because the group is homogeneous, which here is a checked claim
+    rather than an assumption: RepetitionImages compares every later acquisition against this
+    one, so a single mutated discard_post raises instead of quietly rewriting kept for the
+    whole group.
+    Raises:
+        - ValueError if the header records no switch count, if the readout keeps no points, or
+          if the encoding declares no view or repetition count to size the matrix from
     """
-    first = acqs[0]
-    params = ({q.name: int(q.value) for q in header.user_parameters.user_parameter_long}
-              if header.user_parameters is not None else {})
-    nswitches = params.get("nswitches", 0)
-    totalppswitch = first.samples() // nswitches if nswitches else 0
-    kept = totalppswitch - (first.head.discard_pre or 0) - (first.head.discard_post or 0)
+    nswitches = header_nswitches(header)
+    if not nswitches:
+        raise ValueError("this header records no switch count, so it describes no EPSI matrix")
 
-    ref = first.head.encoding_space_ref
+    nsamples, discard_pre, discard_post, ref = acq_geometry(acq)
+    totalppswitch = nsamples // nswitches
+    kept = totalppswitch - discard_pre - discard_post
+    if kept <= 0:
+        raise ValueError(f"discard_pre={discard_pre} and discard_post={discard_post} leave "
+                         f"{kept} points of a {totalppswitch} point switch")
+
+    limits = None
     if ref is not None and ref < len(header.encoding):
-        nviews = header.encoding[ref].encoding_limits.phase.maximum + 1
-    else:
-        nviews = max(a.head.idx.kspace_encode_step_1 or 0 for a in acqs) + 1
-    return nswitches, totalppswitch, kept, nviews
-
-
-def assemble_kspaces(header: mrd.Header,
-                     acqs: List[mrd.Acquisition],
-                     line_broadening: float) -> Tuple[dict, dict, int]:
-    """
-    Aggregate one k-space cube per repetition, at the matrix this group was acquired at.
-
-    Returns (repetition -> cube, repetition -> its first acquisition, total points per switch).
-    """
-    nswitches, totalppswitch, kept, nviews = group_layout(header, acqs)
-
-    cubes: dict = {}
-    references: dict = {}
-    for acq in acqs:
-        rep = acq.head.idx.repetition
-        if rep not in cubes:
-            cubes[rep] = np.zeros((nviews, kept, nswitches * FIDPAD), dtype='complex')
-            references[rep] = acq
-        view = acq.head.idx.kspace_encode_step_1 or 0
-        cubes[rep][view, :, :nswitches] = apply_line_broadening(
-            acq, line_broadening,
-            nswitches=nswitches, totalppswitch=totalppswitch, kept=kept)
-    return cubes, references, totalppswitch
+        limits = header.encoding[ref].encoding_limits
+    elif header.encoding:
+        limits = header.encoding[0].encoding_limits
+    views = None if limits is None else (limits.kspace_encoding_step_1 or limits.phase)
+    reps = None if limits is None else limits.repetition
+    if views is None or reps is None:
+        raise ValueError(f"encoding {ref} declares no view or repetition count, so there is no "
+                         f"matrix to reconstruct into")
+    return Layout(nswitches=nswitches, totalppswitch=totalppswitch, kept=kept,
+                  nviews=views.maximum + 1, nreps=reps.maximum + 1)
 
 
 def fft_kspace_to_image(kspace: np.ndarray) -> np.ndarray:
     """FFT one repetition's k-space cube over all three axes into (views, readout, frequency)."""
     axes = tuple(range(kspace.ndim))
     return np.fft.fftshift(np.fft.fftn(kspace, axes=axes), axes=axes)
+
+
+class RepetitionImages:
+    """
+    Accumulate one group's acquisitions into per-repetition images, a repetition at a time.
+
+    A repetition is the smallest unit that can be transformed. One acquisition is one view, so
+    the view axis is complete only once every acquisition of that repetition is in hand, and
+    transforming all three axes of the cube is what turns it into (views, readout, frequency).
+    Acquisitions arrive one at a time off the stream, so a cube is held open until the
+    repetition index changes and is transformed then. Only the image outlives it, which keeps a
+    single repetition of k-space in memory rather than the whole series, while still retaining
+    every image: the alignment reference is the brightest voxel across the whole series and the
+    global spectrum is the sum over it, so everything after the transform needs the series in
+    hand.
+
+    The repetition axis of `images` is the recorded repetition index rather than a running count
+    of the repetitions delivered, so it lines up with acq.head.idx.repetition and with the
+    repetition axis of the metabolite maps, which makes it a time axis a kinetic model can use.
+    A repetition the stream never delivers is left as zeros and is skipped by both fits.
+    """
+
+    def __init__(self, header: mrd.Header, first_acq: mrd.Acquisition, line_broadening: float):
+        self.layout = layout_from_acq(header, first_acq)
+        self.line_broadening = line_broadening
+        self._geometry = acq_geometry(first_acq)
+        self.images = np.zeros((self.layout.nreps, self.layout.nviews, self.layout.kept,
+                                self.layout.nswitches * FIDPAD), dtype='complex')
+        # the first acquisition of each repetition, whose header describes that repetition
+        self.reference_acq: dict = {}
+        self.reps_present: List[int] = []
+        self._rep: Optional[int] = None
+        self._cube: Optional[np.ndarray] = None
+        self._views_seen: set = set()
+
+    def add(self, acq: mrd.Acquisition) -> None:
+        """
+        Take one acquisition, transforming the repetition before it once this one starts.
+
+        The geometry check is per acquisition rather than over an assembled group, because a
+        stream is only ever seen one acquisition at a time. It is the same guarantee the batch
+        check gave: a minority layout is a corrupted header, not a variant, and a group that
+        disagrees with itself means something upstream is wrong that a quietly reasonable answer
+        would hide. Taking the layout from the first acquisition alone once let a single mutated
+        discard_post rewrite kept from 12 to 20 for all 216 acquisitions of a series, silently.
+        Raises:
+            - ValueError if this acquisition's readout geometry differs from the group's, if it
+              carries a view or repetition index the encoding does not declare, or if its
+              repetition has already been transformed
+        """
+        geometry = acq_geometry(acq)
+        if geometry != self._geometry:
+            raise ValueError(f"this group mixes readout geometries: (samples, discard_pre, "
+                             f"discard_post, encoding_ref)={geometry} against {self._geometry} "
+                             f"on the first acquisition of the group")
+
+        rep = acq.head.idx.repetition or 0
+        if rep >= self.layout.nreps:
+            raise ValueError(f"the encoding declares {self.layout.nreps} repetitions but "
+                             f"repetition index {rep} is present")
+        if rep != self._rep:
+            self._transform_open_cube()
+            # the cube for a repetition is opened once and transformed when the next one starts,
+            # so a repetition that comes back later would be rebuilt from its tail alone
+            if rep in self.reps_present:
+                raise ValueError(f"repetition {rep} arrives in more than one run of the stream, "
+                                 f"so its k-space cannot be assembled in a single pass")
+            self._rep = rep
+            self._cube = np.zeros((self.layout.nviews, self.layout.kept,
+                                   self.layout.nswitches * FIDPAD), dtype='complex')
+            self._views_seen = set()
+            self.reference_acq[rep] = acq
+
+        view = acq.head.idx.kspace_encode_step_1 or 0
+        if view >= self.layout.nviews:
+            raise ValueError(f"the encoding declares {self.layout.nviews} views but view index "
+                             f"{view} is present")
+        self._cube[view, :, :self.layout.nswitches] = apply_line_broadening(
+            acq, self.line_broadening,
+            nswitches=self.layout.nswitches,
+            totalppswitch=self.layout.totalppswitch,
+            npoints_per_switch=self.layout.kept)
+        self._views_seen.add(view)
+
+    def close(self) -> None:
+        """Transform the repetition still open, once the stream has run out."""
+        self._transform_open_cube()
+        absent = sorted(set(range(self.layout.nreps)) - set(self.reps_present))
+        if absent:
+            print(f"warning: the stream carries none of repetitions {absent} that the encoding "
+                  f"declares, which stay zero through the reconstruction", file=sys.stderr)
+
+    def _transform_open_cube(self) -> None:
+        """Transform the open cube into its image and drop it. Idempotent, so close() is safe."""
+        if self._cube is None:
+            return
+        missing = sorted(set(range(self.layout.nviews)) - self._views_seen)
+        if missing:
+            print(f"warning: repetition {self._rep} is missing views {missing}, which keep zero "
+                  f"rows through the transform", file=sys.stderr)
+        self.images[self._rep] = fft_kspace_to_image(self._cube)
+        self.reps_present.append(self._rep)
+        self._cube = None
 
 
 def spectral_axis(header: mrd.Header,
@@ -332,6 +473,8 @@ def spectral_axis(header: mrd.Header,
     # the converter writes the 13C frequency here despite the field name, since that is the
     # frequency these spectra were actually acquired at
     center_freq_hz = header.experimental_conditions.h1resonance_frequency_hz
+    if not center_freq_hz:
+        raise ValueError("the header records no resonance frequency, so there is no ppm axis")
     bw_ppm = spectral_bw_hz / center_freq_hz * 1.0e+6
     nfreq = nswitches * FIDPAD
     xscale = np.arange(nfreq) / nfreq * bw_ppm
@@ -364,6 +507,9 @@ def phase_align(volumes: np.ndarray,
         for j in range(out.shape[1]):
             for k in range(out.shape[2]):
                 spect = out[ide, j, k, :]
+                # a repetition the stream never delivered is a zero slab, and stays one
+                if not np.any(spect):
+                    continue
                 if noise_threshold is not None and np.max(np.abs(spect)) < noise_threshold:
                     continue
                 best_overlap = -np.inf
@@ -468,6 +614,8 @@ def fit_voxel_peaks(volumes: np.ndarray,
         for j in range(ny):
             for k in range(nx):
                 spect = volumes[ide, j, k, :]
+                if not np.any(spect):
+                    continue
                 if np.max(np.abs(spect)) < noise_threshold:
                     continue
                 params = fitter.fit_windowed(spect, df=fit_df, dw=fit_dw, dph=fit_dph)
@@ -565,12 +713,12 @@ def fit_and_emit_peaks(aligned: np.ndarray,
                    **map_meta)
 
 
-def reconstruct_phantom(phantom_kspaces: List[np.ndarray],
-                        xscale: np.ndarray,
+def reconstruct_phantom(header: mrd.Header,
+                        prescan: RepetitionImages,
                         width_scale: Tuple[float, float] = (0.1, 1.9)
                         ) -> Tuple[float, Optional[np.ndarray]]:
     """
-    Reconstruct the urea phantom prescan and derive the scaling factor it exists to provide.
+    Fit the urea phantom prescan and derive the scaling factor it exists to provide.
 
     The phantom holds one known metabolite, so its spectrum is fitted with a single peak rather
     than the metabolite pattern, and the quantity of interest is that peak's area, amplitude
@@ -578,18 +726,27 @@ def reconstruct_phantom(phantom_kspaces: List[np.ndarray],
     every voxel of a phantom is signal, which is why the legacy sets a phantom's noise to zero
     outright. Several phantom sets average into one number.
 
+    The prescan arrives already transformed, in its own RepetitionImages, because its matrix
+    need not match the series' and on cirrhrat_43_1 it does not. That accumulator carries the
+    prescan's own layout, which is what this reads its spectral axis off.
+
     width_scale is the same (lo, hi) bound the metabolite fit uses, as multiples of the width
-    guess. It matters more here than there: the scaling is the peak's area, amplitude times
+    guess. It matters more here than there. The scaling is the peak's area, amplitude times
     width, so a width held off its true value scales every experiment this number normalises.
     Returns:
         - (the scaling, 1.0 when there is no phantom to derive one from,
            the per-voxel area map of the last phantom set, or None)
     """
+    if not prescan.reps_present:
+        return 1.0, None
+    xscale, _ = spectral_axis(header, prescan.reference_acq[prescan.reps_present[0]],
+                              prescan.layout.nswitches, prescan.layout.totalppswitch)
+
     scalings: List[float] = []
     voxel_map = None
 
-    for kspace in phantom_kspaces:
-        img = fft_kspace_to_image(kspace)
+    for rep in prescan.reps_present:
+        img = prescan.images[rep]
         # every voxel contributes; a phantom has no noise floor to gate against
         global_spect = img.sum(axis=(0, 1))
         scaling = float(np.max(np.abs(global_spect)))
@@ -617,11 +774,9 @@ def reconstruct_phantom(phantom_kspaces: List[np.ndarray],
     return float(np.mean(scalings)), voxel_map
 
 
-# ---------- EPSI reconstruction ------------------------------------------
-
-
 def reconstruct_epsi(header: mrd.Header,
-                     input: Iterable[mrd.Acquisition],
+                     series: RepetitionImages,
+                     prescan: Optional[RepetitionImages],
                      *,
                      line_broadening: float,
                      spec: PeakSpec,
@@ -634,69 +789,42 @@ def reconstruct_epsi(header: mrd.Header,
     """
     Reconstruct an EPSI acquisition into spectra, a global peak fit and metabolite maps.
 
-    One forward pass over the stream aggregates a k-space cube per repetition, then each cube
-    is transformed into an image. Everything after that - the brightest voxel, the noise floor,
-    the alignment, the global fit and the per-voxel fits - needs the whole series in hand,
-    because the alignment reference is the brightest voxel across repetitions and the global
-    spectrum is the sum over them. So only assembly and the transform run per repetition.
+    Everything downstream of the transform. The series arrives already in the image domain, as
+    the (repetitions, views, readout, frequency) array its RepetitionImages accumulated one
+    repetition at a time off the stream, so nothing here touches k-space or an acquisition's
+    data. What it still needs from the acquisitions is their headers, which the accumulator
+    keeps one per repetition, and which carry the timestamps that make the repetition axis a
+    time axis.
 
-    Acquisitions flagged IS_NOISE_MEASUREMENT are the averaged phantom prescan, not repetitions
-    of the series. They are kept apart, reconstructed on their own, and contribute only their
-    scaling factor and their own image.
+    The averaged phantom prescan arrives as its own RepetitionImages, on its own matrix, and
+    contributes only its scaling factor and its own image.
+
+    Both sides of the alignment are emitted. The pre-alignment image goes out per repetition,
+    carrying that repetition's own acquisition header, and is the record of what the alignment
+    was given; the aligned series goes out once as a 4-D array, and is what the fits actually
+    see and what a consumer needs to re-fit without realigning.
 
     Yields NdArrays only. The raw acquisitions are passed through by the caller, in a stream
     call of their own.
     """
-    acquisitions = list(input)
-    if not acquisitions:
+    if not series.reps_present:
         return
 
-    # the flag says which acquisitions are the averaged prescan; group_layout says what matrix
-    # each group was acquired at, which need not be the same one. Both flags are accepted:
-    # the converter marks a prescan IS_NOISE_MEASUREMENT now and marked it IS_NAVIGATION_DATA
-    # before, and reading only the new one folds an old file's prescan into the series as extra
-    # view rows rather than skipping it
-    prescan = (mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT
-               | mrd.AcquisitionFlags.IS_NAVIGATION_DATA)
-    data_acqs = [a for a in acquisitions if not (a.head.flags & prescan)]
-    phantom_acqs = [a for a in acquisitions if a.head.flags & prescan]
-    if not data_acqs:
-        return
+    layout = series.layout
+    recon_array = series.images
+    reps_present = series.reps_present
+    xscale, spectral_bw_hz = spectral_axis(header, series.reference_acq[reps_present[0]],
+                                           layout.nswitches, layout.totalppswitch)
 
-    kspaces, references, totalppswitch = assemble_kspaces(header, data_acqs, line_broadening)
-    if not kspaces:
-        return
-    nswitches, _, _, _ = group_layout(header, data_acqs)
-    xscale, spectral_bw_hz = spectral_axis(header, data_acqs[0], nswitches, totalppswitch)
-
-    # image = fft for each aggregated kspace
-    volumes: List[np.ndarray] = []
-    current_max = -np.inf
-    max_spect = None
-    max_location = (0, 0, 0)
-    last_repetition = 0
-
-    for irep, rep in enumerate(sorted(kspaces)):
-        reference_acq = references[rep]
-        img = fft_kspace_to_image(kspaces.pop(rep))     # popped, so one cube is freed as we go
-        volumes.append(img)
-        last_repetition = rep
-
-        # the brightest voxel of the series is the reference every other voxel is aligned to
-        peak_per_voxel = np.abs(img).max(axis=-1)
-        j, k = np.unravel_index(int(np.argmax(peak_per_voxel)), peak_per_voxel.shape)
-        if peak_per_voxel[j, k] > current_max:
-            current_max = float(peak_per_voxel[j, k])
-            max_spect = np.copy(img[j, k, :])
-            max_location = (irep, int(j), int(k))
-
-        yield emit(img,
+    for rep in reps_present:
+        reference_acq = series.reference_acq[rep]
+        yield emit(recon_array[rep],
                    head=mrd.NdArrayHeader(
                        dimension_labels=[mrd.ArrayDimension.Y,
                                          mrd.ArrayDimension.X,
                                          mrd.ArrayDimension.CONTRAST],
-                       # no ArrayType means "a reconstructed spectral image", so it goes in the
-                       # generic bucket and is identified by its image type and description
+                       # the schema has no arm for "a reconstructed spectral image", so it
+                       # goes in the generic bucket and the description identifies it
                        array_type=mrd.ArrayType.USER_MAP,
                        image_type=mrd.ArrayImageType.COMPLEX,
                        measurement_uid=reference_acq.head.measurement_uid,
@@ -708,46 +836,69 @@ def reconstruct_epsi(header: mrd.Header,
                    **{"receiver bandwidth(Hz)": spectral_bw_hz,
                       "line broadening(Hz)": line_broadening})
 
-    # the phantom prescan, reconstructed on its own and on its own spectral axis: its matrix
-    # need not match the series', and on cirrhrat_43_1 it does not
+    # the phantom prescan, fitted on its own spectral axis: its matrix need not match the
+    # series', and on cirrhrat_43_1 it does not
     phantom_scaling, phantom_map = 1.0, None
-    if phantom_acqs:
-        phantoms, _, phantom_total = assemble_kspaces(header, phantom_acqs, line_broadening)
-        phantom_nswitches, _, _, _ = group_layout(header, phantom_acqs)
-        phantom_xscale, _ = spectral_axis(header, phantom_acqs[0],
-                                          phantom_nswitches, phantom_total)
-        phantom_scaling, phantom_map = reconstruct_phantom(
-            [phantoms[rep] for rep in sorted(phantoms)], phantom_xscale, width_scale)
-    print(f"Phantom scaling {phantom_scaling:.6g} "
-          f"from {len(phantom_acqs)} prescan acquisition(s)", file=sys.stderr)
+    nprescan = 0 if prescan is None else len(prescan.reps_present)
+    if prescan is not None:
+        phantom_scaling, phantom_map = reconstruct_phantom(header, prescan, width_scale)
+    print(f"Phantom scaling {phantom_scaling:.6g} from {nprescan} prescan repetition(s)",
+          file=sys.stderr)
     if phantom_map is not None:
         yield emit(phantom_map,
                    dimension_labels=[mrd.ArrayDimension.Y, mrd.ArrayDimension.X],
                    description="phantom_image",
                    phantom_scaling=phantom_scaling)
 
-    volumes = np.stack(volumes)
-
-    # the last repetition of a hyperpolarized series has decayed away, so it measures noise
-    noise = float(np.mean(np.abs(volumes[-1])))
+    # the last repetition of a hyperpolarized series has decayed away, so it measures noise.
+    # It is the last one delivered rather than recon_array[-1], which is zeros when the stream
+    # stopped short of the declared count. A repetition missing views dilutes this downward,
+    # since its zero rows count toward the mean
+    noise_repetition = max(reps_present)
+    noise = float(np.mean(np.abs(recon_array[noise_repetition])))
     noise_threshold = noise * NOISE_THRESHOLD_MULTIPLIER
+    if noise == 0.0:
+        print(f"warning: repetition {noise_repetition} is empty, so the noise floor is 0 and "
+              f"every voxel above zero will be fitted", file=sys.stderr)
     yield emit(np.array([noise]),
                dimension_labels=[mrd.ArrayDimension.SAMPLES],
                array_type=mrd.ArrayType.NOISE,
                description="noise",
                noise_threshold_multiplier=NOISE_THRESHOLD_MULTIPLIER,
-               estimated_from_repetition=last_repetition)
+               estimated_from_repetition=noise_repetition)
+
+    # the brightest voxel of the series is the reference every other voxel is aligned to. One
+    # argmax over the series picks the same voxel the per-repetition scan it replaces did: both
+    # take the first maximum, and C order over this array is repetition order
+    peak_per_voxel = np.abs(recon_array).max(axis=-1)
+    max_rep, max_y, max_x = (int(i) for i in
+                             np.unravel_index(int(np.argmax(peak_per_voxel)),
+                                              peak_per_voxel.shape))
+    max_spect = np.copy(recon_array[max_rep, max_y, max_x, :])
 
     yield emit(max_spect,
                dimension_labels=[mrd.ArrayDimension.CONTRAST],
                description="max spectral",
                xscale_ppm=xscale,
-               max_repetition=max_location[0],
-               max_y=max_location[1],
-               max_x=max_location[2])
+               max_repetition=max_rep,
+               max_y=max_y,
+               max_x=max_x)
 
     print("Aligning voxel spectra", file=sys.stderr)
-    aligned, global_spect = phase_align(volumes, max_spect, noise_threshold=noise_threshold)
+    aligned, global_spect = phase_align(recon_array, max_spect, noise_threshold=noise_threshold)
+
+    yield emit(aligned,
+               dimension_labels=[mrd.ArrayDimension.REPETITION,
+                                 mrd.ArrayDimension.Y,
+                                 mrd.ArrayDimension.X,
+                                 mrd.ArrayDimension.CONTRAST],
+               description="epsi_image_aligned",
+               xscale_ppm=xscale,
+               noise_threshold=noise_threshold,
+               phase_search_range=PHASE_SEARCH_RANGE,
+               reference_repetition=max_rep,
+               reference_y=max_y,
+               reference_x=max_x)
 
     yield from fit_and_emit_peaks(aligned, global_spect, xscale, spec,
                                   noise_threshold=noise_threshold,
@@ -767,54 +918,85 @@ def reconstruct_mrs(input: BinaryIO,
                     global_df: float = 0.5,
                     width_scale: Tuple[float, float] = (0.1, 1.9)) -> None:
     """
-    Reconstruct one converted EPSI file.
+    Reconstruct one converted EPSI file
 
-    The acquisitions are read into memory rather than streamed through: they are written back
-    out in a stream call of their own, after the reconstruction has had them, and holding them
-    also means the reader is fully drained before it closes.
+    The stream is read once. Each acquisition is written straight back out and, on the way past,
+    added to its group's accumulator, which transforms a repetition as soon as the next one
+    starts. So the raw acquisitions reach the output unchanged, only one repetition of k-space
+    is ever held, and by the time the passthrough is exhausted every image the fits need is in
+    hand. Acquisitions and NdArrays go out in two stream calls, acquisitions first, which is the
+    order a consumer reads them in.
+
+    Acquisitions flagged IS_NOISE_MEASUREMENT are the averaged phantom prescan, not repetitions
+    of the series, so they accumulate into a second group with its own matrix. Which group an
+    acquisition belongs to is the only thing this decides; everything else about a group is the
+    accumulator's.
 
     nswitches > 1 is the EPSI test, and it is the converter's own: MRStomrd2 sets discard_pre
-    and discard_post only under that condition, so it is exactly the set of files whose
-    readouts are switch structured. The header carries nswitches for every conversion, so its
-    presence alone says nothing - a spectral file records nswitches=1. The test runs before the
-    writer is opened, so a non-EPSI file fails with this message rather than unwinding the
-    writer mid protocol behind a ProtocolError about unwritten data.
+    and discard_post only under that condition, so it is exactly the set of files whose readouts
+    are switch structured. The header carries nswitches for every conversion, so its presence
+    alone says nothing - a spectral file records nswitches=1. The test runs before the writer is
+    opened, so a non-EPSI file fails with this message rather than unwinding the writer mid
+    protocol behind a ProtocolError about unwritten data. A file that turns out to hold no
+    acquisitions cannot be caught that early, so it lets the writer close on a header alone and
+    raises after. Either way the --folder loop drops the output and carries on.
     Raises:
-        - ValueError if the file holds no acquisitions, or is not an EPSI acquisition
+        - ValueError if the file is not an EPSI acquisition, or holds no acquisitions
     """
     with mrd.BinaryMrdReader(input) as reader:
         header = reader.read_header()
-        acquisitions = [item.value for item in reader.read_data()
-                        if isinstance(item, mrd.StreamItem.Acquisition)]
+        nswitches = header_nswitches(header)
+        if nswitches <= 1:
+            raise ValueError(f"this header records nswitches={nswitches}; mrd2recon "
+                             f"reconstructs EPSI only")
 
-    if not acquisitions:
+        # keyed by whether the acquisition is prescan, so a group's accumulator is built from
+        # the first acquisition that belongs to it and sizes itself off that acquisition's own
+        # encoding
+        groups: dict = {}
+
+        def passthrough() -> Iterator[mrd.StreamItem]:
+            """Write every acquisition back out unchanged, accumulating it on the way past."""
+            for item in reader.read_data():
+                if not isinstance(item, mrd.StreamItem.Acquisition):
+                    continue
+                acq = item.value
+                is_prescan = bool(acq.head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT)
+                if is_prescan not in groups:
+                    groups[is_prescan] = RepetitionImages(header, acq, line_broadening)
+                groups[is_prescan].add(acq)
+                yield item
+
+        with mrd.BinaryMrdWriter(output) as writer:
+            header = append_recon_header(header,
+                                         line_broadening=line_broadening,
+                                         spec=spec,
+                                         fit_df=fit_df,
+                                         fit_dw=fit_dw,
+                                         fit_dph=fit_dph,
+                                         global_df=global_df,
+                                         width_scale=width_scale)
+            writer.write_header(header)
+            # the raw acquisitions pass through unchanged, and are accumulated as they go
+            writer.write_data(passthrough())
+            for group in groups.values():
+                group.close()
+
+            series = groups.get(False)
+            if series is not None:
+                writer.write_data(reconstruct_epsi(header,
+                                                   series,
+                                                   groups.get(True),
+                                                   line_broadening=line_broadening,
+                                                   spec=spec,
+                                                   fit_df=fit_df,
+                                                   fit_dw=fit_dw,
+                                                   fit_dph=fit_dph,
+                                                   global_df=global_df,
+                                                   width_scale=width_scale))
+
+    if series is None:
         raise ValueError("this file holds no acquisitions")
-    nswitches, _, _, _ = group_layout(header, acquisitions)
-    if nswitches <= 1:
-        raise ValueError(f"this header records nswitches={nswitches}; mrd2recon reconstructs "
-                         f"EPSI only")
-
-    with mrd.BinaryMrdWriter(output) as writer:
-        append_recon_header(header,
-                            line_broadening=line_broadening,
-                            spec=spec,
-                            fit_df=fit_df,
-                            fit_dw=fit_dw,
-                            fit_dph=fit_dph,
-                            global_df=global_df,
-                            width_scale=width_scale)
-        writer.write_header(header)
-        # the raw acquisitions pass through unchanged, in a stream call of their own
-        writer.write_data(mrd.StreamItem.Acquisition(acq) for acq in acquisitions)
-        writer.write_data(
-            reconstruct_epsi(header, acquisitions,
-                             line_broadening=line_broadening,
-                             spec=spec,
-                             fit_df=fit_df,
-                             fit_dw=fit_dw,
-                             fit_dph=fit_dph,
-                             global_df=global_df,
-                             width_scale=width_scale))
 
 
 if __name__ == "__main__":
@@ -829,13 +1011,12 @@ if __name__ == "__main__":
                         help="How far a peak center may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
     parser.add_argument("-dw", "--fit-dw", type=float, default=0.0, required=False, 
                         help="How far a peak width may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
-    parser.add_argument("-dph", "--fit-dph", type=float, default=0.0, required=False, 
+    parser.add_argument("-dph", "--fit-dph", type=float, default=0.0, required=False,
                         help="How far a peak phase may move from the global fit during the per-voxel fit, in radians. Default 0, i.e. held at the global fit")
     parser.add_argument("-gdf", "--global-df", type=float, default=0.5, required=False,
-                        help="How far the GLOBAL fit may move a peak center from where the known offsets place it, in ppm. Default 0.5, which is what main's wigglefactor enforced; 0 pins every center to its placement")
-    parser.add_argument("--width-bounds", type=float, nargs=2, default=[0.1, 1.9],
-                        metavar=("LO", "HI"), required=False,
-                        help="Global-fit width bounds, as multiples of the estimated width guess. Default 0.1 1.9, the range main's arctan parameterization enforced")
+                        help="How far the global fit may move a peak center from its rigid-pattern placement, in ppm. Default 0.5; 0 pins the placement")
+    parser.add_argument("--width-bounds", type=float, nargs=2, default=(0.1, 1.9), metavar=("LO", "HI"), required=False,
+                        help="Linewidth bounds for both fits, as multiples of the width guess. Default 0.1 1.9")
 
     # the peak arguments have to come out before argparse sees them, since a peak's value may be
     # negative and argparse would read that as another option

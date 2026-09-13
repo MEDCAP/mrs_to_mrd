@@ -11,8 +11,9 @@ figure here:
 
     global_spect / global_spect_fit / lorentzian_*  the fitted spectrum and its peaks
     metabolite_amplitude, metabolite_area          maps, drawn as a peak x repetition montage
-    epsi_image                                     the reconstructed volumes
-    phantom peak area, singular_values, noise      calibration and diagnostics
+    epsi_image / epsi_image_aligned                the reconstructed volumes, averaged over
+                                                   repetitions into a spectrum per voxel
+    phantom_image, singular_values, noise          calibration and diagnostics
 
 An EPSI reconstruction has one global spectrum and a metabolite map; a single voxel FID series
 has one spectrum per time point and no map, so the two are told apart by what is present rather
@@ -25,7 +26,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import BinaryIO, Dict, List
+from typing import BinaryIO, Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib
@@ -197,6 +198,93 @@ def plot_spectral_series(contents: Contents, filename: str) -> bool:
     return True
 
 
+def epsi_series(contents: Contents) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    The reconstructed EPSI volumes as one (nreps, ny, nx, nfreq) stack, and their ppm axis.
+
+    mrd2recon writes the pre-alignment volumes as one epsi_image per repetition and the aligned
+    series as a single 4-D epsi_image_aligned, so the per-repetition arrays are stacked back up
+    and the 4-D one is taken as it stands. The pre-alignment volumes are preferred: they are what
+    the transform produced, and what the alignment was given. Returns (None, None) for a file
+    holding neither.
+    """
+    per_rep = contents.arrays.get("epsi_image")
+    if per_rep:
+        volumes = np.stack([np.asarray(a.data) for a in per_rep])
+        source = per_rep[0]
+    else:
+        aligned = contents.first("epsi_image_aligned")
+        if aligned is None:
+            return None, None
+        volumes = np.asarray(aligned.data)
+        source = aligned
+    if volumes.ndim != 4:
+        return None, None
+
+    xscale = np.array(meta_values(source, "xscale_ppm"))
+    if xscale.size != volumes.shape[-1]:
+        xscale = np.arange(volumes.shape[-1])
+    return volumes, xscale
+
+
+def plot_epsi_image(contents: Contents, filename: str) -> bool:
+    """
+    The reconstructed volumes averaged over repetitions, as a spectrum per voxel.
+
+    The transform leaves each repetition as (y, x, frequency), so the series averaged over its
+    repetition axis is one spectrum per voxel of the slice: the grid draws each in its own cell,
+    beside the same spectra collapsed to a single intensity per voxel. Every cell shares one
+    vertical scale, so a bright voxel is drawn tall and a weak one flat, which is what makes the
+    grid readable as an image of where the signal is rather than as a hundred separate plots.
+
+    The average is of the magnitudes rather than of the complex volumes. epsi_image is written
+    before the alignment, so each repetition carries its own phase and a complex mean cancels by
+    however much they disagree - on ischemia_121_1 that costs 9% of the median voxel and 57% of
+    the worst. Magnitude loses the line shape and keeps the amplitude, which is the trade the
+    right way round for a display whose question is which voxels hold signal.
+    """
+    volumes, xscale = epsi_series(contents)
+    if volumes is None:
+        return False
+
+    nreps, ny, nx, _ = volumes.shape
+    spectra = np.abs(volumes).mean(axis=0)
+    intensity = spectra.sum(axis=-1)
+    scaling = float(spectra.max())
+    if scaling == 0.0:
+        return False
+
+    fig, (image, grid) = plt.subplots(1, 2, figsize=(15, 7.5),
+                                      gridspec_kw={'width_ratios': [1, 1.35]})
+    fig.suptitle(f'epsi image, mean of {nreps} repetitions: {filename}')
+
+    # voxel centers at integer coordinates, so the grid below can place a trace by its indices
+    extent = [-0.5, nx - 0.5, ny - 0.5, -0.5]
+    handle = image.imshow(intensity, cmap='viridis', origin='upper', extent=extent)
+    image.set_title('summed over frequency', fontsize=9)
+    image.set_xlabel('x (voxel)')
+    image.set_ylabel('y (voxel)')
+    fig.colorbar(handle, ax=image, fraction=0.046)
+
+    # the same voxels again, each holding its own spectrum, over the intensity it came from
+    grid.imshow(intensity, cmap='gray', origin='upper', extent=extent, alpha=0.45)
+    # a cell is one voxel wide and a trace is inset inside it, so neighbours do not touch
+    inset = 0.45
+    x_of_point = np.linspace(-inset, inset, spectra.shape[-1])
+    for j in range(ny):
+        for k in range(nx):
+            grid.plot(k + x_of_point, j + inset - spectra[j, k] / scaling * 2 * inset,
+                      color='yellow', linewidth=0.7)
+    grid.set_xticks(np.arange(nx + 1) - 0.5, minor=True)
+    grid.set_yticks(np.arange(ny + 1) - 0.5, minor=True)
+    grid.grid(which='minor', color='0.4', linewidth=0.4)
+    grid.set_xlabel(f'x (voxel), each cell {xscale[0]:.1f} to {xscale[-1]:.1f} ppm')
+    grid.set_ylabel('y (voxel)')
+    grid.set_title(f'spectrum per voxel, all on one scale (peak {scaling:.3g})', fontsize=9)
+    fig.tight_layout()
+    return True
+
+
 def montage(maps: np.ndarray, zoom_factor: int = ZOOM_FACTOR) -> np.ndarray:
     """
     Lay (npeaks, nreps, ny, nx) out as one image, peaks down and repetitions across.
@@ -284,10 +372,13 @@ def plot_diagnostics(contents: Contents, filename: str) -> bool:
     """The phantom map and the SVD singular values, when the run produced them."""
     drawn = False
 
-    phantom = contents.first("phantom peak area")
+    # "phantom peak area" is what the legacy recon tagged it; mrd2recon writes "phantom_image"
+    phantom = contents.first("phantom_image") or contents.first("phantom peak area")
     if phantom is not None:
         maps = np.asarray(phantom.data)
-        if maps.ndim == 3:
+        # montage lays out (npeaks, nreps, ny, nx); the legacy recon wrote a set of maps and
+        # mrd2recon writes a single (ny, nx) one, so both are promoted to that shape
+        while maps.ndim < 4:
             maps = maps[np.newaxis, ...]
         fig = plt.figure(figsize=(7, 4))
         scaling = meta_value(phantom, "phantom_scaling")
@@ -383,8 +474,9 @@ def plot_mrd(input: BinaryIO, filename: str, *, raw: bool = False, save: Path = 
           + (f', {counts}' if counts else ''), file=sys.stderr)
 
     drawn = False
-    for figure in (plot_fitted_spectrum, plot_spectral_series, plot_metabolite_maps,
-                   plot_time_courses, plot_diagnostics, plot_legacy_images):
+    for figure in (plot_fitted_spectrum, plot_spectral_series, plot_epsi_image,
+                   plot_metabolite_maps, plot_time_courses, plot_diagnostics,
+                   plot_legacy_images):
         drawn |= figure(contents, filename)
     if raw:
         drawn |= plot_acquisitions(contents, filename)
