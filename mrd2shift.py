@@ -38,6 +38,13 @@ DRIFT_MIN_GAIN = 1.5
 # echo to sharpen either way is refused rather than acted on
 DRIFT_MIN_SNR = 5.0
 
+# The correction check_peak_position hard-codes, as a slope and a lead. Its 64 entry drift table is
+# rint(0.2097 * switch) to within 1 sample everywhere, mean deviation 0.41, and its constant is
+# int(ramp) + 3. Measured independently, cirrhrat_43_1 drifts +0.1937 per switch, so this default is
+# close to that scan's truth and a long way from the +0.27 the coherent search returns for it
+HARDCODED_SLOPE = 0.2097
+HARDCODED_LEAD = 3
+
 # ndarray -> identify peaks
 # ndarray, identified peaks -> plot
 # mrd.acquisition -> ndarray
@@ -633,6 +640,70 @@ def switch_shifts(nswitch: int, total: int, slope: float) -> np.ndarray:
     return (shifts + total // 2) % total - total // 2
 
 
+def stream_ramp_samples(header: "mrd.Header", acq: "mrd.Acquisition") -> Optional[float]:
+    """
+    How many samples the readout gradient spends on one ramp, read off a converted stream.
+
+    The stream side twin of ramp_samples, which needs an MRSdata and so cannot be used once a scan
+    is a .mrd2. Both numbers survive the conversion: the converter writes tramp_us onto the header
+    as a user parameter, and the dwell is on every acquisition as sample_time_ns.
+
+    Left fractional for the same reason ramp_samples leaves it fractional - the kidney sequences run
+    a 2.5 sample ramp, and rounding here would move the echo half a sample before anything used it.
+    Measured: cirrhrat_43_1 is 112us over a 28us dwell = 4.0, ischemia_121_1 is 100 over 40 = 2.5.
+    Args:
+        - header: the stream header, for tramp_us
+        - acq: any acquisition of the group, for its dwell
+    Returns:
+        - samples per ramp, or None when the stream records neither
+    """
+    params = ({q.name: int(q.value) for q in header.user_parameters.user_parameter_long}
+              if header.user_parameters is not None else {})
+    tramp_us = params.get("tramp_us", 0)
+    dwell_us = (acq.head.sample_time_ns or 0) / 1000.0
+    if not tramp_us or not dwell_us:
+        return None
+    return tramp_us / dwell_us
+
+
+def hardcoded_switch_shifts(nswitch: int, ramp_points: float,
+                            slope: float = HARDCODED_SLOPE,
+                            lead: int = HARDCODED_LEAD) -> np.ndarray:
+    """
+    The correction check_peak_position plots, as one integer shift per switch.
+
+    check_peak_position works it out in two stages and draws the result without ever applying it.
+    They compose into a single shift per switch, which is the only form a roll can take:
+
+      - a constant, `int(ramp_points) + 3`, moving the whole readout to later samples: 7 on
+        cirrhrat where the ramp is 4, 5 on the kidney data where it is 2. This is what puts the
+        echo on the plateau the sequence samples rather than merely stopping it moving.
+      - a drift, removed by slicing each switch from `shift` onward, which moves samples earlier.
+
+    Hence `constant - drift`, running +7 down to -6 across cirrhrat's 64 switches. The sign is the
+    easy thing to invert, so: positive moves samples later, and the two stages pull opposite ways.
+
+    The drift was a 64 entry table stepping 0,0,0,1,1,1,2,2,2,3,... up to 13. That table is a
+    straight line: `rint(0.2097 * i)` reproduces every one of its entries to within 1 sample, mean
+    deviation 0.41, so the 3-then-5 stepping is hand rounding rather than structure. Carrying it as
+    a slope is what lets it apply to a readout with a different switch count instead of being
+    silently wrong there.
+
+    Anchored at switch 0, unlike switch_shifts, which anchors at the middle of the train precisely
+    so that it leaves the mean echo position alone. Here the constant is the re-centering, so
+    switch 0 is the anchor it has to be measured from, and the two anchors must not be mixed.
+    Args:
+        - nswitch: switches in the readout
+        - ramp_points: samples per ramp, from stream_ramp_samples
+        - slope: drift to remove, in samples per switch. Zero applies the constant alone
+        - lead: the +3, i.e. how far past the ramp the constant puts the first echo
+    Returns:
+        - integer shift per switch, length nswitch, positive meaning the samples move later
+    """
+    constant = int(ramp_points) + lead
+    return constant - np.rint(slope * np.arange(nswitch)).astype(int)
+
+
 def ramp_samples(mrs: MRSdata) -> Optional[float]:
     """
     How many samples the readout gradient spends on one ramp, or None when the file cannot say.
@@ -1176,20 +1247,36 @@ def report_windows(named_files: Iterable[Tuple[str, MRSdata]]) -> int:
     return reported
 
 
-def correct_stream(input_path: Path, output_path: Path) -> bool:
+def correct_stream(input_path: Path, output_path: Path, *,
+                   slope: float = HARDCODED_SLOPE,
+                   lead: int = HARDCODED_LEAD,
+                   measured: bool = False) -> bool:
     """
-    Take the echo drift out of a converted stream and write it back out.
+    Move each switch of every acquisition onto the echo position, and write the stream back out.
 
     The acquisitions are grouped by the encoding they point at, because a file holds more than one
     acquisition matrix - the series and the averaged prescan beside it - and their switch layouts
-    differ. The drift is a property of the gradient timing, so it is measured once per matrix over
-    every acquisition of that group pooled, and the same shifts are applied to all of them.
+    differ. The correction is a property of the gradient timing, so it is worked out once per matrix
+    and the same shifts are applied to every acquisition of that group.
 
-    A measurement that fails its own acceptance tests is reported and not applied: the stream is
-    copied through unchanged rather than rolled by a slope nobody trusts.
+    By default the shift is the one check_peak_position hard-codes, as hardcoded_switch_shifts
+    carries it: a constant onto the sampled plateau plus a linear drift. That is applied whatever
+    measure_echo_drift thinks, because on the scans that need correcting it thinks nothing usable.
+    On cirrhrat_43_1 it refuses both encodings - the series at peak/median 4.19 against the 5.0 it
+    requires - so every one of that file's 240 acquisitions used to be copied through untouched, and
+    the reconstruction of the "corrected" stream came back bit-identical. Worse, the slope it
+    returns there is +0.27 where the drift is +0.1937, so lowering the gate would have applied a
+    correction that lands the echo outside the window the sequence samples.
+
+    The search still runs and its verdict is still printed beside what was applied: an operator
+    correcting a scan wants to see what the data said next to what was used. It no longer decides
+    whether anything is written. `measured` puts it back in charge, gate and all.
     Args:
         - input_path: a converted .mrd2
         - output_path: where the corrected stream goes
+        - slope: drift to remove, in samples per switch; 0 applies the constant alone
+        - lead: how far past the ramp the constant puts the first echo
+        - measured: use measure_echo_drift's slope and its acceptance gates instead
     Returns:
         - True when a stream was written
     """
@@ -1214,24 +1301,67 @@ def correct_stream(input_path: Path, output_path: Path) -> bool:
     for acq in acqs:
         groups.setdefault(acq.head.encoding_space_ref or 0, []).append(acq)
 
+    corrected = 0
     for ref, group in sorted(groups.items()):
         total = group[0].samples() // nswitch
         cube = acquisition_cube(group, nswitch, total)
         drift = measure_echo_drift(cube, nswitch, total)
-        shifts = switch_shifts(nswitch, total, drift['slope'])
 
         print(f"\nencoding {ref}: {len(group)} acquisitions, {nswitch} switches of {total} "
               f"samples, {drift['reps']} repetitions pooled")
-        print(f"  {'drift' if drift['usable'] else 'no usable drift'}: {drift['reason']}")
-        print(f"  best slope {drift['slope']:+.4f} samples per switch, a switch period of "
+        print(f"  the search finds {'a usable drift' if drift['usable'] else 'no usable drift'}: "
+              f"{drift['reason']}")
+        print(f"  its best slope is {drift['slope']:+.4f} samples per switch, a switch period of "
               f"{drift['period']:.2f} where nsamples/{nswitch} records {total}")
-        if not drift['usable']:
-            print("  left uncorrected")
+
+        if measured:
+            if not drift['usable']:
+                print("  --measured given and the search refused it, so this group is left alone")
+                continue
+            shifts = switch_shifts(nswitch, total, drift['slope'])
+            print(f"  applying the measured slope: shifts {shifts.min():+d} to {shifts.max():+d} "
+                  f"samples, peak/median {drift['base_snr']:.2f} -> {drift['snr']:.2f}")
+        elif all(a.head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT for a in group):
+            # check_peak_position walks rawdata_file_list and leaves the averaged prescan out, and
+            # the constant it hard-codes is tuned to the series' window: on cirrhrat the series
+            # keeps 12 points of a 28 point switch and the prescan keeps 18 of 34, so the same
+            # int(ramp)+3 that lands the series echo on 10, its window middle, puts the prescan's
+            # on 16 against a middle of 13. A prescan only ever contributes phantom_scaling, which
+            # mrd2recon records rather than applies, so leaving it where it was acquired costs
+            # nothing and moving it by a constant meant for another matrix does not
+            print(f"  encoding {ref} is the averaged prescan, on its own window: left alone, since "
+                  f"the constant is derived for the series' window")
             continue
-        print(f"  shifts {shifts.min():+d} to {shifts.max():+d} samples, "
-              f"peak/median {drift['base_snr']:.2f} -> {drift['snr']:.2f}")
+        else:
+            ramp = stream_ramp_samples(header, group[0])
+            if ramp is None:
+                print(f"  encoding {ref} records no tramp_us or no sample time, so the constant "
+                      f"cannot be derived and this group is left alone", file=sys.stderr)
+                continue
+            shifts = hardcoded_switch_shifts(nswitch, ramp, slope, lead)
+            print(f"  applying {slope:+.4f} per switch on a constant of int({ramp:g})+{lead}"
+                  f"={int(ramp) + lead}: switch 0 moves {int(shifts[0]):+d} and switch "
+                  f"{nswitch - 1} moves {int(shifts[-1]):+d}, against "
+                  f"{group[0].head.discard_pre or 0} discarded ramp points before the window")
+        # a roll is cyclic within the switch, so a shift bigger than the discarded ramp fills the
+        # readout window with ramp points: the samples it brings in from the far end of the switch
+        # are the rephasing ramp, not signal. Measured on cirrhrat_43_1, where the shifts run +7 to
+        # -6 against 4 discarded points, only 5 of 64 switches keep a window made entirely of
+        # plateau samples, the mean is 8.6 of 12, and the ends of the train are under half - which
+        # is why that correction widens the fitted lines instead of narrowing them
+        discard = group[0].head.discard_pre or 0
+        reach = int(np.abs(shifts).max())
+        if reach > discard:
+            print(f"WARNING encoding {ref} rolls by up to {reach} samples where only {discard} ramp "
+                  f"points are discarded, so the readout window takes in {reach - discard} sample(s) "
+                  f"of ramp at the ends of the train. The echo is moved, but onto data that was "
+                  f"never sampled on the gradient plateau", file=sys.stderr)
         for acq in group:
             roll_acquisition(acq, shifts, nswitch, total)
+        corrected += 1
+
+    if not corrected:
+        print("no group was corrected, so the output is a copy of the input", file=sys.stderr)
 
     with mrd.BinaryMrdWriter(str(output_path)) as writer:
         writer.write_header(header)
@@ -1253,6 +1383,16 @@ def main() -> int:
     parser.add_argument("-o", "--output", type=Path,
                         help="where to write the corrected stream "
                              "(default: <input>_corrected.mrd2 beside the input)")
+    parser.add_argument("--slope", type=float, default=HARDCODED_SLOPE,
+                        help=f"drift to remove, in samples per switch. Default "
+                             f"{HARDCODED_SLOPE}, the slope check_peak_position's table encodes; "
+                             f"0 applies the constant alone")
+    parser.add_argument("--lead", type=int, default=HARDCODED_LEAD,
+                        help=f"how far past the ramp the constant puts the first echo, i.e. the "
+                             f"+N in int(ramp)+N. Default {HARDCODED_LEAD}")
+    parser.add_argument("--measured", action="store_true",
+                        help="use measure_echo_drift's slope and its acceptance gates instead of "
+                             "the constant-plus-slope correction, leaving a group it refuses alone")
     args = parser.parse_args()
 
     if not args.input.is_file():
@@ -1261,7 +1401,8 @@ def main() -> int:
     if output == args.input:
         parser.error("--output would overwrite the input")
 
-    return 0 if correct_stream(args.input, output) else 1
+    return 0 if correct_stream(args.input, output, slope=args.slope, lead=args.lead,
+                               measured=args.measured) else 1
 
 
 if __name__ == "__main__":
