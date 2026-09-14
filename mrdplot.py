@@ -9,10 +9,14 @@ command works on a reconstruction, on a raw conversion, and on the legacy image-
 mrd2recon.py writes its results as NdArrays tagged with a description, which is what picks the
 figure here:
 
-    global_spect / global_spect_fit / lorentzian_*  the fitted spectrum and its peaks
+    metabolite_global_spect / _global_spect_fit / _lorentzian_*   the fitted spectrum and its
+                                                   peaks. Every array the recon writes is
+                                                   named for its encoding, metabolite_ or
+                                                   phantom_, since the series and the prescan
+                                                   are fitted separately into one stream
     metabolite_amplitude, metabolite_area          maps, drawn as a peak x repetition montage
     epsi_image                                     the reconstructed volumes
-    phantom peak area, singular_values, noise      calibration and diagnostics
+    phantom_area, singular_values, noise           calibration and diagnostics
 
 An EPSI reconstruction has one global spectrum and a metabolite map; a single voxel FID series
 has one spectrum per time point and no map, so the two are told apart by what is present rather
@@ -99,7 +103,7 @@ def plot_fitted_spectrum(contents: Contents, filename: str) -> bool:
     This is the figure the fit is judged by: if the model does not sit on the data, or a peak
     center is not on a peak, the metabolite maps below are not worth reading.
     """
-    spectra = contents.arrays.get("global_spect")
+    spectra = contents.arrays.get("metabolite_global_spect")
     if not spectra or len(spectra) > 1:
         return False    # no spectrum, or a time series, which plot_spectral_series draws
 
@@ -114,15 +118,15 @@ def plot_fitted_spectrum(contents: Contents, filename: str) -> bool:
     plt.plot(xscale, np.imag(spect.data), 'g', label='imag')
     plt.plot(xscale, np.abs(spect.data), color='0.7', label='magnitude')
 
-    fit = contents.first("global_spect_fit")
+    fit = contents.first("metabolite_global_spect_fit")
     if fit is not None:
         plt.plot(xscale, np.real(fit.data), 'k', label='fit')
         plt.plot(xscale, np.imag(fit.data), 'k', linestyle='--', label='_nolegend_')
 
-    centers = contents.first("lorentzian_centers_ppm")
+    centers = contents.first("metabolite_lorentzian_centers_ppm")
     if centers is not None:
         names = meta_values(centers, "peak_names")
-        widths = contents.first("lorentzian_widths_ppm")
+        widths = contents.first("metabolite_lorentzian_widths_ppm")
         top = np.max(np.abs(spect.data))
         # peaks can sit close together, so the labels run vertically and alternate height
         for ip, center in enumerate(centers.data):
@@ -155,7 +159,7 @@ def plot_spectral_series(contents: Contents, filename: str) -> bool:
     The stack shows the line shape and the image shows how it evolves, which is what the
     metabolic flux experiment is actually about.
     """
-    spectra = contents.arrays.get("global_spect")
+    spectra = contents.arrays.get("metabolite_global_spect")
     if not spectra or len(spectra) < 2:
         return False
 
@@ -284,13 +288,16 @@ def plot_diagnostics(contents: Contents, filename: str) -> bool:
     """The phantom map and the SVD singular values, when the run produced them."""
     drawn = False
 
-    phantom = contents.first("phantom peak area")
+    phantom = contents.first("phantom_area")
     if phantom is not None:
         maps = np.asarray(phantom.data)
         if maps.ndim == 3:
             maps = maps[np.newaxis, ...]
         fig = plt.figure(figsize=(7, 4))
-        scaling = meta_value(phantom, "phantom_scaling")
+        # the area of the prescan's single peak in its summed spectrum: the number the phantom
+        # exists to provide, which the recon records rather than applies
+        areas = contents.first("phantom_global_peak_areas")
+        scaling = float(np.asarray(areas.data).ravel()[0]) if areas is not None else None
         fig.suptitle(f'phantom peak area (scaling {scaling:.3f}): {filename}'
                      if scaling is not None else f'phantom peak area: {filename}')
         plt.imshow(montage(maps), cmap='gray')

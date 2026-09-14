@@ -154,7 +154,7 @@ class LorentzianFitter:
                    centers_init: np.ndarray,
                    widths_init: np.ndarray,
                    width_bounds: tuple = None,
-                   center_window: float = 0.5) -> PeakParams:
+                   center_window: float | None = 0.5) -> PeakParams:
         """Fit all Lorentzian parameters (centers, widths, phases, amplitudes, baseline).
 
         A center may move by at most center_window from where it was placed and a width is held
@@ -168,7 +168,8 @@ class LorentzianFitter:
             - centers_init: where each peak is thought to be, in ppm
             - widths_init: the width guess each peak starts from, in ppm
             - width_bounds: an absolute (lo, hi) width range in ppm, applied to every peak
-            - center_window: how far a center may move from centers_init, in ppm
+            - center_window: how far a center may move from centers_init, in ppm, or None to
+              leave it unbounded
         """
         npeaks = len(centers_init)
         c0 = np.asarray(centers_init, dtype=float)
@@ -181,7 +182,9 @@ class LorentzianFitter:
 
         bounds = [(None, None)] * (4 * npeaks + 2)
         for j in range(npeaks):
-            bounds[j] = (-center_window, center_window)
+            # None leaves a center free to go anywhere, which is what the legacy did
+            bounds[j] = ((None, None) if center_window is None
+                         else (-center_window, center_window))
             # a width is an absolute value here, so an unbounded optimizer can walk one through
             # zero and the model diverges. The default is the range the arctan parameterization
             # this replaces used to enforce implicitly
