@@ -38,10 +38,11 @@ DRIFT_MIN_GAIN = 1.5
 # echo to sharpen either way is refused rather than acted on
 DRIFT_MIN_SNR = 5.0
 
-# The correction check_peak_position hard-codes, as a slope and a lead. Its 64 entry drift table is
-# rint(0.2097 * switch) to within 1 sample everywhere, mean deviation 0.41, and its constant is
-# int(ramp) + 3. Measured independently, cirrhrat_43_1 drifts +0.1937 per switch, so this default is
-# close to that scan's truth and a long way from the +0.27 the coherent search returns for it
+# The correction check_peak_position hard-codes, as a slope and a lead. Both were tuned by eye
+# against `MRStomrd2.py -w`, which plots the per-switch echo against plot_sample_window's expected
+# position band, so they are calibrated to put the magnitude echo where the sequence says - an
+# objective, and not the same one as spectral SNR. Its 64 entry drift table is rint(0.2097 * switch)
+# to within 1 sample everywhere, and its constant is int(ramp) + 3
 HARDCODED_SLOPE = 0.2097
 HARDCODED_LEAD = 3
 
@@ -683,11 +684,16 @@ def hardcoded_switch_shifts(nswitch: int, ramp_points: float,
     Hence `constant - drift`, running +7 down to -6 across cirrhrat's 64 switches. The sign is the
     easy thing to invert, so: positive moves samples later, and the two stages pull opposite ways.
 
-    The drift was a 64 entry table stepping 0,0,0,1,1,1,2,2,2,3,... up to 13. That table is a
-    straight line: `rint(0.2097 * i)` reproduces every one of its entries to within 1 sample, mean
-    deviation 0.41, so the 3-then-5 stepping is hand rounding rather than structure. Carrying it as
-    a slope is what lets it apply to a readout with a different switch count instead of being
+    The drift was a 64 entry table stepping 0,0,0,1,1,1,2,2,2,3,... up to 13, tuned against the
+    echo position plot `MRStomrd2.py -w` draws. That table is a straight line: `rint(0.2097 * i)`
+    reproduces every one of its entries to within 1 sample, mean deviation 0.41. Carrying it as a
+    slope is what lets it apply to a readout with a different switch count instead of being
     silently wrong there.
+
+    Both numbers are calibrated to place the magnitude echo, which is what that plot shows. That is
+    not the same objective as spectral SNR, and on cirrhrat_43_1 the two disagree - see
+    mrd2recon's --drift-slope, which applies this same correction as a readout window rather than
+    as a roll and does not pay the ramp cost below.
 
     Anchored at switch 0, unlike switch_shifts, which anchors at the middle of the train precisely
     so that it leaves the mean echo position alone. Here the constant is the re-centering, so
@@ -1248,7 +1254,7 @@ def report_windows(named_files: Iterable[Tuple[str, MRSdata]]) -> int:
 
 
 def correct_stream(input_path: Path, output_path: Path, *,
-                   slope: float = HARDCODED_SLOPE,
+                   slope: Optional[float] = None,
                    lead: int = HARDCODED_LEAD,
                    measured: bool = False) -> bool:
     """
@@ -1259,22 +1265,26 @@ def correct_stream(input_path: Path, output_path: Path, *,
     differ. The correction is a property of the gradient timing, so it is worked out once per matrix
     and the same shifts are applied to every acquisition of that group.
 
-    By default the shift is the one check_peak_position hard-codes, as hardcoded_switch_shifts
-    carries it: a constant onto the sampled plateau plus a linear drift. That is applied whatever
-    measure_echo_drift thinks, because on the scans that need correcting it thinks nothing usable.
-    On cirrhrat_43_1 it refuses both encodings - the series at peak/median 4.19 against the 5.0 it
-    requires - so every one of that file's 240 acquisitions used to be copied through untouched, and
-    the reconstruction of the "corrected" stream came back bit-identical. Worse, the slope it
-    returns there is +0.27 where the drift is +0.1937, so lowering the gate would have applied a
-    correction that lands the echo outside the window the sequence samples.
+    Nothing is applied unless asked for, because a roll is the wrong mechanism for this correction
+    and no choice of slope fixes that. Rolling is cyclic within the switch, so a shift larger than
+    the discarded ramp brings the rephasing ramp into the readout window: at the hard-coded
+    +0.2097 on cirrhrat_43_1 only 5 of 64 switches keep a window made entirely of plateau samples,
+    and pooled over all 216 series acquisitions the spectrum loses 29% of its peak/median, 8.96
+    down to 6.38, against simply leaving the data alone. The same constant-plus-slope correction
+    belongs on the readout window instead, where it costs nothing: see mrd2recon's --drift-slope.
 
-    The search still runs and its verdict is still printed beside what was applied: an operator
-    correcting a scan wants to see what the data said next to what was used. It no longer decides
-    whether anything is written. `measured` puts it back in charge, gate and all.
+    What is left here is the roll, on request. `slope` applies hardcoded_switch_shifts at that
+    rate, and `measured` hands the decision back to measure_echo_drift, gate and all - which on
+    the scans that need correcting refuses outright, cirrhrat_43_1's series at peak/median 4.19
+    against the 5.0 it requires, and returns +0.27 where the echo plot says +0.21.
+
+    The search runs and reports whichever mode is in force: an operator correcting a scan wants to
+    see what the data said next to what was used.
     Args:
         - input_path: a converted .mrd2
         - output_path: where the corrected stream goes
-        - slope: drift to remove, in samples per switch; 0 applies the constant alone
+        - slope: drift to remove, in samples per switch. None applies nothing; 0 applies the
+          constant alone
         - lead: how far past the ramp the constant puts the first echo
         - measured: use measure_echo_drift's slope and its acceptance gates instead
     Returns:
@@ -1321,6 +1331,10 @@ def correct_stream(input_path: Path, output_path: Path, *,
             shifts = switch_shifts(nswitch, total, drift['slope'])
             print(f"  applying the measured slope: shifts {shifts.min():+d} to {shifts.max():+d} "
                   f"samples, peak/median {drift['base_snr']:.2f} -> {drift['snr']:.2f}")
+        elif slope is None:
+            print(f"  no --slope given, so encoding {ref} is copied through unrolled. The readout "
+                  f"window is the place for this correction: mrd2recon --drift-slope")
+            continue
         elif all(a.head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT for a in group):
             # check_peak_position walks rawdata_file_list and leaves the averaged prescan out, and
             # the constant it hard-codes is tuned to the series' window: on cirrhrat the series
@@ -1383,10 +1397,12 @@ def main() -> int:
     parser.add_argument("-o", "--output", type=Path,
                         help="where to write the corrected stream "
                              "(default: <input>_corrected.mrd2 beside the input)")
-    parser.add_argument("--slope", type=float, default=HARDCODED_SLOPE,
-                        help=f"drift to remove, in samples per switch. Default "
-                             f"{HARDCODED_SLOPE}, the slope check_peak_position's table encodes; "
-                             f"0 applies the constant alone")
+    parser.add_argument("--slope", type=float, default=None,
+                        help=f"roll the readout to remove this drift, in samples per switch; 0 "
+                             f"applies the constant alone. Omitted, nothing is rolled - a roll is "
+                             f"cyclic within the switch and costs more than it recovers, so prefer "
+                             f"mrd2recon --drift-slope. check_peak_position's table is "
+                             f"{HARDCODED_SLOPE}")
     parser.add_argument("--lead", type=int, default=HARDCODED_LEAD,
                         help=f"how far past the ramp the constant puts the first echo, i.e. the "
                              f"+N in int(ramp)+N. Default {HARDCODED_LEAD}")
