@@ -149,8 +149,7 @@ def append_recon_header(header: mrd.Header, *,
                         fit_dw: float = 0.0,
                         fit_dph: float = 0.0,
                         global_df: float = 0.5,
-                        width_scale: Tuple[float, float] = (0.1, 1.9),
-                        drift_slope: float = 0.0) -> mrd.Header:
+                        width_scale: Tuple[float, float] = (0.1, 1.9)) -> mrd.Header:
     """
     Record the additional parameters required to run on recon on existing header
 
@@ -173,9 +172,6 @@ def append_recon_header(header: mrd.Header, *,
         mrd.UserParameterDoubleType(name="width_bound_lo", value=float(width_scale[0])))
     header.user_parameters.user_parameter_double.append(
         mrd.UserParameterDoubleType(name="width_bound_hi", value=float(width_scale[1])))
-    # so a recon file says which window it was reconstructed at, not just which peaks were fitted
-    header.user_parameters.user_parameter_double.append(
-        mrd.UserParameterDoubleType(name="readout_drift_slope", value=float(drift_slope)))
     for i, name in enumerate(spec.names):
         full = f"{name}_{spec.modifiers[i]}" if spec.modifiers[i] else name
         header.user_parameters.user_parameter_double.append(
@@ -232,32 +228,15 @@ def apply_line_broadening(acq: mrd.Acquisition,
                           *,
                           nswitches: int,
                           totalppswitch: int,
-                          npoints_per_switch: int,
-                          drift_slope: float = 0.0) -> np.ndarray:
+                          npoints_per_switch: int) -> np.ndarray:
     """
-    Read the flat top out of each switch of one readout and apodize it.
+    Reshape channel 0 of one readout into (kept points, switches) and apodize it.
 
     The readout is laid out as (discard_pre, npoints_per_switch, discard_post) repeated once per
-    switch, so cirrhrat_43_1's 1792 samples are 64 switches of 28 points with 12 kept. Only
+    switch, so cirrhrat_43_1's 1280 samples are 64 switches of 20 points with 12 kept. Only
     discard_pre and npoints_per_switch are needed to find that flat top; what follows it is
     whatever is left over, and the layout the caller passes has already been checked against
     every acquisition of the group.
-
-    drift_slope lets the window follow the echo along the switch train, in samples per switch.
-    The switch period is not exactly nsamples/nswitches - cirrhrat_43_1 runs about 28.19 against
-    the 28 it records - so a window pinned at one offset drifts off the echo by the end of the
-    train. Switch i is read from `discard_pre + slope * i` instead of from discard_pre.
-
-    Every switch still yields exactly npoints_per_switch samples, whatever the slope, so the
-    matrix this feeds keeps the same shape for every view: what varies is which samples are kept,
-    never how many. That is what makes this the right place for the correction and a roll of the
-    samples the wrong one - a roll is cyclic within the switch, so once the shift exceeds the
-    discarded ramp it brings the rephasing ramp into the window. Indexing the flat sample axis
-    rather than the reshaped grid reads across the switch boundary instead, which is where the
-    drifting plateau's samples actually are.
-
-    The window is clamped to the readout at both ends, which costs at most the last switch or
-    two: at 0.1937 on cirrhrat_43_1 the final window wants sample 1792.2 of 1792.
 
     The apodization decays along the switch axis, because one spectral point is acquired per
     switch and so tk advances by a whole switch: that axis is the FID time axis. Which is why
@@ -271,13 +250,11 @@ def apply_line_broadening(acq: mrd.Acquisition,
     if samples.shape[0] < nswitches * totalppswitch:
         raise ValueError(f"this readout holds {samples.shape[0]} samples, too few for "
                          f"{nswitches} switches of {totalppswitch} points")
+    # a readout carrying a remainder keeps its whole switches and drops the tail, which is what
+    # the offset arithmetic this replaced did
+    switches = samples[:nswitches * totalppswitch].reshape(nswitches, totalppswitch)
     discard_pre = acq.head.discard_pre or 0
-    # where each switch's flat top starts on the flat sample axis, so a window that runs past the
-    # nominal switch boundary reads the next switch's samples rather than wrapping to its own start
-    starts = np.rint(np.arange(nswitches) * (totalppswitch + drift_slope)
-                     + discard_pre).astype(int)
-    starts = np.clip(starts, 0, samples.shape[0] - npoints_per_switch)
-    flat_top = samples[starts[:, None] + np.arange(npoints_per_switch)[None, :]]
+    flat_top = switches[:, discard_pre:discard_pre + npoints_per_switch]
     tk = np.arange(nswitches) * acq.head.sample_time_ns * totalppswitch / 1.0e+9
     return flat_top.T * np.exp(-tk * line_broadening)
 
@@ -395,11 +372,9 @@ class RepetitionImages:
     A repetition the stream never delivers is left as zeros and is skipped by both fits.
     """
 
-    def __init__(self, header: mrd.Header, first_acq: mrd.Acquisition, line_broadening: float,
-                 drift_slope: float = 0.0):
+    def __init__(self, header: mrd.Header, first_acq: mrd.Acquisition, line_broadening: float):
         self.layout = layout_from_acq(header, first_acq)
         self.line_broadening = line_broadening
-        self.drift_slope = drift_slope
         self._geometry = acq_geometry(first_acq)
         self.images = np.zeros((self.layout.nreps, self.layout.nviews, self.layout.kept,
                                 self.layout.nswitches * FIDPAD), dtype='complex')
@@ -456,8 +431,7 @@ class RepetitionImages:
             acq, self.line_broadening,
             nswitches=self.layout.nswitches,
             totalppswitch=self.layout.totalppswitch,
-            npoints_per_switch=self.layout.kept,
-            drift_slope=self.drift_slope)
+            npoints_per_switch=self.layout.kept)
         self._views_seen.add(view)
 
     def close(self) -> None:
@@ -942,8 +916,7 @@ def reconstruct_mrs(input: BinaryIO,
                     fit_dw: float = 0.0,
                     fit_dph: float = 0.0,
                     global_df: float = 0.5,
-                    width_scale: Tuple[float, float] = (0.1, 1.9),
-                    drift_slope: float = 0.0) -> None:
+                    width_scale: Tuple[float, float] = (0.1, 1.9)) -> None:
     """
     Reconstruct one converted EPSI file
 
@@ -990,8 +963,7 @@ def reconstruct_mrs(input: BinaryIO,
                 acq = item.value
                 is_prescan = bool(acq.head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT)
                 if is_prescan not in groups:
-                    groups[is_prescan] = RepetitionImages(header, acq, line_broadening,
-                                                          drift_slope)
+                    groups[is_prescan] = RepetitionImages(header, acq, line_broadening)
                 groups[is_prescan].add(acq)
                 yield item
 
@@ -1003,8 +975,7 @@ def reconstruct_mrs(input: BinaryIO,
                                          fit_dw=fit_dw,
                                          fit_dph=fit_dph,
                                          global_df=global_df,
-                                         width_scale=width_scale,
-                                         drift_slope=drift_slope)
+                                         width_scale=width_scale)
             writer.write_header(header)
             # the raw acquisitions pass through unchanged, and are accumulated as they go
             writer.write_data(passthrough())
@@ -1046,11 +1017,6 @@ if __name__ == "__main__":
                         help="How far the global fit may move a peak center from its rigid-pattern placement, in ppm. Default 0.5; 0 pins the placement")
     parser.add_argument("--width-bounds", type=float, nargs=2, default=(0.1, 1.9), metavar=("LO", "HI"), required=False,
                         help="Linewidth bounds for both fits, as multiples of the width guess. Default 0.1 1.9")
-    parser.add_argument("--drift-slope", type=float, default=0.0, required=False,
-                        help="How far the readout window follows the echo along the switch train, "
-                             "in samples per switch. Default 0, i.e. the same window in every "
-                             "switch. The switch period is not exactly nsamples/nswitches, so a "
-                             "pinned window drifts off the echo by the end of a long train")
 
     # the peak arguments have to come out before argparse sees them, since a peak's value may be
     # negative and argparse would read that as another option
@@ -1064,8 +1030,7 @@ if __name__ == "__main__":
                         fit_dw=args.fit_dw,
                         fit_dph=args.fit_dph,
                         global_df=args.global_df,
-                        width_scale=tuple(args.width_bounds),
-                        drift_slope=args.drift_slope)
+                        width_scale=tuple(args.width_bounds))
 
     if args.folder and args.input:
         raise ValueError("Cannot specify both --folder (local only) and --input")
