@@ -77,19 +77,31 @@ PHASE_SEARCH_RANGE = 15
 # spectral zero fill factor; 1 means the spectral axis is exactly one point per echo
 FIDPAD = 1
 
-# The global fit's two constraints, set to what mrd2_recon_to_incorporate.py enforced: centers
-# unbounded (its `bnds` left the center block [None, None]) and widths held to half to one and
-# a half times the width guess.
+# The global fit's two constraints. Both exist because lorn was linearised: main's lorn.py
+# parameterized through arctan, so `c = centers + arctan(x)/pi * wigglefactor` capped a center
+# at +-0.5 ppm and `w = widths * (1 + arctan(x) * 1.8/pi)` held a width to 0.1 to 1.9 times the
+# guess, with no bounds argument passed to minimize at all. lorn_to_incorporate.py replaced both
+# with plain offsets, `c = centers + x0` and `w = x0`, which confines nothing - so
+# mrd2_recon_to_incorporate.py had to supply bounds by hand. It supplied one for the width, at
+# the narrower (0.5, 1.5), and none for the center, and that omission is why a tiny peak can
+# slide onto a strong neighbour and be fitted as a second component of its line: the residual
+# falls while both peaks' maps are ruined. On cirrhrat_43_1, unbounded, centers walked 2.6 to
+# 3.0 ppm off their placement and two peaks ended 0.01 ppm apart.
 #
-# The measured-better alternative is GLOBAL_CENTER_WINDOW_PPM = 0.5 and WIDTH_BOUND_SCALE =
-# (0.1, 1.9), and it is a real difference, not a preference. Unbounded centers let a tiny peak
-# slide onto a strong neighbour and be fitted as a second component of its line, which lowers
-# the residual while ruining both peaks' maps: on a 6 peak kidney series hyd_tm walked 1.2 ppm
-# onto urea and took a third of its amplitude. The narrow width bound makes a peak sit on the
-# bound instead of on its own linewidth; on cirrhrat_43_1 it clamped four of six peaks and cost
-# 0.7 of residual. Flip these two lines to go back. append_recon_header records whichever
-# values a run used, so a recon file says which regime produced it.
-GLOBAL_CENTER_WINDOW_PPM: Optional[float] = 0.5
+# The center window is a (lo, hi) clip on each peak's own width rather than one fixed number,
+# because a center is determined about as well as its line is narrow: on cirrhrat_43_1 the
+# fitted widths run 0.133 to 0.871 ppm, and a single window is either too loose for the sharp
+# peaks or too tight for the broad ones. The clip floors it so a very narrow peak is not pinned
+# to nothing, and caps it so a very broad one cannot wander onto its neighbour.
+#
+# The width bound is absolute, as multiples of the width guess, and (0.1, 1.9) restores what
+# the arctan allowed. At (0.5, 1.5) five of six of this data's true widths fall outside the
+# bound, so the peaks sit on it instead of on their own linewidth.
+#
+# append_recon_header records whichever values a run used, so a recon file says which regime
+# produced it.
+CenterWindow = Optional[Tuple[float, float]]
+GLOBAL_CENTER_WINDOW_PPM: CenterWindow = (0.1, 1.0)
 WIDTH_BOUND_SCALE = (0.1, 1.9)
 
 
@@ -185,7 +197,7 @@ def append_recon_header(header: mrd.Header, *,
                         fit_df: float = 0.0,
                         fit_dw: float = 0.0,
                         fit_dph: float = 0.0,
-                        global_df: Optional[float] = GLOBAL_CENTER_WINDOW_PPM,
+                        global_df: CenterWindow = GLOBAL_CENTER_WINDOW_PPM,
                         width_scale: Tuple[float, float] = WIDTH_BOUND_SCALE) -> mrd.Header:
     """
     Record the additional parameters required to run on recon on existing header
@@ -203,9 +215,15 @@ def append_recon_header(header: mrd.Header, *,
         mrd.UserParameterDoubleType(name="linewidth_window_ppm", value=float(fit_dw)))
     header.user_parameters.user_parameter_double.append(
         mrd.UserParameterDoubleType(name="phase_window_rad", value=float(fit_dph)))
+    # the center window is a clip on each peak's own width, so it takes two numbers; inf for
+    # both says the centers were left unbounded
+    gdf_lo, gdf_hi = ((float("inf"), float("inf")) if global_df is None
+                      else (global_df, global_df) if np.isscalar(global_df)
+                      else (global_df[0], global_df[1]))
     header.user_parameters.user_parameter_double.append(
-        mrd.UserParameterDoubleType(name="global_frequency_window_ppm",
-                                    value=float("inf") if global_df is None else float(global_df)))
+        mrd.UserParameterDoubleType(name="global_frequency_window_lo_ppm", value=float(gdf_lo)))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="global_frequency_window_hi_ppm", value=float(gdf_hi)))
     header.user_parameters.user_parameter_double.append(
         mrd.UserParameterDoubleType(name="width_bound_lo", value=float(width_scale[0])))
     header.user_parameters.user_parameter_double.append(
@@ -460,7 +478,7 @@ def phase_align(volumes: np.ndarray,
 def fit_global_multipeak(global_spect: np.ndarray,
                          xscale: np.ndarray,
                          spec: PeakSpec,
-                         center_window: Optional[float] = GLOBAL_CENTER_WINDOW_PPM,
+                         center_window: CenterWindow = GLOBAL_CENTER_WINDOW_PPM,
                          width_scale: Tuple[float, float] = WIDTH_BOUND_SCALE
                          ) -> Tuple[LorentzianFitter, int, float]:
     """
@@ -561,7 +579,7 @@ def fit_and_emit_peaks(aligned: np.ndarray,
                        fit_dw: float = 0.0,
                        fit_dph: float = 0.0,
                        label: str = "metabolite",
-                       global_df: Optional[float] = GLOBAL_CENTER_WINDOW_PPM,
+                       global_df: CenterWindow = GLOBAL_CENTER_WINDOW_PPM,
                        width_scale: Tuple[float, float] = WIDTH_BOUND_SCALE
                        ) -> Iterable[mrd.StreamItem]:
     """
@@ -663,7 +681,7 @@ def stream_epsi_image(img: np.ndarray,
                       fit_df: float = 0.0,
                       fit_dw: float = 0.0,
                       fit_dph: float = 0.0,
-                      global_df: Optional[float] = GLOBAL_CENTER_WINDOW_PPM,
+                      global_df: CenterWindow = GLOBAL_CENTER_WINDOW_PPM,
                       width_scale: Tuple[float, float] = WIDTH_BOUND_SCALE
                       ) -> Iterable[mrd.StreamItem]:
     """
@@ -734,7 +752,7 @@ def reconstruct_mrs(input: BinaryIO,
                     fit_df: float = 0.0,
                     fit_dw: float = 0.0,
                     fit_dph: float = 0.0,
-                    global_df: Optional[float] = GLOBAL_CENTER_WINDOW_PPM,
+                    global_df: CenterWindow = GLOBAL_CENTER_WINDOW_PPM,
                     width_scale: Tuple[float, float] = WIDTH_BOUND_SCALE) -> None:
     """
     Reconstruct one converted EPSI file.
