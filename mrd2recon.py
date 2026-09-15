@@ -74,8 +74,22 @@ from lorentzian_fitter import LorentzianFitter, candidate_centers, estimate_widt
 NOISE_THRESHOLD_MULTIPLIER = 3.0
 # how far a voxel spectrum may be rolled when aligning it against the reference spectrum
 PHASE_SEARCH_RANGE = 15
-# spectral zero fill factor; 1 means the spectral axis is exactly one point per echo
-FIDPAD = 1
+# Spectral zero fill factor; 1 means the spectral axis is exactly one point per switch.
+#
+# 2 rather than 1 because at 1 the lines are narrower than the grid can represent. On
+# cirrhrat_0_1 the spectral step is 0.261 ppm and four of six fitted widths came back between
+# 0.155 and 0.217 - sub-pixel. The model is A/(1 + i*delta/w), whose magnitude falls off as
+# A*w/delta, so an unresolvably narrow peak becomes a tall spike with a heavy 1/delta tail:
+# urea, 20x the height of anything near it, put 19488 of tail at 5.21 ppm where the whole
+# spectrum reads 37842. Alanine then fitted the residue at 5.77 instead of the 5.2-5.4 its
+# signal actually sits at.
+#
+# Zero filling to 2 halves the step to 0.130 ppm, which those same widths resolve. Alanine
+# moves to 5.37, no width is sub-pixel, nothing clamps, and the fit improves on both channels -
+# on cirrhrat_0_1 real 0.073 -> 0.048 and imag 0.076 -> 0.036. Flooring the width at one
+# spectral step fixes the placement too, but by clamping four of six widths and at a much worse
+# residual, so this is the better of the two.
+FIDPAD = 2
 
 # The global fit's two constraints. Both exist because lorn was linearised: main's lorn.py
 # parameterized through arctan, so `c = centers + arctan(x)/pi * wigglefactor` capped a center
@@ -856,11 +870,20 @@ if __name__ == "__main__":
     parser.add_argument("-dph", "--fit-dph", type=float, default=0.0, required=False, 
                         help="How far a peak phase may move from the global fit during the per-voxel fit, in radians. Default 0, i.e. held at the global fit")
 
+    parser.add_argument("--fidpad", type=int, default=FIDPAD, required=False,
+                        help=f"Spectral zero fill factor. Default {FIDPAD}. At 1 the spectral "
+                             f"step is one point per switch, which on these scans is wider than "
+                             f"the lines, so a peak becomes a sub-pixel spike whose tail "
+                             f"displaces its weaker neighbours")
+
     # the peak arguments have to come out before argparse sees them, since a peak's value may be
     # negative and argparse would read that as another option
     reserved = {option for action in parser._actions for option in action.option_strings}
     spec, remaining = split_peak_args(sys.argv[1:], reserved)
     args = parser.parse_args(remaining)
+
+    # read as a module global by spectral_axis and the buffers, so set it before anything runs
+    FIDPAD = args.fidpad
 
     recon_kwargs = dict(line_broadening=args.line_broadening,
                         spec=spec,
