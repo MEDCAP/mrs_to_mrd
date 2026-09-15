@@ -89,8 +89,8 @@ FIDPAD = 1
 # bound instead of on its own linewidth; on cirrhrat_43_1 it clamped four of six peaks and cost
 # 0.7 of residual. Flip these two lines to go back. append_recon_header records whichever
 # values a run used, so a recon file says which regime produced it.
-GLOBAL_CENTER_WINDOW_PPM: Optional[float] = None
-WIDTH_BOUND_SCALE = (0.5, 1.5)
+GLOBAL_CENTER_WINDOW_PPM: Optional[float] = 0.5
+WIDTH_BOUND_SCALE = (0.1, 1.9)
 
 
 # ---------- peak specification -------------------------------------------

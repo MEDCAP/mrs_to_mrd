@@ -1176,9 +1176,70 @@ def report_windows(named_files: Iterable[Tuple[str, MRSdata]]) -> int:
     return reported
 
 
-def correct_stream(input_path: Path, output_path: Path) -> bool:
+def stream_ramp_samples(header: "mrd.Header", acq: "mrd.Acquisition") -> Optional[float]:
+    """
+    Samples per gradient ramp, read off a converted stream rather than an MRSdata.
+
+    tramp_us is on the header as a user parameter and the dwell is on every acquisition, so both
+    survive the conversion. Left fractional: the kidney sequences run a 2.5 sample ramp and
+    rounding here would move the window half a sample before anything used it.
+    """
+    params = ({q.name: int(q.value) for q in header.user_parameters.user_parameter_long}
+              if header.user_parameters is not None else {})
+    tramp_us = params.get("tramp_us", 0)
+    dwell_us = (acq.head.sample_time_ns or 0) / 1000.0
+    if not tramp_us or not dwell_us:
+        return None
+    return tramp_us / dwell_us
+
+
+def regrid_acquisition(acq: "mrd.Acquisition", nswitch: int, total: int,
+                       slope: float, lead: int = 0) -> None:
+    """
+    Re-base one acquisition's switches onto the period they were really acquired at, in place.
+
+    The switch period is not exactly nsamples/nswitch: cirrhrat_43_1 records 28 and runs about
+    28.19, so by the end of a 64 switch train the readout has slipped some 12 samples. Switch i is
+    taken from `i * (total + slope) + lead` on the flat sample axis and written to `i * total`, the
+    grid the conversion assumed, so a downstream fixed window lands on the plateau again.
+
+    Not a roll. roll_acquisition rotates each switch cyclically within itself, so a shift larger
+    than the discarded ramp brings that switch's own rephasing ramp into the readout window.
+    Reading along the flat axis takes the neighbouring switch's samples instead, which is where the
+    drifting plateau actually sits. The tail is zero filled rather than clamped, because at the end
+    of the train the samples a drifting window asks for run past what was acquired.
+    """
+    data = np.array(acq.data, copy=True)
+    samples = data[0]
+    nsamples = samples.shape[0]
+    used = nswitch * total
+    out = np.zeros_like(samples)
+    out[used:] = samples[used:]
+    for iswitch in range(nswitch):
+        src = int(round(iswitch * (total + slope) + lead))
+        lo, hi = max(src, 0), min(src + total, nsamples)
+        if hi <= lo:
+            continue
+        dst = iswitch * total + (lo - src)
+        out[dst:dst + (hi - lo)] = samples[lo:hi]
+    data[0] = out
+    acq.data = data
+
+
+def correct_stream(input_path: Path, output_path: Path, *,
+                   method: str = "measured",
+                   slope: float = 0.0,
+                   lead: int = 0) -> bool:
     """
     Take the echo drift out of a converted stream and write it back out.
+
+    `method` picks how:
+      - measured : the original path, measure_echo_drift plus a cyclic roll, which leaves a group
+                   alone when the search fails its own acceptance tests
+      - none     : copy through untouched, for a baseline
+      - regrid   : re-base the switch grid at `slope`, plus a constant `lead` offset
+      - roll     : cyclic roll at `slope` with a constant of int(ramp) + `lead`, which is what
+                   check_peak_position plots
 
     The acquisitions are grouped by the encoding they point at, because a file holds more than one
     acquisition matrix - the series and the averaged prescan beside it - and their switch layouts
@@ -1218,20 +1279,54 @@ def correct_stream(input_path: Path, output_path: Path) -> bool:
         total = group[0].samples() // nswitch
         cube = acquisition_cube(group, nswitch, total)
         drift = measure_echo_drift(cube, nswitch, total)
-        shifts = switch_shifts(nswitch, total, drift['slope'])
 
         print(f"\nencoding {ref}: {len(group)} acquisitions, {nswitch} switches of {total} "
               f"samples, {drift['reps']} repetitions pooled")
-        print(f"  {'drift' if drift['usable'] else 'no usable drift'}: {drift['reason']}")
-        print(f"  best slope {drift['slope']:+.4f} samples per switch, a switch period of "
+        print(f"  the search finds {'a usable drift' if drift['usable'] else 'no usable drift'}: "
+              f"{drift['reason']}")
+        print(f"  its best slope is {drift['slope']:+.4f} samples per switch, a switch period of "
               f"{drift['period']:.2f} where nsamples/{nswitch} records {total}")
-        if not drift['usable']:
-            print("  left uncorrected")
+
+        if method == "none":
+            print("  method=none, copied through untouched")
             continue
-        print(f"  shifts {shifts.min():+d} to {shifts.max():+d} samples, "
-              f"peak/median {drift['base_snr']:.2f} -> {drift['snr']:.2f}")
-        for acq in group:
-            roll_acquisition(acq, shifts, nswitch, total)
+        if method == "measured":
+            if not drift['usable']:
+                print("  left uncorrected")
+                continue
+            shifts = switch_shifts(nswitch, total, drift['slope'])
+            print(f"  rolling by the measured slope: {shifts.min():+d} to {shifts.max():+d} "
+                  f"samples, peak/median {drift['base_snr']:.2f} -> {drift['snr']:.2f}")
+            for acq in group:
+                roll_acquisition(acq, shifts, nswitch, total)
+            continue
+        if method == "regrid":
+            print(f"  re-basing onto a {total + slope:.2f} sample period at {slope:+.4f}/switch"
+                  f"{f', lead {lead:+d}' if lead else ''}: the readout slips "
+                  f"{slope * (nswitch - 1):+.1f} samples over the train")
+            for acq in group:
+                regrid_acquisition(acq, nswitch, total, slope, lead)
+            continue
+        if method == "roll":
+            ramp = stream_ramp_samples(header, group[0])
+            if ramp is None:
+                print(f"  encoding {ref} records no tramp_us, so the roll's constant cannot be "
+                      f"derived; left alone", file=sys.stderr)
+                continue
+            constant = int(ramp) + lead
+            shifts = constant - np.rint(slope * np.arange(nswitch)).astype(int)
+            discard = group[0].head.discard_pre or 0
+            print(f"  rolling {slope:+.4f}/switch on a constant of int({ramp:g})+{lead}"
+                  f"={constant}: switch 0 moves {int(shifts[0]):+d}, switch {nswitch - 1} moves "
+                  f"{int(shifts[-1]):+d}, against {discard} discarded ramp points")
+            if int(np.abs(shifts).max()) > discard:
+                print(f"  WARNING rolls up to {int(np.abs(shifts).max())} samples where only "
+                      f"{discard} ramp points are discarded, so the window takes in ramp at the "
+                      f"ends of the train", file=sys.stderr)
+            for acq in group:
+                roll_acquisition(acq, shifts, nswitch, total)
+            continue
+        raise ValueError(f"unknown method {method!r}")
 
     with mrd.BinaryMrdWriter(str(output_path)) as writer:
         writer.write_header(header)
@@ -1253,6 +1348,17 @@ def main() -> int:
     parser.add_argument("-o", "--output", type=Path,
                         help="where to write the corrected stream "
                              "(default: <input>_corrected.mrd2 beside the input)")
+    parser.add_argument("-m", "--method", default="measured",
+                        choices=("measured", "none", "regrid", "roll"),
+                        help="how to correct the echo position. 'measured' is the original "
+                             "measure_echo_drift plus cyclic roll; 'regrid' re-bases the switch "
+                             "grid at --slope; 'roll' is the cyclic roll at --slope with an "
+                             "int(ramp)+--lead constant; 'none' copies through")
+    parser.add_argument("--slope", type=float, default=0.0,
+                        help="drift to remove, in samples per switch, for regrid and roll")
+    parser.add_argument("--lead", type=int, default=0,
+                        help="constant offset in samples: added to the window for regrid, and to "
+                             "int(ramp) for roll")
     args = parser.parse_args()
 
     if not args.input.is_file():
@@ -1261,7 +1367,8 @@ def main() -> int:
     if output == args.input:
         parser.error("--output would overwrite the input")
 
-    return 0 if correct_stream(args.input, output) else 1
+    return 0 if correct_stream(args.input, output, method=args.method,
+                               slope=args.slope, lead=args.lead) else 1
 
 
 if __name__ == "__main__":
