@@ -76,7 +76,7 @@ DRIFT_MAX_RMS = 1.5
 SLOPE_PARAMETER = "echo_drift_slope_applied"
 PAD_PARAMETER = "echo_drift_pad_applied"
 METHOD_PARAMETER = "echo_drift_method"
-METHODS = ("shift", "regrid", "contiguous", "roll", "alloc")
+METHODS = ("shift", "regrid", "contiguous", "roll", "alloc", "none")
 DEFAULT_METHOD = "regrid"
 
 
@@ -567,6 +567,8 @@ def apply_base_and_method(data: np.ndarray, pad: int, offsets: np.ndarray, slope
     figure, which tries every method on a copy and must leave the stream alone.
     """
     padded = prepend_zeros(data, pad) if pad else data
+    if method == "none":
+        return padded       # the pad alone, leaving the drift in
     if method == "regrid":
         return apply_regrid(padded, slope, nswitch, total)
     if method == "roll":
@@ -707,68 +709,78 @@ def plot_method_matrix(panels: Sequence[Tuple[str, np.ndarray]], lines: dict, ns
 
 def check_peak_position(group) -> int:
     """
-    Plot where the two echoes sit in each switch, one figure per raw .MRD of one scan.
+    Plot where the two echoes sit in each switch, one figure for the whole series of one scan.
 
-    The same two-line fit the stream side uses, read off the files before conversion.  One figure per
-    file and never pooled, because pooling is what hides a file whose echo sits somewhere the others'
-    does not; the repetitions inside one file are aggregated for the opposite reason, since one
-    repetition of one view is mostly noise.
+    The same two-line fit the stream side uses, read off the files before conversion.  Every
+    repetition is summed into the one figure whichever way the series arrived, one file per
+    repetition or one file holding them all, since one repetition of one view is mostly noise.
     Args:
         - group: a ScanGroup from MRSorganize; only its real data is read
     Returns:
-        - how many files were plotted
+        - 1 when the figure was drawn, 0 when nothing could be
     """
     # imported here so conversion needs neither the reader nor a plotting stack
     import matplotlib.pyplot as plt
     from MRSreader import MRSdata
 
-    plotted = 0
+    aggregated = None
+    nfiles = nrep = 0
     for filepath in group.rawdata_file_list:
         mrs = MRSdata()
         mrs.read_from_file(filepath)
-        nswitch = max(mrs.nswitches, 1)
-        if nswitch <= 1 or mrs.rawdata is None or mrs.rawdata.size == 0:
+        if mrs.nswitches <= 1 or mrs.rawdata is None or mrs.rawdata.size == 0:
             print(f"Skipping {filepath}: no EPSI readout to find echoes in", file=sys.stderr)
             continue
-        total = mrs.nsamples // nswitch
-        kept = mrs.npoints_per_switch or total
-        ramp = int(mrs.tramp // (mrs.sample_period // 10)) if mrs.sample_period else 0
+        if aggregated is None:
+            nswitch = mrs.nswitches
+            nsamples = mrs.nsamples
+            total = nsamples // nswitch
+            kept = mrs.npoints_per_switch or total
+            ramp = int(mrs.tramp // (mrs.sample_period // 10)) if mrs.sample_period else 0
+            aggregated = np.zeros(nsamples)
+        elif (mrs.nswitches, mrs.nsamples) != (nswitch, nsamples):
+            print(f"Skipping {filepath}: {mrs.nswitches} switches of {mrs.nsamples} samples "
+                  f"against the series' {nswitch} of {nsamples}", file=sys.stderr)
+            continue
         # magnitude summed over every axis but the samples one: views, slices, echoes and
         # repetitions are all just repeats of the same readout for finding an echo
-        aggregated = np.abs(mrs.rawdata).sum(axis=tuple(range(1, mrs.rawdata.ndim)))
-        signal = aggregated[:nswitch * total].reshape(nswitch, total)
+        aggregated += np.abs(mrs.rawdata).sum(axis=tuple(range(1, mrs.rawdata.ndim)))
+        nfiles += 1
+        nrep += mrs.nrepetitions
+    if aggregated is None:
+        return 0
+    signal = aggregated[:nswitch * total].reshape(nswitch, total)
 
-        lines = fit_peak_lines(signal)
-        switches = np.arange(nswitch)
-        print(f"\n{filepath}: {nswitch} switches of {total}, {mrs.nrepetitions} repetition(s)",
-              file=sys.stderr)
-        print(f"  slope {lines['slope']:+.4f} per switch, a period of {total + lines['slope']:.4f}; "
-              f"lines at {lines['first_intercept'] % total:.2f} ({lines['on_first']} switches, rms "
-              f"{lines['first_rms']:.2f}) and {lines['second_intercept'] % total:.2f} "
-              f"({lines['on_second']}, rms {lines['second_rms']:.2f})", file=sys.stderr)
+    lines = fit_peak_lines(signal)
+    switches = np.arange(nswitch)
+    print(f"\n{group.meas_id}: {nswitch} switches of {total}, {nrep} repetition(s) "
+          f"over {nfiles} file(s)", file=sys.stderr)
+    print(f"  slope {lines['slope']:+.4f} per switch, a period of {total + lines['slope']:.4f}; "
+          f"lines at {lines['first_intercept'] % total:.2f} ({lines['on_first']} switches, rms "
+          f"{lines['first_rms']:.2f}) and {lines['second_intercept'] % total:.2f} "
+          f"({lines['on_second']}, rms {lines['second_rms']:.2f})", file=sys.stderr)
 
-        figure, axes = plt.subplots(figsize=(7, 9))
-        axes.imshow(signal, aspect='auto', origin='lower', interpolation='nearest',
-                    extent=(-0.5, total - 0.5, -0.5, nswitch - 0.5))
-        axes.axvspan(ramp - 0.5, ramp + kept - 0.5, color='w', alpha=0.15,
-                     label=f"window {ramp}..{ramp + kept - 1}")
-        axes.plot(lines['peaks'][lines['first_family']], switches[lines['first_family']],
-                  'x', color='C3', ms=6, label=f"first echo ({lines['on_first']})")
-        if not lines['first_family'].all():
-            axes.plot(lines['peaks'][~lines['first_family']], switches[~lines['first_family']],
-                      '+', color='C1', ms=7, label=f"second echo ({lines['on_second']})")
-        for intercept in (lines['first_intercept'], lines['second_intercept']):
-            axes.plot((intercept + lines['slope'] * switches) % total, switches, '.',
-                      color='w', ms=2, alpha=0.7)
-        axes.set_xlabel(f"position within the {total} point switch")
-        axes.set_ylabel("switch")
-        axes.set_title(f"{Path(filepath).name}: {lines['slope']:+.4f} per switch")
-        axes.legend(fontsize=8, loc='upper right')
-        figure.tight_layout()
-        plt.show()
-        plt.close(figure)
-        plotted += 1
-    return plotted
+    figure, axes = plt.subplots(figsize=(7, 9))
+    axes.imshow(signal, aspect='auto', origin='lower', interpolation='nearest',
+                extent=(-0.5, total - 0.5, -0.5, nswitch - 0.5))
+    axes.axvspan(ramp - 0.5, ramp + kept - 0.5, color='w', alpha=0.15,
+                 label=f"window {ramp}..{ramp + kept - 1}")
+    axes.plot(lines['peaks'][lines['first_family']], switches[lines['first_family']],
+              'x', color='C3', ms=6, label=f"first echo ({lines['on_first']})")
+    if not lines['first_family'].all():
+        axes.plot(lines['peaks'][~lines['first_family']], switches[~lines['first_family']],
+                  '+', color='C1', ms=7, label=f"second echo ({lines['on_second']})")
+    for intercept in (lines['first_intercept'], lines['second_intercept']):
+        axes.plot((intercept + lines['slope'] * switches) % total, switches, '.',
+                  color='w', ms=2, alpha=0.7)
+    axes.set_xlabel(f"position within the {total} point switch")
+    axes.set_ylabel("switch")
+    axes.set_title(f"{group.meas_id}, {nrep} repetitions: {lines['slope']:+.4f} per switch")
+    axes.legend(fontsize=8, loc='upper right')
+    figure.tight_layout()
+    plt.show()
+    plt.close(figure)
+    return 1
 
 
 # ---------- driver ----------------------------------------------------------------------------
@@ -804,7 +816,7 @@ def correct_stream(input_path: str, output_path: Optional[str], method: str = DE
               file=sys.stderr)
         if output_path:
             write_stream(output_path, header, items)
-        return 0
+        return 1
     if (header_long(header, "nswitches") or 1) <= 1:
         print(f"{input_path} records no switch train, so there is no drift to take out",
               file=sys.stderr)
@@ -846,7 +858,7 @@ def correct_stream(input_path: str, output_path: Optional[str], method: str = DE
           f"{start + 3:+d} of ramp+3"
           + (f"; --pad {applied_pad:+d} overrides it" if pad is not None else ""), file=sys.stderr)
 
-    applied = drift['slope'] if drift['usable'] else 0.0
+    applied = drift['slope'] if drift['usable'] and method != "none" else 0.0
     already = header_double(header, SLOPE_PARAMETER)
     corrected_signal = raw_signal
     if not drift['usable'] and not applied_pad:
@@ -884,7 +896,7 @@ def correct_stream(input_path: str, output_path: Optional[str], method: str = DE
                 own_cube, _ = acquisition_cube(group, n, t)
                 own_signal = np.abs(own_cube).sum(axis=(2, 3))
                 own = measure_drift(own_cube, n, t)
-                scaled = own['slope'] if own['usable'] else 0.0
+                scaled = own['slope'] if own['usable'] and method != "none" else 0.0
                 # the pad needs `start + kept // 2`, which means nothing when the layout's own
                 # numbers do not account for its switch
                 pad_here = (measure_pad(readout_anchor(own['lines'], own_signal, t), t, s, k)

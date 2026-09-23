@@ -1,3 +1,7 @@
+# todo
+- verify recon and lorn fit from main is inherited into add-ndarray branch
+- verify other methods of 
+
 # EPSI echo drift correction
 
 `mrd2shift.py` is the middle stage of the pipeline:
