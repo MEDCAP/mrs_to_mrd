@@ -2,6 +2,15 @@
 - verify recon and lorn fit from main is inherited into add-ndarray branch
 - verify other methods of 
 
+# Setup
+
+    git clone --recurse-submodules <this repo>     # or, in an existing clone: git submodule update --init
+    pip install -r requirements.txt
+
+`requirements.txt` installs `mrd` from the MEDCAP mrd-fork at the same `dev` commit the `mrd-fork`
+submodule points to, so the environment needs nothing from the submodule checkout itself; the
+submodule is there to read and edit the fork's source.
+
 # EPSI echo drift correction
 
 `mrd2shift.py` is the middle stage of the pipeline:
