@@ -31,15 +31,16 @@ THE CORRECTION.  On top of that base, each switch i is displaced by delta_i = -s
 switch 0 so the train is pulled back onto the position the base put switch 0 at.  Where that
 displacement is applied is the whole question, and --method selects it:
 
-    regrid      exact, resampling the whole readout onto the period it was acquired at (default)
-    contiguous  exact, over the whole switch, along the contiguous readout rather than wrapping
-    shift       exact, over the whole switch, cyclically
+    contiguous  exact, over the whole switch, along the contiguous readout rather than wrapping (default)
     roll        the fractional part rounded away, over the contiguous readout      (control)
     alloc       the fractional part linearly interpolated, over the contiguous readout (control)
 
 A `phase` method, a phase ramp applied inside the reconstruction's window alone, was dropped: it
 leaves the readout where it was by construction, so it cannot straighten the echo, and measured on
 cirrhrat_43_1 it made the global fit worse than no correction at all (residual 1.648 against 1.284).
+`regrid`, resampling onto the period `total + slope`, was dropped as the same operation as
+contiguous under the switch-0 anchor; `shift`, the Fourier shift theorem cyclic within each switch,
+was dropped for contiguous, which reads the real neighbouring switch instead of wrapping.
 
     python mrd2shift.py -i raw.mrd2 -o straight.mrd2
     cat raw.mrd2 | python mrd2shift.py -i - -o - | ...
@@ -76,8 +77,8 @@ DRIFT_MAX_RMS = 1.5
 SLOPE_PARAMETER = "echo_drift_slope_applied"
 PAD_PARAMETER = "echo_drift_pad_applied"
 METHOD_PARAMETER = "echo_drift_method"
-METHODS = ("shift", "regrid", "contiguous", "roll", "alloc", "none")
-DEFAULT_METHOD = "regrid"
+METHODS = ("contiguous", "roll", "alloc", "none")
+DEFAULT_METHOD = "contiguous"
 
 
 # ---------- the stream ------------------------------------------------------------------------
@@ -301,10 +302,8 @@ def switch_offsets(nswitch: int, slope: float) -> np.ndarray:
     drift - six samples of a twelve point window on cirrhrat - past where the pad aimed it.
 
     The cost is that the largest displacement now falls at the end of the train, slope * (M-1)
-    rather than half that.  `shift` is the only method that still wraps inside a switch, so it is the
-    only one for which that means more of the switch's own ramp pulled into the window at the far
-    end; contiguous, regrid, roll and alloc all read from the neighbouring switch instead and do not
-    pay it.  Which is a difference -p is there to show.
+    rather than half that.  Every method reads from the neighbouring switch rather than wrapping, so
+    none of them pays for it by pulling the switch's own ramp into the window at the far end.
     """
     return -slope * np.arange(nswitch)
 
@@ -395,48 +394,15 @@ def prepend_zeros(data: np.ndarray, pad: int) -> np.ndarray:
     return out
 
 
-def _phase_shift(block: np.ndarray, offset: float, axis: int = 0) -> np.ndarray:
-    """One exact cyclic displacement by the shift theorem, along `axis`."""
-    n = block.shape[axis]
-    kernel = np.fft.fftfreq(n) * n
-    shape = [1] * block.ndim
-    shape[axis] = n
-    spectrum = np.fft.fft(block, axis=axis)
-    return np.fft.ifft(spectrum * np.exp(-2j * np.pi * kernel.reshape(shape) * offset / n),
-                       axis=axis)
-
-
-def apply_switch(data: np.ndarray, offsets: np.ndarray, nswitch: int, total: int) -> np.ndarray:
-    """
-    Displace each switch over the whole switch, exactly, so the window ends up holding different
-    samples.
-
-    That is what re-centres the k-space line on the echo and fixes the asymmetric truncation which
-    broadens the spatial point spread - it sharpens the metabolite map, where a phase confined to the
-    window cannot.  Cyclic: what a switch's own displacement pulls in at the end furthest from the
-    anchor is that switch's own ramp and rephasing points, not a real neighbour, and the weight this
-    implicitly puts on them never reaches zero the way a truncated sinc does - see _phase_shift's
-    impulse response.  `roll` and `alloc` both read the real neighbour instead; see apply_roll and
-    apply_alloc.
-    """
-    used = nswitch * total
-    out = np.array(data, copy=True).astype(np.complex128)
-    body = out[:, :used].reshape(out.shape[0], nswitch, total)
-    for i, offset in enumerate(offsets):
-        body[:, i, :] = _phase_shift(body[:, i, :], float(offset), axis=1)
-    out[:, :used] = body.reshape(out.shape[0], used)
-    return out
-
-
 def apply_roll(data: np.ndarray, offsets: np.ndarray, nswitch: int, total: int) -> np.ndarray:
     """
     Displace each switch by the nearest whole sample, read from the real contiguous readout.
 
-    `roll` throws away the same fractional part `shift` corrects for - the question it exists to
+    `roll` throws away the fractional part `contiguous` interpolates - the question it exists to
     answer is what that fraction is worth - but there is no reason to also throw away where the
-    whole-sample part of the shift points.  `np.roll` wraps within one switch, so what fills the far
-    end of a large displacement is that switch's own ramp and rephasing samples: junk, standing in
-    for a real neighbour that the readout actually has.  This reads that neighbour instead, at
+    whole-sample part of the displacement points.  `np.roll` wraps within one switch, so what fills
+    the far end of a large displacement is that switch's own ramp and rephasing samples: junk,
+    standing in for a real neighbour that the readout actually has.  This reads that neighbour instead, at
     whatever integer position `switch_offsets` rounds to, over the same contiguous coordinate
     `apply_contiguous` uses - it differs from it only in reading one real sample per position rather
     than interpolating sixteen.
@@ -459,14 +425,14 @@ def apply_alloc(data: np.ndarray, offsets: np.ndarray, nswitch: int, total: int)
     """
     Displace each switch by a linear blend of its two nearest real neighbours.
 
-    The two-tap answer to what roll and shift answer more crudely and more precisely: split the
+    The two-tap answer to what roll and contiguous answer more crudely and more precisely: split the
     fractional part of the displacement between the two samples straddling the source position, in
     proportion to how close each one is - a source of 1142.748 reads mostly the sample at 1143
     (weight 0.748, since it is only 0.252 away) and a little of 1142 (weight 0.252).  Read from the
     contiguous readout, over the same source coordinate apply_contiguous and apply_roll use, so a
     large displacement pulls in a real neighbouring switch rather than wrapping - unlike the cyclic
-    two-tap blend this replaces, which shaded the field of view instead of blurring it for the same
-    reason `shift` and `roll` used to wrap: the two taps came from within the same switch.
+    two-tap blend this replaces, which shaded the field of view instead of blurring it because its
+    two taps came from within the same switch.
     """
     used = nswitch * total
     source = (np.arange(used, dtype=float).reshape(nswitch, total)
@@ -507,42 +473,20 @@ def resample(line: np.ndarray, source: np.ndarray, half_width: int = 8) -> np.nd
     return out
 
 
-def apply_regrid(data: np.ndarray, slope: float, nswitch: int, total: int,
-                 lead: float = 0.0) -> np.ndarray:
-    """
-    Resample the whole readout onto the period it was really acquired at.
-
-    The other methods displace each switch; this re-grids once.  The defect is that the stream is
-    divided by `total` where the gradient period is `total + slope`, so switch i of the real sequence
-    begins at sample `i*(total + slope)` rather than `i*total`.  Reading there and writing to `i*total`
-    puts every switch back on the grid the reconstruction assumes, with no per-switch discontinuity
-    at the boundaries and nothing wrapped.
-
-    Anchored on switch 0, like switch_offsets and for the same reason: reading switch i straight from
-    `i * (total + slope)` leaves every echo at the within-period offset switch 0 already had, which
-    is the position the zero-pad base has put where the sequence asks for it.  `lead` moves that
-    grid, and the base having already placed the readout there, it is left at zero.
-    """
-    used = nswitch * total
-    out = np.array(data, copy=True).astype(np.complex128)
-    position = np.arange(total, dtype=float)
-    source = np.concatenate([i * (total + slope) + position + lead
-                             for i in range(nswitch)])
-    out[:, :used] = resample(out[:, :used], source)
-    return out
-
-
 def apply_contiguous(data: np.ndarray, offsets: np.ndarray, nswitch: int, total: int,
                      half_width: int = 8) -> np.ndarray:
     """
     Displace each switch along the contiguous readout instead of wrapping inside it.
 
-    `shift` is cyclic within a switch, so the samples it pulls in at the ends of the train - where
-    the displacement is largest - are that switch's own ramp and rephasing points.  Those are junk,
-    and burying the weak metabolites under them is what costs the whole-switch family its hydrate.
-    The readout is one continuous time series, so the samples that really sit beside the window are
+    A displacement cyclic within a switch pulls in, at the ends of the train where it is largest,
+    that switch's own ramp and rephasing points.  Those are junk, and burying the weak metabolites
+    under them costs the hydrate.  The readout is one continuous time series, so the samples that
+    really sit beside the window are
     the neighbouring switch's, and this takes those: band-limited interpolation with a windowed sinc
     over the contiguous readout, zero only at the two physical ends where there is no neighbour.
+
+    With the switch-0 anchor the source `i*total + p + slope*i` is `i*(total + slope) + p`, so this
+    is also the resampling onto the period the switches were really acquired at.
     Args:
         - half_width: taps either side; 8 puts the sinc truncation well below the noise
     """
@@ -554,7 +498,7 @@ def apply_contiguous(data: np.ndarray, offsets: np.ndarray, nswitch: int, total:
     return out
 
 
-def apply_base_and_method(data: np.ndarray, pad: int, offsets: np.ndarray, slope: float,
+def apply_base_and_method(data: np.ndarray, pad: int, offsets: np.ndarray,
                           nswitch: int, total: int, method: str) -> np.ndarray:
     """
     The zero-pad base and then one drift method, in that order, over one readout.
@@ -569,15 +513,11 @@ def apply_base_and_method(data: np.ndarray, pad: int, offsets: np.ndarray, slope
     padded = prepend_zeros(data, pad) if pad else data
     if method == "none":
         return padded       # the pad alone, leaving the drift in
-    if method == "regrid":
-        return apply_regrid(padded, slope, nswitch, total)
     if method == "roll":
         return apply_roll(padded, offsets, nswitch, total)
     if method == "alloc":
         return apply_alloc(padded, offsets, nswitch, total)
-    if method == "contiguous":
-        return apply_contiguous(padded, offsets, nswitch, total)
-    return apply_switch(padded, offsets, nswitch, total)
+    return apply_contiguous(padded, offsets, nswitch, total)
 
 
 def record(header: mrd.Header, slope: float, pad: int, method: str) -> None:
@@ -914,7 +854,7 @@ def correct_stream(input_path: str, output_path: Optional[str], method: str = DE
             offsets = switch_offsets(n, scaled)
             for acq in group:
                 data = np.asarray(acq.data)
-                moved = apply_base_and_method(data, pad_here, offsets, scaled, n, t, method)
+                moved = apply_base_and_method(data, pad_here, offsets, n, t, method)
                 acq.data = moved.astype(data.dtype)
                 if drop_first:
                     # the first FID point is the integral of the spectrum, which a sum of
@@ -958,7 +898,7 @@ def correct_stream(input_path: str, output_path: Optional[str], method: str = DE
             panels.append((name, pooled_signal(
                 raw_lines, nswitch, total,
                 lambda line, m=name: apply_base_and_method(
-                    line, applied_pad, offsets, applied, nswitch, total, m))))
+                    line, applied_pad, offsets, nswitch, total, m))))
         plot_method_matrix(panels, drift['lines'], nswitch, total, start, kept,
                            f"{Path(input_path).name}: {drift['slope']:+.4f} per switch, "
                            f"base {applied_pad:+d}", Path(plot))

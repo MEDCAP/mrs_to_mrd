@@ -85,7 +85,7 @@ the neighbouring switch do not.
 happens to travel in the same file — and the scaling the reconstruction takes from it has to mean the
 same thing before and after a correction. Left alone, cirrhrat's phantom scaling reads 625.678
 whatever `--method` ran. Corrected along with the series it read 599.589 under `phase`, 494.786 under
-`regrid` and 284.540 under `alloc`: a calibration drifting with the thing it is supposed to calibrate,
+`contiguous` and 284.540 under `alloc`: a calibration drifting with the thing it is supposed to calibrate,
 and under `alloc` less than half its true value.
 
 The prescan is also the case that shows why the series' numbers cannot simply be scaled onto another
@@ -110,68 +110,46 @@ that measurement is unusable. Being left alone is the better failure.
 
 ## The methods
 
-### `regrid` — resample onto the period actually acquired
-
-The other methods displace each switch. This one re-grids the whole readout once.
-
-The defect is that the stream is divided by `total` where the gradient period is `total + slope`, so
-switch *i* of the real sequence begins at sample `i·(total + slope)`, not `i·total`. `regrid` reads
-there and writes to `i·total`:
-
-    source[i, p] = i · (total + slope) + p        for p in 0 .. total-1
-    output[i, p] = resample(readout, source[i, p])
-
-Every switch lands back on the grid the reconstruction assumes. Because the source positions are
-fractional, the read is done by `resample`: a 16-tap Lanczos-windowed sinc (`half_width = 8`), which
-is band-limited interpolation rather than rounding. A readout is one continuous time series, so a sample
-between two of its points is genuinely recoverable that way; the window keeps truncating the kernel
-from ringing, and anything outside the readout reads as zero, since at the two physical ends there is
-no neighbour and zero says "not measured" where clamping would repeat an edge.
-
-Anchored on switch 0 like everything else: reading straight from `i·(total + slope)` leaves every echo
-at the within-period offset switch 0 already had, which the pad has already put on target. `lead`
-would move that grid and is left at zero.
-
-What it buys: no per-switch discontinuity at the boundaries, and nothing wrapped. What it costs: the
-source positions run 0.0 to 1803.2 while the readout holds 1792 samples, so **13 samples at the tail
-of the last switch read as zero**. That is the honest price of reading a longer period out of a fixed
-number of samples.
-
 ### `contiguous` — displace along the contiguous readout
 
-`shift` is cyclic within a switch, so the samples it pulls in at the ends of the train — where the
-displacement is largest — are that switch's own ramp and rephasing points. Those are junk, and
-burying the weak metabolites under them is what costs the wrapping methods their hydrate. The readout
-is one continuous time series, so the samples that really sit beside the window are the neighbouring
-switch's. `contiguous` takes those, through the same `resample`:
+A displacement that is cyclic within a switch pulls in, at the ends of the train where it is largest,
+that switch's own ramp and rephasing points. Those are junk, and burying the weak metabolites under
+them is what cost the wrapping `shift` method its hydrate. The readout is one continuous time series,
+so the samples that really sit beside the window are the neighbouring switch's. `contiguous` takes
+those:
 
     source[i, p] = (i · total + p) - offsets[i]     where offsets[i] = -slope · i
+    output[i, p] = resample(readout, source[i, p])
 
-**With the switch-0 anchor this is the same operation as `regrid`.** Substituting the offsets gives
-`i·total + p + slope·i = i·(total + slope) + p`, which is `regrid`'s source exactly; measured, the two
-agree to 2×10⁻¹³ and produce identical reconstructions down to the phantom scaling (494.786 both).
-They were distinct under the old mid-train anchor, which offset `regrid` by a constant `middle`. Both
-are kept because they are written from different starting points — one from the period, one from the
-per-switch displacement — and either could be the one to generalise later.
+Because the source positions are fractional, the read is done by `resample`: a 16-tap
+Lanczos-windowed sinc (`half_width = 8`), which is band-limited interpolation rather than rounding.
+The window keeps truncating the kernel from ringing, and anything outside the readout reads as zero,
+since at the two physical ends there is no neighbour and zero says "not measured" where clamping would
+repeat an edge. The source runs past the end of the readout on the last switch (0.0 to 1803.2 against
+1792 samples on cirrhrat), so **13 samples at the tail of the last switch read as zero** — the honest
+price of reading a longer period out of a fixed number of samples.
 
-### `shift` — exact, cyclic within the switch
+`docs/shift-methods-weights.pdf` draws the weights `contiguous`, `roll` and `alloc` put on the real
+samples around one fractional source position, on ischemia_187_1.
 
-The displacement applied over the whole switch by the Fourier shift theorem, so it is exact for a
-fractional number of samples. Because it is cyclic, what leaves one end of a switch arrives at the
-other. That is fine while the displacement is small and increasingly wrong towards the end of the
-train, where 12.2 samples of a 28 point switch wrap the switch's own ramp into the window.
+### `regrid` and `shift` — dropped
 
-Moving the whole switch is what re-centres the k-space line on the echo and fixes the asymmetric
-truncation that broadens the spatial point spread — it sharpens the metabolite map, which a phase
-confined to the window cannot.
+`regrid` resampled onto the period actually acquired, `source = i·(total + slope) + p`. With the
+switch-0 anchor that is `contiguous`'s source exactly (`i·total + p + slope·i`); measured, the two
+agreed to 2×10⁻¹³ and produced identical reconstructions, so only one is kept.
 
-### `roll` — `shift` with the fractional part rounded away (control)
+`shift` applied each displacement by the Fourier shift theorem, cyclically within its switch. It was
+exact for the fraction but wrapped the switch's own ramp into the window towards the end of the train,
+where `contiguous` reads the real neighbour; in the results below it lost switch 63 and some hydrate.
+
+### `roll` — the fractional part rounded away (control)
 
 `np.roll` by `round(offset)`. This is the hardcoded stair-step correction (`shift=0` for `i<3`, `1`
-for `i<6`, …) generated from the measured slope instead of written out by hand. It is a control: the
-difference between it and `shift` is what the fractional part is worth.
+for `i<6`, …) generated from the measured slope instead of written out by hand, read from the
+contiguous readout. It is a control: the difference between it and `contiguous` is what the fractional
+part is worth.
 
-### `alloc` — `shift` with the fractional part split between neighbours (control)
+### `alloc` — the fractional part split between neighbours (control)
 
 Linear interpolation between the two neighbouring integer rolls. The two-tap split is a convolution
 along kx and therefore a multiplication across the image, so it does not blur — it shades the readout
@@ -190,6 +168,8 @@ A correction that cannot move the echo has nothing to contribute here.
 
 ## Results on cirrhrat_43_1
 
+Measured before `regrid` and `shift` were dropped; their rows are kept for comparison.
+
 Readout echo position per switch, windowed to 10 ± 6 so the rephasing echo cannot win the argmax:
 
 | | sw0 | sw1 | sw15 | sw30 | sw45 | sw63 | sd |
@@ -203,7 +183,7 @@ Readout echo position per switch, windowed to 10 ± 6 so the rephasing echo cann
 | `alloc` | 9 | 9 | 10 | 10 | 10 | 16 | 1.61 |
 
 The pad puts switch 0 on target and leaves the walk untouched, which is what it is for. `regrid` and
-`contiguous` then hold every switch on 9–10; the wrapping methods hold it until the far end and lose
+`contiguous` (the same operation) then hold every switch on 9–10; the wrapping methods hold it until the far end and lose
 switch 63.
 
 Through a full reconstruction — global fit residual, and each metabolite's area summed over the
@@ -218,13 +198,13 @@ signal-bearing repetitions 1–8:
 | `roll` | 2.660 | 930 | 5635 | 7953 | 1403 | 743 | 1165 |
 | `alloc` | 1.338 | 1021 | 5184 | 7300 | 818 | 2255 | 648 |
 
-`regrid` and `contiguous` give the lowest residual and the largest hydrate. `roll` is the worst of
+`regrid` and `contiguous` (the same operation) give the lowest residual and the largest hydrate. `roll` is the worst of
 all, worse than no correction: rounding the displacement to whole samples costs more than the drift
 it removes, which is the argument for keeping it only as a control.
 
 **One caveat on reading that table.** A lower global-fit residual does not by itself prove a better
 reconstruction — it can also mean a small peak has slid onto a strong neighbour. Here the hydrate
-centre moves from 3.40 ppm before correction to 2.63 ppm after `regrid`, 0.77 ppm towards urea, while
+centre moves from 3.40 ppm before correction to 2.63 ppm after `contiguous`, 0.77 ppm towards urea, while
 urea's own area falls to 0.69× and hydrate's rises to 1.66×. Some of that hydrate gain is real
 recovery and some may be borrowed from urea. Check the peak placement in the fitted-spectrum figures
 before quoting the hydrate number.
@@ -234,7 +214,7 @@ before quoting the hydrate number.
 `docs/` holds every figure referenced here, regenerated by the commands in the next section.
 
 - `echo_position_all_methods.png` — position within a switch across, switch number up, for the raw
-  readout and each of the five methods over the zero-pad base. A drifting echo is a slanted stripe and
+  readout and each method over the zero-pad base. A drifting echo is a slanted stripe and
   a corrected one is vertical. The reconstruction window is shaded and the expected echo position is a
   dotted line. The base is not drawn on its own: it translates the whole picture by `pad` and leaves
   the walk exactly as it was, which the raw panel already shows.
@@ -249,11 +229,11 @@ before quoting the hydrate number.
 - `<method>_recon_phantom_peak_area_scaling_625_678.png` — the prescan map. The scaling is in the
   filename and reads 625.678 for every method, because the prescan is not shifted.
 
-`<method>` is `before`, `shift`, `regrid`, `contiguous`, `roll` or `alloc`.
+`<method>` is `before`, `contiguous`, `roll` or `alloc`; the `shift` and `regrid` figures predate their removal.
 
 ## Usage
 
-    # correct a stream, measuring both numbers off the data (--method regrid is the default)
+    # correct a stream, measuring both numbers off the data (--method contiguous is the default)
     python mrd2shift.py -i raw.mrd2 -o straight.mrd2
 
     # as a pipeline stage; both default to $INPUT_PIPE / $OUTPUT_PIPE
@@ -277,10 +257,10 @@ stage dies on its magic bytes.
 
 To regenerate everything in `docs/` from a converted stream:
 
-    for m in shift regrid contiguous roll alloc; do
+    for m in contiguous roll alloc; do
         python mrd2shift.py -i before.mrd2 -o $m.mrd2 --method $m
     done
-    for m in before shift regrid contiguous roll alloc; do
+    for m in before contiguous roll alloc; do
         python mrd2recon.py -i $m.mrd2 -o ${m}_recon.mrd2 \
             -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
         python mrdplot.py -i ${m}_recon.mrd2 -s docs/

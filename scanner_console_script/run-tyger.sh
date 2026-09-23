@@ -31,8 +31,8 @@ usage() {
 Usage: run-tyger.sh <target_directory> [--method METHOD]... [--no-plot] [-- recon flags...]
 
   <target_directory>  holds one subdirectory per scan; each is tarred and sent up
-  --method METHOD     shift method: shift, regrid, contiguous, roll, alloc.
-                      Repeat to sweep; each method costs a full recon. Default: regrid
+  --method METHOD     shift method: contiguous, roll, alloc.
+                      Repeat to sweep; each method costs a full recon. Default: contiguous
   --no-plot           skip the local mrdplot.py figures
   --dry-run           print the rendered codespecs and exit, without touching the cluster
   -- recon flags      passed to mrd2recon.py, e.g. -pyr_s 9.7 -lac_m 21.8
@@ -60,7 +60,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[ "${#METHODS[@]}" -gt 0 ] || METHODS=(regrid)
+[ "${#METHODS[@]}" -gt 0 ] || METHODS=(contiguous)
 if [ "$DRY_RUN" -eq 0 ]; then
   [ -n "$TARGET_DIR" ] || usage
   [ -d "$TARGET_DIR" ] || die "directory '$TARGET_DIR' does not exist"
@@ -162,7 +162,7 @@ fi
 
 for m in "${METHODS[@]}"; do
   case "$m" in
-    shift|regrid|contiguous|roll|alloc) ;;
+    contiguous|roll|alloc) ;;
     *) die "unknown shift method '$m' (METHODS in mrd2shift.py)" ;;
   esac
   render_spec "${SPEC_DIR}/shift_codespec.yml" --method "$m" > "${WORK_DIR}/shift_${m}.yml"
