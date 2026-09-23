@@ -48,7 +48,7 @@ def kernel_curve(method: str, x: np.ndarray, source: float) -> np.ndarray:
     return np.where(np.abs(d) < HALF, np.sinc(d) * np.sinc(d / HALF), 0.0)
 
 
-def text_page(pdf, title, paragraphs, table=None):
+def text_page(pdf, title, paragraphs):
     fig = plt.figure(figsize=(8.5, 11))
     fig.text(0.08, 0.94, title, fontsize=17, weight="bold", va="top")
     y = 0.89
@@ -60,13 +60,6 @@ def text_page(pdf, title, paragraphs, table=None):
                      family="monospace" if mono else None)
             y -= 0.02
         y -= 0.012
-    if table is not None:
-        ax = fig.add_axes([0.08, 0.04, 0.84, max(0.05, y - 0.07)])
-        ax.axis("off")
-        t = ax.table(cellText=table[1], colLabels=table[0], loc="upper center", cellLoc="right")
-        t.auto_set_font_size(False)
-        t.set_fontsize(8)
-        t.scale(1, 1.25)
     pdf.savefig(fig)
     plt.close(fig)
 
@@ -150,8 +143,8 @@ def main() -> int:
             "    alloc       w = 1-f at floor(source), f at floor+1       2 taps (linear)\n"
             "    contiguous  w(x) = sinc(x) * sinc(x/8),  x = source-n    16 taps (Lanczos-8)",
             "f is the fractional part of source. The weights are real, so the same weights are "
-            "applied to the real and to the imaginary part of the complex signal; the plots show "
-            "both. All three read along the contiguous readout, so a tap past the end of a switch "
+            "applied to the real and to the imaginary part of the complex signal. "
+            "All three read along the contiguous readout, so a tap past the end of a switch "
             "reads the real neighbouring switch rather than wrapping into its own ramp.",
             f"Worked switches: {half_switch} (f = {fracs[half_switch]:.3f}, near one half, where the "
             f"kernels disagree most) and {quarter_switch} (f = {fracs[quarter_switch]:.3f}), both at "
@@ -200,138 +193,6 @@ def main() -> int:
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- page 3: real and imaginary parts, each method's result at the fractional position
-        for i in chosen:
-            s, k, sums = worked[i]
-            lo, hi = int(np.floor(s)) - HALF - 1, int(np.floor(s)) + HALF + 2
-            ints = np.arange(lo, hi + 1)
-            fig, axes = plt.subplots(2, 1, figsize=(11, 8.5), sharex=True)
-            for ax, part, name in ((axes[0], np.real, "real"), (axes[1], np.imag, "imaginary")):
-                ax.axhline(0, color="k", lw=0.5)
-                ax.plot(ints, part(samples[ints]), "-", color="#bbbbbb", lw=1, zorder=1)
-                # each measured sample, ringed by method, ring size by |weight|
-                for m, marker, shift in (("contiguous", "o", 0), ("alloc", "s", 0), ("roll", "D", 0)):
-                    idx, w = k[m]
-                    ax.scatter(idx, part(samples[idx]), s=30 + 400 * np.abs(w), facecolors="none",
-                               edgecolors=COLOURS[m], lw=1.5, marker=marker, label=f"{m} taps",
-                               zorder=2)
-                ax.plot(ints, part(samples[ints]), "o", color="k", ms=3, zorder=3)
-                for m in ("roll", "alloc", "contiguous"):
-                    ax.plot([s], [part(sums[m])], "*", ms=16, color=COLOURS[m], mec="k",
-                            zorder=4, label=f"{m} result {part(sums[m]):+.4g}")
-                ax.axvline(s, color="k", lw=1)
-                for b in range(lo - lo % total, hi + 1, total):
-                    ax.axvline(b - 0.5, color="k", ls=":", lw=0.8)
-                ax.set_ylabel(f"{name} part")
-                ax.legend(fontsize=7, ncol=2, loc="lower left", markerscale=0.7)
-            axes[1].set_xlabel("sample index on the contiguous readout")
-            fig.suptitle(f"Switch {i}, output position {target}: measured samples (black dots), the "
-                         f"taps each method reads (rings, size = |weight|),\nand what each returns "
-                         f"at source = {s:.4f} (stars). Same real weights on both parts.",
-                         fontsize=10)
-            fig.tight_layout(rect=(0, 0, 1, 0.94))
-            pdf.savefig(fig)
-            plt.close(fig)
-
-        # ---- page: the table of taps for the half switch
-        s, k, sums = worked[half_switch]
-        cidx, cw = k["contiguous"]
-        rows = []
-        for n, wc in zip(cidx, cw):
-            wr = 1.0 if n == k["roll"][0][0] else 0.0
-            wa = dict(zip(k["alloc"][0], k["alloc"][1])).get(n, 0.0)
-            v = samples[n]
-            rows.append([str(n), f"{n % total}", f"{wr:.3f}", f"{wa:.3f}", f"{wc:+.4f}",
-                         f"{v.real:+.4g}", f"{v.imag:+.4g}"])
-        for m in ("roll", "alloc", "contiguous"):
-            v = sums[m]
-            rows.append([f"{m} sum", "", "", "", "", f"{v.real:+.4g}", f"{v.imag:+.4g}"])
-        ang = {m: np.degrees(np.angle(sums[m])) for m in sums}
-        text_page(pdf, f"Switch {half_switch}: every tap and the weighted sums", [
-            f"source = {s:.4f}, f = {s % 1:.4f}. Columns: sample index on the contiguous readout, its "
-            "position within its switch, the weight roll, alloc and contiguous put on it, and its "
-            "real and imaginary value. Each sum is Σ w·(re + i·im) and equals the method's output.",
-            "Magnitude / phase of each result:    "
-            + "   ".join(f"{m} {abs(sums[m]):.4g} / {ang[m]:+.1f}°" for m in sums),
-        ], table=(["index", "pos", "roll w", "alloc w", "contiguous w", "real", "imag"], rows))
-
-        # ---- page: across the train
-        frac_err = offsets - np.rint(offsets)
-        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
-        ax = axes[0, 0]
-        ax.plot(-offsets, ".-", color="k", ms=3, label="true displacement  slope·i")
-        ax.plot(-np.rint(offsets), drawstyle="steps-mid", color=COLOURS["roll"], label="roll: round")
-        ax.set_xlabel("switch i")
-        ax.set_ylabel("samples")
-        ax.legend(fontsize=8)
-        ax.set_title("displacement per switch")
-        ax = axes[0, 1]
-        ax.plot(frac_err, ".-", color=COLOURS["roll"], ms=3)
-        for i in chosen:
-            ax.axvline(i, color="k", ls=":", lw=0.8)
-        ax.set_xlabel("switch i")
-        ax.set_ylabel("samples")
-        ax.set_title("roll error: true - rounded, a ±0.5 sawtooth")
-        ax = axes[1, 0]
-        fs = np.linspace(0, 1, 201)
-        for f in (0.0, 0.25, 0.5):
-            xx = np.linspace(-0.5, 0.5, 400)
-            # response of each kernel to frequency x (cycles/sample) at this fraction
-            alloc_r = np.abs((1 - f) + f * np.exp(-2j * np.pi * xx))
-            ax.plot(xx, alloc_r, color=COLOURS["alloc"], alpha=0.4 + f, label=f"alloc f={f}")
-        taps = np.arange(-HALF + 1, HALF + 1)
-        for f in (0.25, 0.5):
-            w = np.sinc(f - taps) * np.sinc((f - taps) / HALF)
-            xx = np.linspace(-0.5, 0.5, 400)
-            ax.plot(xx, np.abs(np.exp(-2j * np.pi * np.outer(xx, taps)) @ w),
-                    color=COLOURS["contiguous"], alpha=0.4 + f, label=f"contiguous f={f}")
-        ax.axhline(1, color=COLOURS["roll"], label="roll: gain 1, but position off by up to ±0.5")
-        ax.set_xlabel("frequency along the readout (cycles/sample)")
-        ax.set_ylabel("|gain|")
-        ax.set_ylim(0, 1.15)
-        ax.legend(fontsize=7)
-        ax.set_title("what each kernel does to the readout's content")
-        axes[1, 1].axis("off")
-        maps = fig.add_gridspec(2, 8)[1, 4:].subgridspec(1, 4, wspace=0.08)
-        for n, m in enumerate(("none", "roll", "alloc", "contiguous")):
-            sig = ms.pooled_signal(lines, nswitch, total, lambda line, m=m: ms.apply_base_and_method(
-                line, pad, offsets, slope, nswitch, total, m))
-            ax = fig.add_subplot(maps[0, n])
-            ax.imshow(sig, aspect="auto", origin="lower", cmap="magma",
-                      extent=(-0.5, total - 0.5, -0.5, nswitch - 0.5))
-            ax.axvspan(start - 0.5, start + kept - 0.5, fc="none", ec="w", ls="--", lw=0.8)
-            ax.set_title(m if m != "none" else "pad only", fontsize=9, color=COLOURS[m])
-            ax.set_xlabel("position", fontsize=8)
-            ax.tick_params(labelsize=7)
-            if n:
-                ax.set_yticklabels([])
-            else:
-                ax.set_ylabel("switch i", fontsize=8)
-        fig.suptitle(f"Across the train: {nswitch} switches, slope {slope:+.4f}", fontsize=11)
-        fig.tight_layout(rect=(0, 0, 1, 0.96))
-        pdf.savefig(fig)
-        plt.close(fig)
-
-        # ---- last page: takeaways
-        text_page(pdf, "What the weights mean", [
-            "roll reads one measured sample, the nearest one. It is exact only when f is 0; elsewhere "
-            "it reads a point up to half a sample from where the echo really is. Its gain is 1 at "
-            "every frequency, so it does not blur, but it leaves a position error that saws between "
-            "-0.5 and +0.5 along the train. The switch index is the spectral axis, so that "
-            "per-switch error lands in the spectrum as a periodic phase error.",
-            "alloc is a two-tap triangle: 1-f on the sample below, f on the sample above. It lands "
-            "on the right position on average, but a straight line between two samples is a "
-            "low-pass filter. At f = 0.5 it simply averages two neighbours and passes nothing at "
-            "the Nyquist frequency. The loss changes with f, so it too varies from switch to switch.",
-            "contiguous is the band-limited answer: a sinc windowed to 16 taps (Lanczos-8). The weights "
-            "alternate in sign and fall off with distance, the negative lobes being what restores "
-            "the high-frequency content the triangle loses. Its gain is flat to near Nyquist at any f, "
-            "so every switch is moved by the right fraction with the same response. Its taps near "
-            "the ends of a switch reach into the real neighbouring switch; only at the two physical "
-            "ends of the readout are they zero.",
-            "All three are the same operation, Σ w_n · x_n at the same fractional source, with a "
-            "different set of weights. That is the whole difference between them.",
-        ])
     print(f"wrote {args.output}")
     return 0
 
