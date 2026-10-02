@@ -1,0 +1,14 @@
+# mrd-fork is a full clone with C++, MATLAB, and generated code. The image installs the library
+# from git instead, so keep it out of the build context
+mrd-fork/
+
+.git/
+.gitmodules
+__pycache__/
+*.pyc
+*.mrd2
+*.mrd
+*.MRD
+*.SPR
+test/
+.DS_Store

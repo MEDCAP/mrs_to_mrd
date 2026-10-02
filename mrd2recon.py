@@ -1,834 +1,927 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from statistics import mode
-import os
-from scipy.optimize import minimize, Bounds
-from scipy.io import savemat
-import sys
-from pathlib import Path
-from typing import BinaryIO, Union
+"""
+Reconstruct a converted EPSI .mrd2 file into lorentzian peak fits and metabolite maps.
+
+EPSI only: anything else raises.
+
+tyger args:
+- python mrd2recon.py
+    - -i
+    - $(INPUT_PIPE)
+    - -o
+    - $(OUTPUT_PIPE)
+
+With --folder, every .mrd2 that is not itself a _recon.mrd2 is reconstructed to
+<name>_recon.mrd2 beside it. With --input, one file is reconstructed to --output.
+
+    python mrd2recon.py -f {directory} {metabolite shift parameters}
+    python mrd2recon.py -i raw.mrd2 -o recon.mrd2 \
+        -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
+
+    _s  source peak, the injected substrate
+    _t  tiny peak, not a candidate for "which peak is the tallest one"
+    _m  a derived metabolite
+
+The fit runs twice: once on the summed spectrum, to settle the relative ppm shift of each
+metabolite, then once per voxel with that line shape. How far a voxel may depart from it is
+given by three windows, all zero by default, which is to say the line shape is pinned and
+only the amplitudes vary:
+
+    -df   how far a peak center may move from the global fit, in ppm
+    -dw   how far a peak width may move from the global fit, in ppm
+    -dph  how far a peak phase may move from the global fit, in radians
+
+The global fit has its own two constraints, GLOBAL_CENTER_WINDOW_PPM and WIDTH_BOUND_SCALE,
+set at the top of this module to what mrd2_recon_to_incorporate.py enforced.
+
+An averaged phantom prescan, flagged IS_NOISE_MEASUREMENT by the converter, is a separate
+encoding with its own matrix and its own spectral axis, so it is assembled into its own buffer
+and fitted on its own. It runs through the same alignment and the same fitter as the series -
+only the noise floor, the peak list and the output names differ - and yields phantom_* arrays
+alongside the metabolite_* ones. Its phantom_global_peak_areas is the single number the
+prescan exists to provide: it is recorded, never applied, because what makes two experiments
+comparable is the consumer's decision.
+
+Everything the reconstruction produces goes to the output stream as mrd NdArrays, not as the
+mrd Image field, and the raw acquisitions are kept in the recon file unchanged.
+
+Where this departs from mrd2_recon_to_incorporate.py, deliberately:
+
+    - the readout geometry is read from each acquisition, not hardcoded at necho=64, nro=12
+    - the first spectral point is kept; the legacy's `if iecho > 0` left it zero, discarding
+      a real FID point
+    - every repetition is fitted; the legacy started at 4, a debug shortcut it kept
+    - phantom voxels are fitted with the line shape pinned, like the series. The legacy fitted
+      them unbounded. phantom_global_peak_areas is unaffected, since it comes from the global
+      fit; only the per-voxel phantom map differs
+    - voxel amplitudes start from the spectrum rather than from zero, which is a starting
+      point rather than a result, but this is not a convex fit
+"""
+
 import argparse
-import re
-from acqtypes import AcqType
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, BinaryIO, Iterable, List, Optional, Sequence, Tuple
 
-# path to mrd python package is 'root/mrd-fork/python' 
-sys.path.insert(0, 'mrd-fork/python')
+import numpy as np
+
 import mrd
-from MRSreader import MRSdata
-from lorn import lornfit, lor1fit, lorneval, lor1eval, lor1plot, lornputspect, lornpackx0, lornunpackx0, \
-        lorngetpeakparams, lornputpeakparams, set_allow_width_adjust
 
-debugphasing = False
-debuglorn = True
-saveLornFitLocal = False
-saveMetaboliteLocal = False
-kfitdata_local = False
-MRSsave_dir = os.environ.get("MRS_SAVE_DIR", "C:/Users/MRS/Desktop")
+from lorentzian_fitter import LorentzianFitter, candidate_centers, estimate_width_fwhm
 
-basedir = '.'
-fidpad = 1
-lb = 42 # Hz
-fit_dw = 0  # 4-parameter Lor fit linewidth window in ppm
-fit_df = 0  # 4-parameter Lor fit frequency window in ppm
-fit_dph = 0 # 4-parameter Lor fit phase window in rad
-experiment_name = ''
+# a voxel spectrum is fitted only if above the estimated noise floor
+NOISE_THRESHOLD_MULTIPLIER = 3.0
+# how far a voxel spectrum may be rolled when aligning it against the reference spectrum
+PHASE_SEARCH_RANGE = 15
+# Spectral zero fill factor; 1 means the spectral axis is exactly one point per switch.
+#
+# 2 rather than 1 because at 1 the lines are narrower than the grid can represent. On
+# cirrhrat_0_1 the spectral step is 0.261 ppm and four of six fitted widths came back between
+# 0.155 and 0.217 - sub-pixel. The model is A/(1 + i*delta/w), whose magnitude falls off as
+# A*w/delta, so an unresolvably narrow peak becomes a tall spike with a heavy 1/delta tail:
+# urea, 20x the height of anything near it, put 19488 of tail at 5.21 ppm where the whole
+# spectrum reads 37842. Alanine then fitted the residue at 5.77 instead of the 5.2-5.4 its
+# signal actually sits at.
+#
+# Zero filling to 2 halves the step to 0.130 ppm, which those same widths resolve. Alanine
+# moves to 5.37, no width is sub-pixel, nothing clamps, and the fit improves on both channels -
+# on cirrhrat_0_1 real 0.073 -> 0.048 and imag 0.076 -> 0.036. Flooring the width at one
+# spectral step fixes the placement too, but by clamping four of six widths and at a much worse
+# residual, so this is the better of the two.
+FIDPAD = 1
 
-def findmrd2files(basedir, targetfiletype):
-    '''
-    Search for raw.mrd2 or targetfiletype in the basedir directory and all its subdirectories
-    '''
-    mrd2list = []
-    if os.path.isfile(basedir):
-        return [basedir]
-    for root, dirnames, filenames in os.walk(basedir):
-        if 'raw.mrd2' in filenames or targetfiletype in filenames:
-            if '*_recon.mrd2' in filenames:
+# The global fit's two constraints. Both exist because lorn was linearised: main's lorn.py
+# parameterized through arctan, so `c = centers + arctan(x)/pi * wigglefactor` capped a center
+# at +-0.5 ppm and `w = widths * (1 + arctan(x) * 1.8/pi)` held a width to 0.1 to 1.9 times the
+# guess, with no bounds argument passed to minimize at all. lorn_to_incorporate.py replaced both
+# with plain offsets, `c = centers + x0` and `w = x0`, which confines nothing - so
+# mrd2_recon_to_incorporate.py had to supply bounds by hand. It supplied one for the width, at
+# the narrower (0.5, 1.5), and none for the center, and that omission is why a tiny peak can
+# slide onto a strong neighbour and be fitted as a second component of its line: the residual
+# falls while both peaks' maps are ruined. On cirrhrat_43_1, unbounded, centers walked 2.6 to
+# 3.0 ppm off their placement and two peaks ended 0.01 ppm apart.
+#
+# The center window is a (lo, hi) clip on each peak's own width rather than one fixed number,
+# because a center is determined about as well as its line is narrow: on cirrhrat_43_1 the
+# fitted widths run 0.133 to 0.871 ppm, and a single window is either too loose for the sharp
+# peaks or too tight for the broad ones. The clip floors it so a very narrow peak is not pinned
+# to nothing, and caps it so a very broad one cannot wander onto its neighbour.
+#
+# The width bound is absolute, as multiples of the width guess, and (0.1, 1.9) restores what
+# the arctan allowed. At (0.5, 1.5) five of six of this data's true widths fall outside the
+# bound, so the peaks sit on it instead of on their own linewidth.
+#
+# append_recon_header records whichever values a run used, so a recon file says which regime
+# produced it.
+CenterWindow = Optional[Tuple[float, float]]
+GLOBAL_CENTER_WINDOW_PPM: CenterWindow = (0.1, 1.0)
+WIDTH_BOUND_SCALE = (0.1, 1.9)
+
+
+# ---------- peak specification -------------------------------------------
+
+
+@dataclass(frozen=True)
+class PeakSpec:
+    """The metabolite peaks to fit, as named on the command line or recorded in a header."""
+    names: List[str]
+    offsets: np.ndarray     # chemical shifts in ppm, same order as names
+    modifiers: List[str]    # the letters after the underscore, same order as names
+
+    def __len__(self) -> int:
+        return len(self.names)
+
+    @property
+    def biggest_idx(self) -> List[int]:
+        """Peaks eligible to be the tallest one in the spectrum, i.e. those without _t."""
+        return [i for i, m in enumerate(self.modifiers) if "t" not in m]
+
+    @property
+    def metabolite_idx(self) -> List[int]:
+        """Peaks marked _m, the ones a kinetic model would treat as products."""
+        return [i for i, m in enumerate(self.modifiers) if "m" in m]
+
+    @property
+    def source_idx(self) -> Optional[int]:
+        """The peak marked _s, the injected substrate, if one was named."""
+        for i, m in enumerate(self.modifiers):
+            if "s" in m:
+                return i
+        return None
+
+
+# A phantom holds one known metabolite, so its spectrum is fitted with a single peak rather
+# than a pattern of offsets. One peak at offset 0 reduces candidate_centers to the argmax of
+# the spectrum, which is where the legacy placed it, and leaves the hypothesis loop exactly one
+# candidate to try - so the phantom fit runs through the same code as the metabolite fit.
+PHANTOM_SPEC = PeakSpec(names=["phantom"], offsets=np.zeros(1), modifiers=[""])
+
+
+def split_peak_args(argv: Sequence[str], reserved) -> Tuple[PeakSpec, List[str]]:
+    """
+    Pull the peak specifications out of argv, leaving the rest for argparse.
+
+    This runs before argparse rather than using parse_known_args, because a peak's value may
+    itself be negative ('-bic_tm -0.4'), which argparse would read as another option.
+    A token is a peak if it starts with '-', is not one of argparse's own options, and is
+    followed by something that parses as a float.
+    Args:
+        - argv: the arguments, without the program name
+        - reserved: the option strings argparse owns, e.g. {'-i', '--input', ...}, which is
+          also what keeps '-dw 0.1' from being read as a peak named 'dw'
+    Returns:
+        - (PeakSpec, the arguments argparse should see)
+    """
+    names: List[str] = []
+    offsets: List[float] = []
+    modifiers: List[str] = []
+    remaining: List[str] = []
+
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token.startswith("-") and token not in reserved and i + 1 < len(argv):
+            try:
+                offset = float(argv[i + 1])
+            except ValueError:
+                remaining.append(token)
+                i += 1
                 continue
-            else:
-                print(f"Found raw.mrd2 file at {os.path.join(root, 'raw.mrd2')}", file=sys.stderr)
-                mrd2list.append(os.path.join(root, 'raw.mrd2'))
-    return(mrd2list)
+            body = token[1:]
+            name, _, mods = body.partition("_")
+            names.append(name)
+            offsets.append(offset)
+            modifiers.append(mods)
+            i += 2
+            continue
+        remaining.append(token)
+        i += 1
 
-def generate_aux_images(imglist):
-    for iimg in range(len(imglist)):
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.COMPLEX)
-        img = mrd.Image(head=imghead, data=np.expand_dims(imglist[iimg], (2, 3, 4)))
-        yield(mrd.StreamItem.ImageUint32(img))
+    spec = PeakSpec(names=names,
+                    offsets=np.asarray(offsets, dtype=float),
+                    modifiers=modifiers)
+    return spec, remaining
 
-def get_clarg(clarg, arg, ty):
-    clargarr = clarg.split(' ')
-    for iarg in range(len(clargarr) - 1):
-        if(clargarr[iarg] == arg): 
-            return(ty(clargarr[iarg + 1]))
 
-def append_auximage(aux_images_list: list, echo_number: int):
-    plt.gcf().canvas.draw()
-    canvas = plt.gcf().canvas
-    width, height = canvas.get_width_height()
-    bmp_buffer = np.frombuffer(canvas.tostring_argb(), dtype=np.uint8)
-    expected = int(width) * int(height) * 4
-    if bmp_buffer.size != expected and hasattr(canvas, "get_renderer"):
-        renderer = canvas.get_renderer()
-        width, height = renderer.width, renderer.height
-        expected = int(width) * int(height) * 4
-    if bmp_buffer.size != expected:
-        pixel_count = bmp_buffer.size // 4
-        height = int(height)
-        width = int(pixel_count // height) if height else int(width)
-    bmp = bmp_buffer.reshape((int(height), int(width), 4))
-    bmp = bmp.astype(np.uint32)
-    # Pack ARGB bytes from canvas.tostring_argb() into a single uint32 per pixel:
-    #   bits 24-31 = A, 16-23 = R, 8-15 = G, 0-7 = B
-    encodedbmp = (bmp[:, :, 0] << 24) | (bmp[:, :, 1] << 16) | (bmp[:, :, 2] << 8) | bmp[:, :, 3]
-    aux_images_list.append(encodedbmp)
 
-def kABfiteval(x):
-    # uses P, t, y
-    # P=peak amplitudes of the source metabolite
-    # t=time points of the acquisitions
-    # y=peak amplitudes of the metabolite to be fitted
-    # x[.01, .03, 1] for initial guess
-    yp = np.zeros(len(y), dtype=np.float64)
-    yp[0] = x[2]
-    # numerically integrate, x[0] is kAB, x[1] is 1/T1, x[2] is the amount of B at the beginning of acquisition
-    for j in range(1, len(t)):
-        dt = t[j] - t[j-1]
-        Pbar = (P[j-1] + P[j]) / 2
-        yp[j] = yp[j-1] * np.exp(-x[1] * dt) + x[0] * Pbar * np.exp(-x[1] * dt / 2)
-    return(yp)
+def append_recon_header(header: mrd.Header, *,
+                        line_broadening: float,
+                        spec: PeakSpec,
+                        fit_df: float = 0.0,
+                        fit_dw: float = 0.0,
+                        fit_dph: float = 0.0,
+                        global_df: CenterWindow = GLOBAL_CENTER_WINDOW_PPM,
+                        width_scale: Tuple[float, float] = WIDTH_BOUND_SCALE) -> mrd.Header:
+    """
+    Record the additional parameters required to run on recon on existing header
 
-def kABfit(x):
-    # x1 = minimize(kABfit, [.01, .03, 1]).x
-    yp = kABfiteval(x)
-    return(np.sum((yp - y)**2))
+    The peak list goes on as one double per peak, named '<name>_<modifiers>', so a downstream
+    consumer can recover which peak each map belongs to.
+    """
+    if header.user_parameters is None:
+        header.user_parameters = mrd.UserParametersType()
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="line_broadening_factor", value=float(line_broadening)))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="frequency_window_ppm", value=float(fit_df)))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="linewidth_window_ppm", value=float(fit_dw)))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="phase_window_rad", value=float(fit_dph)))
+    # the center window is a clip on each peak's own width, so it takes two numbers; inf for
+    # both says the centers were left unbounded
+    gdf_lo, gdf_hi = ((float("inf"), float("inf")) if global_df is None
+                      else (global_df, global_df) if np.isscalar(global_df)
+                      else (global_df[0], global_df[1]))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="global_frequency_window_lo_ppm", value=float(gdf_lo)))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="global_frequency_window_hi_ppm", value=float(gdf_hi)))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="width_bound_lo", value=float(width_scale[0])))
+    header.user_parameters.user_parameter_double.append(
+        mrd.UserParameterDoubleType(name="width_bound_hi", value=float(width_scale[1])))
+    for i, name in enumerate(spec.names):
+        full = f"{name}_{spec.modifiers[i]}" if spec.modifiers[i] else name
+        header.user_parameters.user_parameter_double.append(
+            mrd.UserParameterDoubleType(name=full, value=float(spec.offsets[i])))
+    return header
 
-def generate_epsi_images(h: mrd.Header, metabolite: np.ndarray, peakoffsets: np.ndarray, peaknames: list):
-    # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
-    time_between_images = 3   # approximately 3s between images
-    nmet = metabolite.shape[0]
-    nimg = metabolite.shape[1]
-    measfreq = h.experimental_conditions.h1resonance_frequency_hz
-    fov = np.array([h.encoding[0].encoded_space.field_of_view_mm.x, \
-            h.encoding[0].encoded_space.field_of_view_mm.y, \
-            h.encoding[0].encoded_space.field_of_view_mm.z], dtype=np.float32)
-    pos = h.measurement_information.relative_table_position
-    
-    for ide in range(nimg):
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.MAGNITUDE)
-        if(ide == 0):
-            imghead.flags = mrd.ImageFlags.FIRST_IN_SET
-        elif(ide == nimg - 1):
-            imghead.flags = mrd.ImageFlags.LAST_IN_SET
-        imghead.measurement_uid = ide
-        imghead.measurement_freq = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
-        imghead.measurement_freq_label = np.array(peaknames, dtype=np.dtype(np.object_))
-        imghead.field_of_view = fov
-        imghead.position = np.array([pos.x, pos.y, pos.z], dtype=np.float32)
-        imghead.col_dir = np.zeros((3,), dtype=np.dtype(np.float32))
-        imghead.line_dir = np.zeros((3,), dtype=np.dtype(np.float32))
-        imghead.slice_dir = np.zeros((3,), dtype=np.dtype(np.float32))
-        imghead.patient_table_position = np.zeros((3,), dtype=np.dtype(np.float32))
-        imghead.average = 0
-        imghead.slice = 0    # only one slice
-        imghead.contrast = 0 # not sure what to do with this yet
-        imghead.phase = 0    # or this
-        imghead.repetition = ide
-        imghead.set = 0      # or this
-        imghead.acquisition_time_stamp_ns = ide * time_between_images * 1000000000
-        imghead.physiology_time_stamp_ns = []
-        # imghead.image_type = mrd.ImageType.COMPLEX
-        imghead.image_index = ide
-        imghead.image_series_index = ide
-        imghead.user_int = []
-        imghead.user_float = []
-        # rotate counterclock-wise 90deg and flip leftright
-        # metabolite shape = (freq, meas, rows, cols)
-        # mrd2 image shape = (channels, slices, rows, cols, freqs)
-        imgdata = np.expand_dims(np.moveaxis(metabolite[:, ide, :, :], 0, 2), (0, 1))
-        img = mrd.Image(head=imghead, data=imgdata)
-        yield(mrd.StreamItem.ImageDouble(img))
+# ---------- NdArray emission ---------------------------------------------
 
-def epsi_recon(raw_acquisition_list: list, biggestpeaklist: list, peakoffsets: np.ndarray):
-    global experiment_name
-    auximages = []
-    numimages = sum([a.head.flags & mrd.AcquisitionFlags.LAST_IN_PHASE == \
-            mrd.AcquisitionFlags.LAST_IN_PHASE for a in raw_acquisition_list])
-    ia = 0
-    kspaces = []
-    phantom_kspaces = []
-    for iimg in range(numimages):
-        # check to see if kspace has the right dimensions for this image
-        sampletime = raw_acquisition_list[ia].head.sample_time_ns / 1.0E+9
-        centerfreq = raw_acquisition_list[ia].head.acquisition_center_frequency
-        totalppswitch = int(raw_acquisition_list[ia].data.shape[0] / raw_acquisition_list[ia].head.idx.contrast + 0.1)
-        nro = totalppswitch - raw_acquisition_list[ia].head.discard_pre - raw_acquisition_list[ia].head.discard_post
-        necho = raw_acquisition_list[ia].head.idx.contrast
-        for iap in range(ia + 1, len(raw_acquisition_list)):
-            if(raw_acquisition_list[iap].head.flags & \
-                    mrd.AcquisitionFlags.LAST_IN_PHASE == mrd.AcquisitionFlags.LAST_IN_PHASE):
-                break
-        npe = iap - ia + 1
 
-        ########
-        # method1 discard the first echo=63 echoes
-        kspace = np.zeros((npe, nro, (necho-1) * fidpad), dtype = 'complex')
-        # # method2
-        # kspace = np.zeros((npe, nro, necho * fidpad), dtype = 'complex')
+def meta_values(value: Any) -> List[mrd.ArrayMetaValue]:
+    """Encode a python value as the list of ArrayMetaValue that mrd meta entries hold."""
+    if isinstance(value, str):
+        return [mrd.ArrayMetaValue.String(value)]
+    if isinstance(value, (bool, int, np.integer)):
+        return [mrd.ArrayMetaValue.Int64(int(value))]
+    if isinstance(value, (float, np.floating)):
+        return [mrd.ArrayMetaValue.Float64(float(value))]
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [v for item in value for v in meta_values(item)]
+    raise TypeError(f"cannot encode {type(value)} as array meta")
 
-        if(AcqType(raw_acquisition_list[ia].head.user_int[0]) == AcqType.MRS_EPSI_PHANTOM):
-            phantom_kspaces.append(kspace)
-        elif(AcqType(raw_acquisition_list[ia].head.user_int[0]) == AcqType.MRS_EPSI):
-            kspaces.append(kspace)
-        for ipe in range(npe):
-            a = raw_acquisition_list[ia]
-            # plot raw echo data
-            # plt.figure()
-            # plt.plot(np.abs(a.data))
-            # plt.title(f'a.data shape: {a.data.shape}, ipe: {ipe} iimg: {iimg}')
-            # plt.show()
-            #######
-            # method1
-            for iecho in range(a.head.idx.contrast-1):
-                kspace[ipe, :, iecho] = a.data[(0 + iecho * totalppswitch + a.head.discard_pre):(0 + iecho * totalppswitch + a.head.discard_post + nro), 0]
-                # line broadening
-                tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
-                kspace[ipe, :, iecho] *= np.exp(-tk * lb)
-            ia += 1
-            #######
-            # # method2
-            # for iecho in range(a.head.idx.contrast):
-            #     kspace[ipe, :, 0] = np.concatenate((np.zeros(3), a.data[:9,0]))
-            #     if iecho > 0:
-            #         kspace[ipe, :, iecho] = a.data[(13 + (iecho-1) * totalppswitch + a.head.discard_pre):(13 + (iecho-1) * totalppswitch + a.head.discard_post + nro), 0]
-            #     # line broadening
-            #     tk = iecho * a.head.sample_time_ns * totalppswitch / 1.0E+9
-            #     kspace[ipe, :, iecho] *= np.exp(-tk * lb)
-            # ia += 1
-    print(f'Performing fft', file=sys.stderr)
-    imgs = []
-    phantom_imgsets = []
-    if len(phantom_kspaces) > 0:
-        phantom_recon_array = np.zeros((len(phantom_kspaces), phantom_kspaces[0].shape[0], phantom_kspaces[0].shape[1]))
-        for kspace in phantom_kspaces:
-            img = np.zeros(([1] + list(kspace.shape)), dtype = 'complex')
-            img[0, :] = np.fft.fftshift(np.fft.fftn(kspace))
-            phantom_imgsets = phantom_imgsets + [img]
-    if len(kspaces) > 0:
-        hpimgset = np.zeros(([len(kspaces)] + list(kspaces[0].shape)), dtype = 'complex')
-        for iimg in range(len(kspaces)):
-            hpimgset[iimg, :] = np.fft.fftshift(np.fft.fftn(kspaces[iimg]))
-    allimgsets = phantom_imgsets + [hpimgset]
-    phantomscaling = 0
-    for imgset in allimgsets:
-        print('finding biggest voxel')
-        currmax = 0
-        for ide in range(imgset.shape[0]):
-            for j in range(imgset.shape[1]):
-                for k in range(imgset.shape[2]):
-                    thismax = np.max(np.abs(imgset[ide, j, k, :]))
-                    if(thismax > currmax):
-                        currmax = thismax
-                        maxj = j
-                        maxk = k
-                        maxide = ide
-        isphantom = any(x is imgset for x in phantom_imgsets)
-        noise = 0.0
-        if(not isphantom):
-            # estimate noise level by looking at the last image in the series
-            noise = np.mean(np.abs(imgset[-1, :, :, :]))
-        maxspect = imgset[maxide,maxj,maxk,:].copy()
-        globalspect = np.zeros((imgset[0].shape[2]), dtype = 'complex')
-        for ide in range(imgset.shape[0]):
-        #     # go through all the voxels and minimize the phase difference
-            for j in range(imgset.shape[1]):
-                for k in range(imgset.shape[2]):
-                    thisspect = imgset[ide, j, k, :]
-                    # discard spectral data signal less than 3XNoise
-                    if((not isphantom) and (np.max(np.abs(thisspect)) < noise * 3)):
-                        continue
-                    bestoverlap = 0
-                    for r in range(-15,16):
-                        thisrollspect = np.roll(thisspect,r)    # array flatten before shifting and then shape restored
-                        S0 = np.sum(np.real(thisrollspect * np.conj(maxspect)))
-                        Spi2 = np.sum(np.real(thisrollspect * 1j * np.conj(maxspect)))
-                        overlap = S0**2 + Spi2**2
-                        if(overlap > bestoverlap):
-                            bestr = r
-                            bestoverlap = overlap
-                            th0 = np.pi / 2 - np.arctan2(S0, Spi2)
-                    imgset[ide,j,k,:] = np.roll(imgset[ide,j,k,:], bestr) * np.exp(1j * th0)
-#                    plt.plot(np.angle(imgset[ide,j,k,:]))
-#                    plt.draw()
-#                    plt.pause(.01)
-                    globalspect += imgset[ide, j, k, :]
-        plt.show()
-        BW = 1 / sampletime / totalppswitch
-        xscale = np.array(range(len(globalspect))) / len(globalspect) * BW / centerfreq * 1E+6
-        globalspectscaling = np.max(np.abs(globalspect))
-        globalspect /= globalspectscaling
-        # estimate peak widths using the FWHM of the largest peak
-        maxpeakidx = np.argmax(np.abs(globalspect))
-        leftidx = -1
-        rightidx = -1
-        for isp in range(len(globalspect)):
-            if(np.abs(globalspect[(maxpeakidx - isp) % len(globalspect)]) < 0.5 and leftidx == -1):
-                leftidx = -isp
-            if(np.abs(globalspect[(maxpeakidx + isp) % len(globalspect)]) < 0.5 and rightidx == -1):
-                rightidx = isp
-        widthguess = (rightidx - leftidx) * (xscale[1] - xscale[0]) / 2
-        lornputspect(xscale, globalspect, debuglorn)
-        if(isphantom):
-            # fit to one peak for a phantom 4params + real-imag
-            x0 = np.zeros((6))
-            centers = [xscale[np.argmax(np.abs(globalspect))]]
-            # thisspect -> globalspect
-            # center, width are fixed
-            x0[3] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[0]))]) # amp
-            x0[2] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[0]))])   # phase
-            lornputpeakparams(centers, np.ones((1)) * widthguess, x0[2:3], debuglorn)
-            bnds = [[None, None] for _ in range(6)]
-            bnds[1] = [widthguess / 2, widthguess * 1.5]
-            x1 = minimize(lornfit, x0, bounds=bnds).x
-            c, w, ph, A, b = lornunpackx0(x1, False)
-            thisphantomscaling = A[0] * w[0] * globalspectscaling
-            phantomscaling = phantomscaling + thisphantomscaling / len(phantom_imgsets)
-            plt.clf()
-            plt.plot(xscale, np.real(globalspect), 'r')
-            plt.plot(xscale, np.imag(globalspect), 'g')
-            plt.plot(xscale, np.real(lorneval(x1)), 'k')
-            plt.plot(xscale, np.imag(lorneval(x1)), 'k')
-            plt.plot(xscale, np.abs(globalspect), 'c')
-            plt.text(xscale[10], .9, f'phantom scaling {thisphantomscaling:6.3f}')
-            plt.show()
-        else:
-            hpglobalspect = globalspect.copy()
-    # phantom_imgsets=list of (views, readouts, echoes)
-    for i, phantom_image in enumerate(phantom_imgsets):
-        for j in range(phantom_recon_array.shape[1]):
-            for k in range(phantom_recon_array.shape[2]):
-                thisspect = phantom_image[0, j, k, :]   # 0th channel
-                scaling = np.max(np.abs(thisspect))
-                thisspect /= scaling
-                x0 = np.zeros((6))
-                lornputspect(xscale, thisspect, debuglorn)
-                centers = [xscale[np.argmax(np.abs(thisspect))]]
-                x0[3] = np.abs(thisspect[np.argmin(np.abs(xscale - centers[0]))])
-                x0[2] = np.angle(thisspect[np.argmin(np.abs(xscale - centers[0]))])
-                lornputpeakparams(centers, np.ones((1)) * widthguess, x0[2:3], debuglorn)
-                x1 = minimize(lornfit, x0).x
-                c, w, ph, A, b = lornunpackx0(x1, False)
-                phantom_recon_array[i, j, k] = A[0] * w[0] * scaling
-    # restore HP global spectrum into lorn state (phantom voxel loop above overwrites it)
-    lornputspect(xscale, hpglobalspect, debuglorn)
-    if(phantomscaling == 0):
-        phantomscaling = 1
-    print('phantom scaling = ', phantomscaling)
-    # fit global spectrum to npeaks lorentzians. Biggest peak has got to be either pyruvate or urea. 
-    # Maybe some day this will fail if it's lactate
-    npeaks = len(peakoffsets)
-    x0 = np.zeros(((4 * npeaks) + 2))
-    x1 = np.zeros((len(biggestpeaklist), len(x0)))
-    diff = np.zeros((len(biggestpeaklist)))
-    for icg in range(len(biggestpeaklist)):
-        centers = (xscale[np.argmax(np.abs(hpglobalspect))] - (peakoffsets - \
-                peakoffsets[biggestpeaklist[icg]])) % (BW / centerfreq * 1E+6)
-        bnds = [[None, None] for _ in range(4 * npeaks + 2)]
-        for ip in range(npeaks):
-            x0[3 * npeaks + ip] = np.abs(hpglobalspect[np.argmin(np.abs(xscale - centers[ip]))])
-            x0[2 * npeaks + ip] = np.angle(hpglobalspect[np.argmin(np.abs(xscale - centers[ip]))])
-            bnds[npeaks + ip] = [widthguess / 2, widthguess * 1.5]
-        lornputpeakparams(centers, np.ones((npeaks)) * widthguess, x0[(2 * npeaks):(3 * npeaks)], debuglorn)
-        # print('begin minimize', icg, flush=True)
-        x1[icg, :] = minimize(lornfit, x0, bounds=bnds).x
-        for ip in range(npeaks):
-            if(x1[icg, 3 * npeaks + ip] < 0):
-                x1[icg, 3 * npeaks + ip] *= -1
-                x1[icg, 2 * npeaks + ip] += np.pi
-        diff[icg] = np.sum(np.abs(hpglobalspect - lorneval(x1[icg, :])))
-    centers = (xscale[np.argmax(np.abs(hpglobalspect))] - (peakoffsets - \
-            peakoffsets[biggestpeaklist[np.argmin(diff)]])) % (BW / centerfreq * 1E+6)
-    lornputpeakparams(centers, np.ones((npeaks)) * widthguess, x0[(2 * npeaks):(3 * npeaks)], debuglorn)
-    centers, widths, phases, amplitudes, baseline = lornunpackx0(x1[np.argmin(diff)], debuglorn)
-    specteval = lorneval(x1[np.argmin(diff)])
-    plt.clf()
-    plt.plot(xscale, np.real(hpglobalspect), 'r')
-    plt.plot(xscale, np.imag(hpglobalspect), 'g')
-    plt.plot(xscale, np.real(specteval), 'k')
-    plt.plot(xscale, np.imag(specteval), 'k')
-    for ip in range(0, npeaks):
-        plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
-        plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-    plt.show()
-    if saveLornFitLocal:
-        lorn_fit_dir = os.environ.get("MRS_LORNFIT_DIR")
-        if not lorn_fit_dir:
-            if "cirrhrat" in experiment_name:
-                lorn_fit_dir = os.path.join(MRSsave_dir, "Bukola's Data", "lorn_fit")
-            else:
-                lorn_fit_dir = os.path.join(MRSsave_dir, "shurik", "lorn_fit")
-        os.makedirs(lorn_fit_dir, exist_ok=True)
-        lorn_fit_path = os.path.join(lorn_fit_dir, f'{experiment_name}_lorn_fit.png')
-        try:
-            plt.savefig(lorn_fit_path)
-            print(f'Saving lorentzian fit plot at filepath {lorn_fit_path}', file=sys.stderr)
-        except Exception as e:
-            print(f"Error saving lorentzian fit plot: {e}", file=sys.stderr)
 
-    # append_auximage(auximages, echo_number=a.head.idx.contrast)
-    # now do voxel fits
-    lornputpeakparams(centers, widths, phases, debuglorn)
-    metabolites = np.zeros((npeaks, numimages, npe, nro))
-    metabolites2 = np.zeros((npeaks, numimages, npe, nro))
-    # shorten the list for quick debugging
-    for ide in range(4,hpimgset.shape[0]):
-        # print('voxel fit img', ide, flush=True)
-        plt.clf()
-        for j in range(hpimgset.shape[1]):
-            print(ide, j)
-            for k in range(hpimgset.shape[2]):
-                thisspect = hpimgset[ide,j,k,:]
-                scaling = np.max(np.abs(thisspect))
-                if(np.max(np.abs(thisspect)) < noise * 3):
+def emit(data: np.ndarray, *,
+         head: mrd.NdArrayHeader = None,
+         dimension_labels: List = None,
+         array_type: mrd.ArrayType = mrd.ArrayType.USER_MAP,
+         **meta: Any) -> mrd.StreamItem:
+    """
+    Wrap an array as a stream-ready NdArray.
+
+    Real data is normalised to float64 and complex data to complex128, which is also what
+    picks the StreamItem union arm: those are the only two the readers on the other side
+    expect, so the cast and the choice of arm are the same decision. Meta goes on the
+    NdArray, which is where the dev schema puts it, not on the header, and a None value is
+    dropped rather than encoded.
+    """
+    array = np.asarray(data)
+    complex_data = np.iscomplexobj(array)
+    array = array.astype(np.complex128) if complex_data else array.astype(np.float64)
+    if head is None:
+        head = mrd.NdArrayHeader(dimension_labels=dimension_labels, array_type=array_type)
+    arr = mrd.NdArray(head=head, data=array,
+                      meta={key: meta_values(value)
+                            for key, value in meta.items() if value is not None})
+    return (mrd.StreamItem.NdArrayComplexDouble(arr) if complex_data
+            else mrd.StreamItem.NdArrayDouble(arr))
+
+
+# ---------- k-space assembly ---------------------------------------------
+
+
+def apply_line_broadening(acq: mrd.Acquisition,
+                          line_broadening: float,
+                          *,
+                          nswitches: int,
+                          npoints_per_switch: int) -> np.ndarray:
+    """
+    Reshape channel 0 of one readout into (kept points, switches) and apodize it.
+
+    The readout is laid out as (discard_pre, npoints_per_switch, discard_post) repeated once per
+    switch, so cirrhrat_43_1's 1792 samples are 64 switches of 28 points with 12 kept. Only
+    discard_pre and npoints_per_switch are needed to find that flat top; what follows it is
+    whatever is left over, and EncodingBuffer.check has already confirmed the geometry is the
+    same for every acquisition of this encoding.
+
+    The apodization decays along the switch axis, because one spectral point is acquired per
+    switch and so tk advances by a whole switch: that axis is the FID time axis. Which is why
+    the exponent is applied after the transpose, where the switch axis is last. Moving the
+    transpose would silently apodize along the readout instead.
+    Returns a (npoints_per_switch, nswitches) complex array
+    """
+    totalppswitch = acq.samples() // nswitches
+    # version1: discard pre and post
+    kspace_per_switch = acq.data[0,:].reshape(nswitches,totalppswitch)[:,acq.head.discard_pre:acq.head.discard_pre+npoints_per_switch]
+    # version2: do not discard and take full total points per switch to line broadening
+    # kspace_per_switch = acq.data[0,:].reshape(nswitches,totalppswitch)
+    tk = np.arange(nswitches) * acq.head.sample_time_ns * totalppswitch / 1.0e+9
+    return kspace_per_switch.T * np.exp(-tk * line_broadening)
+
+
+def header_nswitches(header: mrd.Header) -> int:
+    """
+    The switch count, which is shared by every matrix in a file and recorded once on the header.
+
+    Separate from group_layout because the EPSI test in reconstruct_mrs runs against the whole
+    stream, series and prescan together, where the other three numbers are meaningless and the
+    homogeneity check group_layout applies would rightly reject the mix.
+    Returns 0 when the header records none, which is how a non-EPSI file reads.
+    """
+    if header.user_parameters is None:
+        return 0
+    for item in header.user_parameters.user_parameter_long:
+        if item.name == "nswitches":
+            return int(item.value)
+    return 0
+
+
+@dataclass
+class EncodingBuffer:
+    """
+    One encoding's k-space, with the geometry and the spectral axis that belong to it.
+
+    The series and the averaged prescan are separate matrices - on cirrhrat_43_1 the series
+    keeps 12 points of a switch across 8 views and the prescan 18 across 12 - so every number
+    describing one of them is held here rather than in a variable the two take turns writing.
+    That is what the legacy could not do. It kept xscale, the width guess and the lorn module
+    globals in one place for both, which is why it needed an explicit restore after the phantom
+    voxel loop clobbered them, and why its answers depended on processing the phantom first.
+    """
+    img: np.ndarray             # (nreps, ky, kx, t); k-space until fft_kspace_to_image runs
+    xscale: np.ndarray          # this encoding's own ppm axis
+    kept: int                   # flat top points of one switch, which is the readout axis
+    samples: int                # the three the homogeneity check compares
+    discard_pre: int
+    discard_post: int
+    is_prescan: bool
+
+    def check(self, acq: mrd.Acquisition) -> None:
+        """
+        Raise unless this acquisition was acquired at the geometry the buffer was built from.
+
+        Every acquisition of one encoding shares a readout geometry, so a minority layout is a
+        corrupted header rather than a variant. Reading the geometry once and never looking
+        again let a single mutated discard_post rewrite kept from 12 to 20 for all 216
+        acquisitions of a series, silently.
+        """
+        layout = (acq.samples(), acq.head.discard_pre or 0, acq.head.discard_post or 0)
+        if layout != (self.samples, self.discard_pre, self.discard_post):
+            raise ValueError(
+                f"encoding {acq.head.encoding_space_ref} was built at (samples, discard_pre, "
+                f"discard_post)={(self.samples, self.discard_pre, self.discard_post)} but "
+                f"carries an acquisition at {layout}")
+
+
+def make_buffer(header: mrd.Header,
+                acq: mrd.Acquisition,
+                nswitches: int,
+                center_freq_hz: float) -> EncodingBuffer:
+    """
+    Build the buffer one encoding fills, from the first acquisition that names it.
+
+    The readout geometry comes from the acquisition rather than the header user parameters,
+    because those describe the series only - generate_header is built from a rawdata file - and
+    the prescan beside it keeps a different number of points out of a different switch period.
+    Reading npoints_per_switch off the header handed the prescan the series' 12 point window
+    out of its own 18, and the series' spectral bandwidth along with it.
+
+    The view and repetition counts are the two a readout cannot supply, so they come from the
+    encoding the converter wrote for this matrix and pointed the acquisition at.
+    Raises:
+        - ValueError if the encoding declares no matrix, or if the discards leave no readout
+    """
+    ref = acq.head.encoding_space_ref or 0
+    if ref >= len(header.encoding) or header.encoding[ref].encoding_limits is None:
+        raise ValueError(f"an acquisition points at encoding {ref}, which this header "
+                         f"does not describe")
+    limits = header.encoding[ref].encoding_limits
+    if limits.phase is None or limits.repetition is None:
+        raise ValueError(f"encoding {ref} declares no view or no repetition count, so there is "
+                         f"no matrix to fill")
+
+    totalppswitch = acq.samples() // nswitches
+    discard_pre = acq.head.discard_pre or 0
+    discard_post = acq.head.discard_post or 0
+    kept = totalppswitch - discard_pre - discard_post
+    if kept <= 0:
+        raise ValueError(f"discard_pre={discard_pre} and discard_post={discard_post} leave "
+                         f"{kept} points of a {totalppswitch} point switch")
+
+    # one spectral point is acquired per switch, so the spectral dwell is a whole switch period
+    spectral_bw_hz = 1.0e+9 / (acq.head.sample_time_ns * totalppswitch)
+    bw_ppm = spectral_bw_hz / center_freq_hz * 1.0e+6
+    nfreq = nswitches * FIDPAD
+    # a prescan is not a repetition of the series and carries no repetition axis of its own; in
+    # tar mode every prescan file is handed rep_idx=0, so two of them would collide here
+    return EncodingBuffer(
+        img=np.zeros((limits.repetition.maximum + 1,    # repetition
+                      limits.phase.maximum + 1,         # ky
+                      kept,                             # kx
+                      nfreq),                           # t
+                     dtype='complex'),
+        xscale=np.arange(nfreq) / nfreq * bw_ppm,
+        kept=kept,
+        samples=acq.samples(),
+        discard_pre=discard_pre,
+        discard_post=discard_post,
+        is_prescan=bool(acq.head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT))
+
+
+def fft_kspace_to_image(kspace: np.ndarray) -> np.ndarray:
+    """FFT one repetition's k-space cube over all three axes into (views, readout, frequency)."""
+    axes = tuple(range(kspace.ndim))
+    return np.fft.fftshift(np.fft.fftn(kspace, axes=axes), axes=axes)
+
+
+
+
+# ---------- EPSI analysis ------------------------------------------------
+
+
+def phase_align(volumes: np.ndarray,
+                reference_spect: np.ndarray,
+                *,
+                noise_threshold: Optional[float] = None,
+                search_range: int = PHASE_SEARCH_RANGE) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Roll and rotate every voxel spectrum to maximise its overlap with a reference spectrum.
+
+    Each voxel is free to be shifted by a few spectral points and rotated by a global phase;
+    picking the combination that maximises overlap with the brightest spectrum in the series
+    puts every voxel into a common frame, so the sum over voxels adds coherently instead of
+    cancelling. Voxels below the noise threshold are left alone and excluded from the sum.
+    Takes (nreps, nviews, nro, nfreq) against the brightest voxel spectrum in the series, and
+    returns (an aligned copy, the global spectrum summed over aligned voxels).
+    """
+    out = np.array(volumes, dtype=complex, copy=True)
+    global_spect = np.zeros(out.shape[-1], dtype=complex)
+    reference_conj = np.conj(reference_spect)
+
+    for ide in range(out.shape[0]):
+        for j in range(out.shape[1]):
+            for k in range(out.shape[2]):
+                spect = out[ide, j, k, :]
+                # a repetition the stream never delivered is a zero sla0, and stays one
+                if not np.any(spect):
                     continue
-                thisspect /= scaling
+                if noise_threshold is not None and np.max(np.abs(spect)) < noise_threshold:
+                    continue
+                best_overlap = -np.inf
+                best_r = 0
+                best_th = 0.0
+                for r in range(-search_range, search_range + 1):
+                    rolled = np.roll(spect, r)
+                    S0 = float(np.sum(np.real(rolled * reference_conj)))
+                    Spi2 = float(np.sum(np.real(rolled * 1j * reference_conj)))
+                    overlap = S0 * S0 + Spi2 * Spi2
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_r = r
+                        best_th = np.pi / 2 - np.arctan2(S0, Spi2)
+                corrected = np.roll(spect, best_r) * np.exp(1j * best_th)
+                out[ide, j, k, :] = corrected
+                global_spect += corrected
 
-                # try full fit
-                set_allow_width_adjust(1)
-                lornputspect(xscale, thisspect, False)
-                npeaks = len(peakoffsets)
-                x0 = np.zeros((4 * npeaks + 2))
-                bnds = [[None, None] for _ in range(4 * npeaks + 2)]
-                for ip in range(npeaks):
-                    x0[2 * npeaks + ip] = phases[ip]
-                    bnds[ip] = [-fit_df, fit_df]
-                    bnds[npeaks + ip] = [widths[ip] - fit_dw, widths[ip] + fit_dw]
-                    bnds[2 * npeaks + ip] = [phases[ip] - fit_dph, phases[ip] + fit_dph]
-                    bnds[3 * npeaks + ip] = [0, None]
-                # print('begin minimize', icg, flush=True)
-                x1 = minimize(lornfit, x0, bounds=bnds).x
-                set_allow_width_adjust(1)
-                for ip in range(npeaks):
-                    if(x1[3 * npeaks + ip] < 0):
-                        x1[3 * npeaks + ip] *= -1
-                        x1[2 * npeaks + ip] += np.pi
-                c, w, ph, A, b = lornunpackx0(x1, False)
-                metabolites[:, ide, j, k] = np.abs(A) * scaling
-                metabolites2[:, ide, j, k] = np.abs(A * w) * scaling
-                specteval = lorneval(x1)
-                plt.figure(1)
-                plt.plot(xscale+j*17, np.real(thisspect)+k*2, 'r')
-                plt.plot(xscale+j*17, np.imag(thisspect)+k*2, 'g')
-                plt.plot(xscale+j*17, np.real(specteval)+k*2, 'k')
-                plt.plot(xscale+j*17, np.imag(specteval)+k*2, 'k')
-                plt.figure(2)
-                for ip in range(npeaks):
-                    plt.subplot(2,3,ip+1)
-                    plt.title(peaknames[ip])
-                    plt.imshow(metabolites[ip, ide, :, :])
-                plt.figure(3)
-                for ip in range(npeaks):
-                    plt.subplot(2,3,ip+1)
-                    plt.title(peaknames[ip])
-                    plt.imshow(metabolites2[ip, ide, :, :])
-            plt.draw()
-            plt.pause(.01)
-        plt.show()
+    return out, global_spect
 
 
-#                lornputspect(xscale, thisspect, 1.0, False)
-#                x0 = np.zeros((npeaks + 2)) # amp of npeaks + real-imag
-#                for ip in range(npeaks):
-#                    x0[ip] = np.abs(thisspect[np.argmin(np.abs(xscale - centers[ip]))])
-#                bounds = Bounds(np.concatenate((np.zeros((npeaks)), [-.1, -.1])), \
-#                        np.concatenate((x0[:npeaks] * 1.5, [.1, .1])))
-#                x1 = minimize(lor1fit, x0, bounds=bounds).x
-#                metabolites[:, ide, j, k] = x1[:npeaks] * scaling
-#                plt.clf()
-#                plt.plot(xscale, scaling*np.real(thisspect), 'r')
-#                plt.plot(xscale, scaling*np.imag(thisspect), 'g')
-#                specteval = lor1eval(x1)
-#                plt.plot(xscale, scaling*np.real(specteval), 'k')
-#                plt.plot(xscale, scaling*np.imag(specteval), 'k')
-#                plt.show()
-#                plt.ylim(-2000, 2000)
-#                plt.pause(.01)
+def fit_global_multipeak(global_spect: np.ndarray,
+                         xscale: np.ndarray,
+                         spec: PeakSpec,
+                         center_window: CenterWindow = GLOBAL_CENTER_WINDOW_PPM,
+                         width_scale: Tuple[float, float] = WIDTH_BOUND_SCALE
+                         ) -> Tuple[LorentzianFitter, int, float]:
+    """
+    Fit the summed spectrum, trying each candidate for which peak is the tallest one.
 
-    # save metabolites array as npy shaped(freq, meas, rows, cols) from (npeaks, numimages, npe, nro)
-    if saveMetaboliteLocal:
-        mat_dir = os.environ.get("MRS_PROCESSED_DIR")
-        if not mat_dir:
-            if "cirrhrat" in experiment_name:
-                mat_dir = os.path.join(MRSsave_dir, "Bukola's Data", "processed_npyfiles")
-            else: # ischema or control
-                mat_dir = os.path.join(MRSsave_dir, "shurik", "processed_npyfiles")
-        os.makedirs(mat_dir, exist_ok=True)
-        try:
-            if len(peakoffsets) == 7 and not "cirrhrat" in experiment_name:
-                mat_filepath = os.path.join(mat_dir, f'{experiment_name}_metaboites_withpoop.mat')
-            else:
-                mat_filepath = os.path.join(mat_dir, f'{experiment_name}_metabolites.mat')
-            savemat(mat_filepath, {
-                'rawdata': metabolites,
-                'phantom_scale': phantomscaling,
-                'phantom': phantom_recon_array
-            }
-            )
-            print(f"Saving metabolites mat file at {mat_filepath}")
-        except Exception as e:
-            print(f"Error saving metabolites mat file: {e}", file=sys.stderr)
-    return([metabolites, auximages])
+    The peak offsets are a rigid pattern whose absolute position is unknown, so each peak that
+    is not marked _t is tried as the one sitting under the tallest point and the hypothesis
+    with the smallest residual wins. The resulting centers, widths and phases then lock the
+    line shape for the per-voxel fits.
 
-def generate_spectra(h: mrd.Header,
-                     measurementtimes_ns: float,
-                     peakamplitudes: np.ndarray,
-                     peakoffsets: np.ndarray,
-                     spectra):
-    # turn the metabolite array (metabolite x image number x rows x columns) into streamable images
-    nspect = spectra.shape[0]
-    ntimepoints = spectra.shape[1]
-    measfreq = h.experimental_conditions.h1resonance_frequency_hz
-    for ispect in range(nspect):
-        # 'image' that is the measured spectrum at this time point
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.COMPLEX)
-        if(ispect == 0):
-            imghead.flags = mrd.ImageFlags.FIRST_IN_SET
-        elif(ispect == nspect - 1):
-            imghead.flags = mrd.ImageFlags.LAST_IN_SET
-        imghead.measurement_uid = ispect
-        imghead.repetition = ispect
-        imghead.acquisition_time_stamp_ns = measurementtimes_ns[ispect]
-        imghead.image_index = ispect
-        imghead.image_series_index = ispect
-        spect = mrd.Image(head=imghead, data=np.expand_dims(np.transpose(spectra[ispect, :]), (0, 1, 2, 3)))
-        yield(mrd.StreamItem.ImageComplexDouble(spect))
-        # 'image' quantifying the amplitudes for this time point
-        imghead = mrd.ImageHeader(image_type=mrd.ImageType.MAGNITUDE)
-        if(ispect == 0):
-            imghead.flags = mrd.ImageFlags.FIRST_IN_SET
-        elif(ispect == ntimepoints - 1):
-            imghead.flags = mrd.ImageFlags.LAST_IN_SET
-        imghead.measurement_uid = ispect
-        imghead.measurement_freq = measfreq + np.uint32(measfreq * peakoffsets / 1E+6 + 0.5)
-        imghead.measurement_freq_label = np.array(peaknames, dtype=np.dtype(np.object_))
-        imghead.repetition = ispect
-        imghead.acquisition_time_stamp_ns = measurementtimes_ns[ispect]
-        imghead.image_index = ispect
-        imghead.image_series_index = ispect
-        spect = mrd.Image(head=imghead, data=np.expand_dims(np.transpose(peakamplitudes[:, ispect]), (0, 1, 2, 3)))
-        yield(mrd.StreamItem.ImageDouble(spect))
+    center_window is how far the fit may move a center from that rigid placement, in ppm. The
+    offsets are known chemistry, so a center is nearly determined before the fit starts; left
+    unbounded, a tiny peak slides onto a strong neighbour and is fitted as a second component
+    of its line. On a 6 peak kidney series hyd_tm walked 1.2 ppm onto urea, took a third of its
+    amplitude, and cut the residual doing it. At 0 the placement is final. The default 0.5 is
+    what lorn.py enforced implicitly through `c = centers + arctan(x0)/pi * wigglefactor` at
+    the wigglefactor of 1.0 the EPSI path always ran at.
 
-def spectra_recon(h: mrd.Header, 
-                  raw_acquisition_list: list, 
-                  sourcepeak: int, 
-                  metabolitelist: list, 
-                  biggestpeakidx: list,
-                  peakoffsets: np.ndarray,
-                  peaknames: list):
-    global P, y, t
-    global experiment_name
+    width_scale is the (lo, hi) width bound as multiples of the width guess. It is what stops
+    the optimizer walking a width through zero, and it is a real constraint on the fit: too
+    narrow a range and a peak sits on a bound instead of on its own linewidth, which makes the
+    model line the wrong shape and its height wrong with it. The default (0.1, 1.9) is the
+    range `w = w0 * (1 + arctan(x0) * 1.8 / pi)` allowed. The (0.5, 1.5) this replaces came
+    from mrd2_recon_to_incorporate.py, which linearised the transforms and re-supplied a
+    narrower bound; on cirrhrat_43_1 it clamped four of six peaks and cost 0.7 of residual.
+    Returns:
+        - (fitter holding the winning fit, index of the winning peak, the width guess in ppm)
+    """
+    scaling = float(np.max(np.abs(global_spect)))
+    if scaling == 0.0:
+        raise ValueError("global spectrum is zero; cannot fit peaks")
+    norm = global_spect / scaling
+    bw_ppm = float(xscale[-1] - xscale[0] + (xscale[1] - xscale[0]))
+    width_guess = estimate_width_fwhm(xscale, norm)
+    widths_init = np.full(len(spec), width_guess)
+    width_bounds = (width_guess * width_scale[0], width_guess * width_scale[1])
 
-    auximages = []
-    numspectra = len(raw_acquisition_list)
-    a = raw_acquisition_list[0]
-    sampletime = a.head.sample_time_ns / 1.0E+9
-    centerfreq = a.head.acquisition_center_frequency
-    npts = len(a.data)
-    # kspace shape=(measurements=80, spectra=1280)
-    kspace = np.zeros((numspectra, npts), dtype = 'complex')
-    ia = 0
-    for ispect in range(kspace.shape[0]):
-        kspace[ispect, :] = raw_acquisition_list[ispect].data[:, 0]
-        for ipt in range(kspace.shape[1]):
-             tk = ipt * sampletime
-             lb = 42
-             kspace[ispect, ipt] *= np.exp(-tk * lb)
-    spectra = np.fft.fftshift(np.fft.fft(kspace, axis = (1)), axes = (1))
-    currmax = 0
-    for ispect in range(numspectra):
-        thismax = np.max(np.abs(spectra[ispect, :]))
-        if(thismax > currmax):
-            currmax = thismax
-            maxispect = ispect
-    # estimate noise level by looking at the last image in the series
-    noise = np.mean(np.abs(spectra[-1, :]))
-    maxspect = spectra[maxispect,:].copy()
-    maxpt = np.argmax(np.abs(maxspect))
-    BW = 1 / sampletime
-    # take points within 25 ppm of highest signal
-    lowpt = int(maxpt - 25E-6 / (BW / centerfreq) * npts)
-    hipt = int(maxpt + 25E-6 / (BW / centerfreq) * npts)
-    newBW = BW * (hipt - lowpt) / npts
-    spectra = spectra[:, lowpt:hipt]
-    # global spectrum across +-25ppm of highest peak
-    globalspect = np.zeros(hipt - lowpt, dtype = 'complex')
-    xscale = np.array(range(len(globalspect))) / len(globalspect) * newBW / centerfreq * 1E+6
-    for ispect in range(numspectra):
-        if(np.max(np.abs(spectra[ispect, :])) > noise * 5):
-            globalspect += spectra[ispect, :]
-    globalspect /= np.max(np.abs(globalspect))
-    # estimate peak widths using the FWHM of the largest peak
-    maxpeakidx = np.argmax(np.abs(globalspect))
-    leftidx = -1
-    rightidx = -1
-    for isp in range(len(globalspect)):
-        if(np.abs(globalspect[(maxpeakidx - isp) % len(globalspect)]) < 0.5 and leftidx == -1):
-             leftidx = maxpeakidx - isp
-        if(np.abs(globalspect[(maxpeakidx + isp) % len(globalspect)]) < 0.5 and rightidx == -1):
-             rightidx = maxpeakidx + isp
-    widthguess = (rightidx - leftidx) * (xscale[1] - xscale[0]) / 4
-    lornputspect(xscale, globalspect, debuglorn)
-    # fit global spectrum to npeaks lorentzians.
-    x0 = np.zeros(((4 * len(peakoffsets)) + 2))
-    x1 = np.zeros((len(biggestpeakidx), len(x0)))
-    diff = np.zeros((len(biggestpeakidx)))
-    for icg in range(len(biggestpeakidx)):
-        centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
-                peakoffsets[biggestpeakidx[icg]])) % (BW / centerfreq * 1E+6)
-        for ip in range(len(peakoffsets)):
-             x0[3 * len(peakoffsets) + ip] = np.abs(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
-             x0[2 * len(peakoffsets) + ip] = np.angle(globalspect[np.argmin(np.abs(xscale - centers[ip]))])
-        lornputpeakparams(centers, np.ones((len(peakoffsets))) * widthguess, x0[(2 * len(peakoffsets)):(3 * len(peakoffsets))], debuglorn)
-        # print('begin minimize', icg, flush=True)
-        x1[icg, :] = minimize(lornfit, x0).x
-        for ip in range(len(peakoffsets)):
-             if(x1[icg, 3 * len(peakoffsets) + ip] < 0):
-                 x1[icg, 3 * len(peakoffsets) + ip] *= -1
-                 x1[icg, 2 * len(peakoffsets) + ip] += np.pi
-        diff[icg] = np.sum(np.abs(globalspect - lorneval(x1[icg, :])))
-    centers = (xscale[np.argmax(np.abs(globalspect))] - (peakoffsets - \
-                peakoffsets[biggestpeakidx[np.argmin(diff)]])) % (BW / centerfreq * 1E+6)
-    lornputpeakparams(centers, np.ones((len(peakoffsets))) * widthguess, x0[(2 * len(peakoffsets)):(3 * len(peakoffsets))], debuglorn)
-    thex1 = x1[np.argmin(diff)]
-    centers, widths, phases, amplitudes, baseline = lornunpackx0(thex1, debuglorn)
-    specteval = lorneval(thex1)
-    plt.clf()
-    plt.plot(xscale, np.real(globalspect), 'r')
-    plt.plot(xscale, np.imag(globalspect), 'g')
-    plt.plot(xscale, np.real(specteval), 'k')
-    plt.plot(xscale, np.imag(specteval), 'k')
-    for ip in range(0, len(peakoffsets)):
-        plt.plot([centers[ip], centers[ip]], [-1, 1], 'k')
-        plt.text(centers[ip], .95-ip*.07, str(centers[ip]))
-    plt.title(f'{experiment_name} global spectrum')
-    # plt.show()
-    append_auximage(auximages, echo_number=a.head.idx.contrast)
-    # now do voxel fits
-    lornputpeakparams(centers, widths, phases, debuglorn)
-    peakamplitudes = np.zeros((len(peakoffsets), numspectra))
-    measurementtimes_ns = [a.head.acquisition_time_stamp_ns - \
-            raw_acquisition_list[0].head.acquisition_time_stamp_ns for a in raw_acquisition_list]
-    for ispect in range(numspectra):
-        # print('voxel fit img', ispect, flush=True)
-        thisspect = spectra[ispect,:]
-        scaling = np.max(np.abs(thisspect))
-        thisspect /= scaling
-        lornputspect(xscale, thisspect, False)
-        x0 = np.zeros((len(peakoffsets) + 2))
-        for ip in range(len(peakoffsets)):
-            x0[ip] = np.abs(thisspect[np.argmin(np.abs(xscale - centers[ip]))])
-        bounds = Bounds(np.concatenate((np.zeros((len(peakoffsets))), [-.1, -.1])), np.concatenate((x0[:len(peakoffsets)] * 1.5, [.1, .1])))
-        x1 = minimize(lor1fit, x0, bounds=bounds)
-        peakamplitudes[:, ispect] = x1.x[:len(peakoffsets)] * scaling
-    auc = np.sum(peakamplitudes, axis=(1))
-    auc /= max(auc)
-    auc *= 100
-    peakamplitudes /= np.max(peakamplitudes)
-    # now do model fit
-    legend = []
-    plt.clf()
-    colors=['r', 'b', 'g', 'c', 'k', 'r', 'b']
-    kAB_auc_data = {}
-    for ip in range(len(peakoffsets)):
-        P = peakamplitudes[sourcepeak, :]   # peak amp of injected sample
-        y = peakamplitudes[ip, :]           # peak amp of each metabolite
-        t = np.arange(len(y))               # Use the index as the time axis for y
-        if(ip in metabolitelist):
-            # x[0]=kAB, x[1]=1/T1, x[2]=initial amount of metabolite
-            if peaknames[ip] == 'lac' or peaknames[ip] == 'ala':
-                bounds = [(None, None), (1/24.5, 1/20), (None, None)]
-            else:
-                bounds = [(None, None), (1/100, 1), (None, None)]
-            x1 = minimize(kABfit, [.01, .03, 1], bounds=bounds).x
-            kAB_auc_data[peaknames[ip]] = {'kAB': x1[0],
-                                           '1/T1': 1/x1[1],
-                                           'AUC': auc[ip]}
-            # save values as text file
-            plt.plot(t, y, colors[ip]+'.', \
-                    label = peaknames[ip]+'/k={:.5f}'.format(x1[0])+'/T1inverse={:.2f}'.format(1/x1[1]) + \
-                    '/AUC={:.2f}'.format(auc[ip]))
-            # fitted line
-            plt.plot(t, kABfiteval(x1), '-'+colors[ip], label='_nolabel_')
-        else:
-            kAB_auc_data[peaknames[ip]] = {'AUC': auc[ip]}
-            if(ip == sourcepeak):
-                plt.plot(t, y, colors[ip]+'-', label=peaknames[ip] + \
-                    '/AUC={:.2f}'.format(auc[ip]))
-            else:
-                plt.plot(t, y, colors[ip]+'--', label=peaknames[ip] + \
-                    '/AUC={:.2f}'.format(auc[ip]))
-    plt.legend(title='')
-    plt.title(experiment_name)
-    plt.xlabel('time')
-    plt.yticks([])
-    # plt.show()
-    append_auximage(auximages, echo_number=a.head.idx.contrast)
-    if kfitdata_local:
-        kfitdata_dir = 'C:/Users/MRS/Desktop/mrs_to_mrd/kfitdata'
-    if os.path.exists(kfitdata_dir):
-        import csv
-        try:
-            csv_filepath = os.path.join(kfitdata_dir, f'{experiment_name}_kAB.csv')
-            with open(csv_filepath, 'w', newline='') as f:
-                writer = csv.writer(f)
-                headers = ['experiment_name']
-                for metabolite_name in kAB_auc_data.keys():
-                    headers.append(f'kpyr_to_{metabolite_name}')
-                    headers.append(f'1/T1_{metabolite_name}')
-                    headers.append(f'AUC_{metabolite_name}')
-                writer.writerow(headers)
-                rows = [experiment_name]
-                for metabolite_name, values in kAB_auc_data.items():
-                    if 'kAB' in values:
-                        rows.append(values['kAB'])
-                        rows.append(values['1/T1'])
-                        rows.append(values['AUC'])
-                    elif 'kAB' not in values and 'AUC' in values:
-                        rows.append(np.nan)
-                        rows.append(np.nan)
-                        rows.append(values['AUC'])
-                writer.writerow(rows)
-            print(f"Saved kAB fit data at {csv_filepath}", file=sys.stderr)
-        except Exception as e:
-            print(f"Error saving kAB fit data: {e}", file=sys.stderr)
-    return(measurementtimes_ns, spectra, centerfreq + np.uint32(centers * centerfreq / 1.0E+6), \
-            peakamplitudes, auximages)
+    candidates = spec.biggest_idx or list(range(len(spec)))
+    best_fitter = None
+    best_idx = candidates[0]
+    for icg in candidates:
+        fitter = LorentzianFitter(xscale)
+        centers = candidate_centers(xscale, norm, spec.offsets, icg, bw_ppm)
+        params = fitter.fit_global(norm, centers, widths_init, width_bounds=width_bounds,
+                                   center_window=center_window)
+        if best_fitter is None or params.loss < best_fitter.params.loss:
+            best_fitter = fitter
+            best_idx = icg
 
-# Take single file as input and reconstruct output
-def reconstruct_mrs(input: Union[str, BinaryIO],
-                    output: Union[str, BinaryIO],
-                    sourcepeak: int,
-                    metabolitelist: list,
-                    biggestpeakidx: list,
-                    peakoffsets: np.ndarray,
-                    peaknames: list):
-    global experiment_name
-    def generate_stream(input: list):
-        for item in input:
-            if isinstance(item, mrd.Acquisition):
-                yield mrd.StreamItem.Acquisition(item)
+    return best_fitter, best_idx, width_guess
+
+
+def fit_voxel_peaks(volumes: np.ndarray,
+                    fitter: LorentzianFitter,
+                    *,
+                    noise_threshold: float = 0.0,
+                    fit_df: float = 0.0,
+                    fit_dw: float = 0.0,
+                    fit_dph: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Fit every voxel with its line shape held at, or near, the one the global fit settled on.
+
+    The windows say how far a voxel may depart from that shape. At their default of zero the
+    line shape is pinned and only the amplitudes and a baseline are free, so a voxel too noisy
+    to support a full fit still yields a usable amplitude. Opening them lets a voxel whose
+    shim, and so whose line, differs from the average of the slice fit its own. The windows are
+    in ppm, ppm and radians. Returns ((npeaks, nreps, nviews, nro) peak heights, the matching
+    peak areas, each from its own voxel's fitted width).
+    """
+    npeaks = len(fitter.params.centers)
+    nreps, ny, nx, _ = volumes.shape
+    amplitudes = np.zeros((npeaks, nreps, ny, nx))
+    areas = np.zeros((npeaks, nreps, ny, nx))
+
+    for ide in range(nreps):
+        print(f"Fitting voxels for repetition={ide}", file=sys.stderr)
+        for j in range(ny):
+            for k in range(nx):
+                spect = volumes[ide, j, k, :]
+                if not np.any(spect):
+                    continue
+                if np.max(np.abs(spect)) < noise_threshold:
+                    continue
+                params = fitter.fit_windowed(spect, df=fit_df, dw=fit_dw, dph=fit_dph)
+                amplitudes[:, ide, j, k] = np.abs(params.amplitudes)
+                areas[:, ide, j, k] = np.abs(params.amplitudes * params.widths)
+
+    return amplitudes, areas
+
+
+def fit_and_emit_peaks(aligned: np.ndarray,
+                       global_spect: np.ndarray,
+                       xscale: np.ndarray,
+                       spec: PeakSpec,
+                       *,
+                       noise_threshold: float,
+                       fit_df: float = 0.0,
+                       fit_dw: float = 0.0,
+                       fit_dph: float = 0.0,
+                       label: str = "metabolite",
+                       global_df: CenterWindow = GLOBAL_CENTER_WINDOW_PPM,
+                       width_scale: Tuple[float, float] = WIDTH_BOUND_SCALE
+                       ) -> Iterable[mrd.StreamItem]:
+    """
+    Fit the peaks on an aligned series and emit everything that describes the fit.
+
+    Everything downstream of the alignment: the global fit, the line shape it settled on, and
+    the per-voxel maps. Takes the aligned (nreps, nviews, nro, nfreq) series and the sum over
+    its voxels, which the line shape is fitted to. Nothing flows back to the caller, so a run
+    with no peaks named stops after the summed spectrum.
+
+    `label` names every array this emits, since the series and the prescan are fitted
+    separately and share one output stream; without it a reader would see two `global_spect`
+    arrays and no way to tell which encoding each belongs to.
+    """
+    if len(spec) == 0:
+        print("No peaks specified, skipping the Lorentzian fits", file=sys.stderr)
+        yield emit(global_spect,
+                   dimension_labels=[mrd.ArrayDimension.CONTRAST],
+                   description=f"{label}_global_spect",
+                   encoding=label,
+                   xscale_ppm=xscale)
+        return
+
+    print(f"Fitting {len(spec)} peaks to the {label} global spectrum", file=sys.stderr)
+    fitter, biggest_idx, width_guess = fit_global_multipeak(global_spect, xscale, spec,
+                                                            center_window=global_df,
+                                                            width_scale=width_scale)
+    params = fitter.params
+    global_scaling = float(np.max(np.abs(global_spect)))
+
+    yield emit(global_spect,
+               dimension_labels=[mrd.ArrayDimension.CONTRAST],
+               description=f"{label}_global_spect",
+               encoding=label,
+               xscale_ppm=xscale,
+               width_guess_ppm=width_guess,
+               biggest_peak_index=biggest_idx,
+               biggest_peak_name=spec.names[biggest_idx])
+    yield emit(fitter.eval() * global_scaling,
+               dimension_labels=[mrd.ArrayDimension.CONTRAST],
+               description=f"{label}_global_spect_fit",
+               encoding=label,
+               xscale_ppm=xscale,
+               fit_loss=params.loss)
+
+    # the area of each peak in the summed spectrum, amplitude times width. For a phantom, whose
+    # spec is one peak, this single number is the scaling the prescan exists to provide: it is
+    # what makes two experiments comparable. Recorded, never applied - the legacy carried it
+    # alongside the maps the same way, and what to do with it is the consumer's decision
+    for description, values in ((f"{label}_lorentzian_centers_ppm", params.centers),
+                                (f"{label}_lorentzian_widths_ppm", params.widths),
+                                (f"{label}_lorentzian_phases_rad", params.phases),
+                                (f"{label}_lorentzian_amplitudes",
+                                 params.amplitudes * global_scaling),
+                                (f"{label}_global_peak_areas",
+                                 np.abs(params.amplitudes * params.widths) * global_scaling)):
+        yield emit(values,
+                   dimension_labels=[mrd.ArrayDimension.BASIS],
+                   description=description,
+                   encoding=label,
+                   peak_names=spec.names)
+    yield emit(np.array([params.baseline * global_scaling]),
+               dimension_labels=[mrd.ArrayDimension.SAMPLES],
+               description=f"{label}_lorentzian_baseline",
+               encoding=label)
+
+    # peak height and peak area. The area is each voxel's own amplitude times its own fitted
+    # width, so with the width window closed it is a per-peak rescaling of the amplitudes and
+    # with it open it is a genuinely per-voxel integral
+    metabolites, areas = fit_voxel_peaks(aligned, fitter,
+                                         noise_threshold=noise_threshold,
+                                         fit_df=fit_df, fit_dw=fit_dw, fit_dph=fit_dph)
+
+    map_meta = dict(encoding=label,
+                    peak_names=spec.names,
+                    peak_offsets_ppm=spec.offsets,
+                    source_peak_index=spec.source_idx,
+                    metabolite_indices=spec.metabolite_idx or None,
+                    fit_df_ppm=fit_df,
+                    fit_dw_ppm=fit_dw,
+                    fit_dph_rad=fit_dph)
+    for description, values in ((f"{label}_amplitude", metabolites),
+                                (f"{label}_area", areas)):
+        yield emit(values,
+                   dimension_labels=[mrd.ArrayDimension.BASIS,
+                                     mrd.ArrayDimension.REPETITION,
+                                     mrd.ArrayDimension.Y,
+                                     mrd.ArrayDimension.X],
+                   description=description,
+                   **map_meta)
+
+
+def stream_epsi_image(img: np.ndarray,
+                      xscale: np.ndarray,
+                      spec: PeakSpec,
+                      *,
+                      is_prescan: bool,
+                      label: str,
+                      fit_df: float = 0.0,
+                      fit_dw: float = 0.0,
+                      fit_dph: float = 0.0,
+                      global_df: CenterWindow = GLOBAL_CENTER_WINDOW_PPM,
+                      width_scale: Tuple[float, float] = WIDTH_BOUND_SCALE
+                      ) -> Iterable[mrd.StreamItem]:
+    """
+    Align one encoding's images, fit them, and emit everything that describes the fit.
+
+    The series and the phantom prescan run through here alike, which is what the legacy did
+    too: one loop over `allimgsets` did the brightest voxel search, the roll and rotate
+    alignment, the global spectrum accumulation and the FWHM width guess for both. Only three
+    things branch on which one this is - the noise floor, the peak list, and what the outputs
+    are called - and all three arrive as arguments, so neither can reach into the other's
+    state the way the legacy's module level globals let them.
+    Args:
+        - img: this encoding's (nreps, ny, nx, nfreq) images, already transformed
+        - xscale: this encoding's own ppm axis; a prescan's switch period differs from the
+          series', so its spectral bandwidth does too
+        - spec: the metabolite pattern, or PHANTOM_SPEC for a prescan
+        - is_prescan: selects the noise floor, the one thing that cannot be read off the data
+        - label: names the arrays this emits, so both encodings can share one stream
+    """
+    if is_prescan:
+        # every voxel of a phantom is signal, which is why the legacy set a phantom's noise to
+        # zero outright rather than gating it
+        noise_threshold = 0.0
+    else:
+        # the last repetition of a hyperpolarized series has decayed away, so it measures noise
+        noise = float(np.mean(np.abs(img[-1])))
+        noise_threshold = noise * NOISE_THRESHOLD_MULTIPLIER
+        if noise == 0.0:
+            print(f"warning: repetition {img.shape[0] - 1} is empty, so the noise floor is 0 "
+                  f"and every voxel above zero will be fitted", file=sys.stderr)
+
+    # the brightest voxel is the reference every other voxel is aligned to. One argmax over the
+    # whole series picks the same voxel the legacy's triple loop did: both take the first
+    # maximum, and C order over this array is repetition order
+    peak_per_voxel = np.abs(img).max(axis=-1)   # across t
+    max_rep, max_y, max_x = (int(i) for i in
+                             np.unravel_index(int(np.argmax(peak_per_voxel)),
+                                              peak_per_voxel.shape))
+    print(f"Aligning phase for {label}", file=sys.stderr)
+    aligned, global_spect = phase_align(img, img[max_rep, max_y, max_x, :],
+                                        noise_threshold=noise_threshold)
+
+    yield emit(aligned,
+               dimension_labels=[mrd.ArrayDimension.REPETITION,
+                                 mrd.ArrayDimension.Y,
+                                 mrd.ArrayDimension.X,
+                                 mrd.ArrayDimension.CONTRAST],
+               description=f"{label}_image_aligned",
+               encoding=label,
+               noise_threshold=noise_threshold,
+               phase_search_range=PHASE_SEARCH_RANGE,
+               reference_repetition=max_rep,
+               reference_y=max_y,
+               reference_x=max_x)
+
+    yield from fit_and_emit_peaks(aligned, global_spect, xscale, spec,
+                                  label=label,
+                                  noise_threshold=noise_threshold,
+                                  fit_df=fit_df, fit_dw=fit_dw, fit_dph=fit_dph,
+                                  global_df=global_df, width_scale=width_scale)
+
+
+def reconstruct_mrs(input: BinaryIO,
+                    output: BinaryIO,
+                    *,
+                    line_broadening: float,
+                    spec: PeakSpec,
+                    fit_df: float = 0.0,
+                    fit_dw: float = 0.0,
+                    fit_dph: float = 0.0,
+                    global_df: CenterWindow = GLOBAL_CENTER_WINDOW_PPM,
+                    width_scale: Tuple[float, float] = WIDTH_BOUND_SCALE) -> None:
+    """
+    Reconstruct one converted EPSI file.
+
+    Acquisitions are routed by encoding_space_ref, which the converter sets per matrix, so the
+    series and the averaged prescan each fill their own buffer and neither can be assembled
+    into the other's. Nothing reads the FIRST_IN_PHASE / LAST_IN_REPETITION flags: a cube is
+    complete when the stream ends, not when a flag says so, which is what makes the result
+    independent of the order the acquisitions arrive in and leaves a series missing a view with
+    zero rows rather than everything shifted by one.
+
+    The transform runs once per repetition on the whole (ky, kx, t) cube. Transforming each
+    readout as it arrived would leave the phase encode axis in k-space, because a DFT along ky
+    is a sum over every view and no single acquisition holds more than one of them.
+    Raises:
+        - ValueError if the header describes no EPSI matrix, records no resonance frequency,
+          or if the stream holds no acquisitions
+    """
     with mrd.BinaryMrdReader(input) as reader:
-        raw_header = reader.read_header()
-        raw_streamables_list = list(reader.read_data())
-        raw_acquisition_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Acquisition]
-        raw_acquisition_list.sort(key = lambda x: x.head.acquisition_time_stamp_ns)
-        img_list = [x.value for x in raw_streamables_list if type(x.value) == mrd.Image]
+        header = reader.read_header()
 
-    with mrd.BinaryMrdWriter(output) as writer:
-        # write the same header from input mrd file
-        writer.write_header(raw_header)
-        if(raw_header.measurement_information.sequence_name.find('epsi') > -1):
-            experiment_name = str(Path(input).parents[0].name)
-            [metabolites, auximages] = epsi_recon(raw_acquisition_list, biggestpeakidx, peakoffsets)
-            writer.write_data(generate_epsi_images(raw_header, metabolites, peakoffsets, peaknames))
-            # read_data can be called only once to get Stream +Item
-            # write_data can be rewritten by converting list of mrd objects to StreamItem
-            writer.write_data(generate_stream(raw_acquisition_list))
-        elif(
-            raw_header.measurement_information.sequence_name.find('1puls') > -1 or
-            raw_header.measurement_information.sequence_name.find('one_pulse') > -1 or 
-            raw_header.measurement_information.sequence_name.find('fid') > -1):
-            [measurementtimes_ns, spectra, peakfrequencies, peakamplitudes, auximages] = spectra_recon(
-                h=raw_header,
-                raw_acquisition_list=raw_acquisition_list,
-                sourcepeak=sourcepeak,
-                metabolitelist=metabolitelist,
-                biggestpeakidx=biggestpeakidx,
-                peakoffsets=peakoffsets,
-                peaknames=peaknames)
-            writer.write_data(generate_spectra(raw_header, measurementtimes_ns, peakamplitudes, peakoffsets, spectra))
-            writer.write_data(generate_stream(raw_acquisition_list))
-        if(len(auximages) > 0):
-            writer.write_data(generate_aux_images(auximages))
+        nswitches = header_nswitches(header)
+        if not nswitches:
+            raise ValueError("this header records no switch count, so it describes no EPSI "
+                             "matrix")
+        # the converter writes the 13C frequency here despite the field name, since that is the
+        # frequency these spectra were actually acquired at
+        center_freq_hz = header.experimental_conditions.h1resonance_frequency_hz
+        if not center_freq_hz:
+            raise ValueError("the header records no resonance frequency, so there is no ppm "
+                             "axis")
+
+        with mrd.BinaryMrdWriter(output) as writer:
+            # record what this reconstruction was run with, so a recon file says how it was made
+            header = append_recon_header(header,
+                                         line_broadening=line_broadening,
+                                         spec=spec,
+                                         fit_df=fit_df,
+                                         fit_dw=fit_dw,
+                                         fit_dph=fit_dph,
+                                         global_df=global_df,
+                                         width_scale=width_scale)
+            writer.write_header(header)
+
+            buffers: dict = {}
+            acquisitions: List[mrd.Acquisition] = []
+            for item in reader.read_data():
+                if not isinstance(item, mrd.StreamItem.Acquisition):
+                    continue
+                acq = item.value
+                acquisitions.append(acq)
+                ref = acq.head.encoding_space_ref or 0
+                if ref not in buffers:
+                    buffers[ref] = make_buffer(header, acq, nswitches, center_freq_hz)
+                buffer = buffers[ref]
+                buffer.check(acq)
+                buffer.img[acq.head.idx.repetition or 0,
+                           acq.head.idx.kspace_encode_step_1 or 0,
+                           :,
+                           :nswitches] = apply_line_broadening(
+                               acq, line_broadening,
+                               nswitches=nswitches,
+                               npoints_per_switch=buffer.kept)
+            if not acquisitions:
+                raise ValueError("this stream holds no acquisitions, so there is nothing to "
+                                 "reconstruct")
+
+            # one transform per repetition, over all three axes of its cube
+            print(f"Transforming {len(buffers)} encoding(s) from "
+                  f"{len(acquisitions)} acquisitions", file=sys.stderr)
+            for buffer in buffers.values():
+                for rep in range(buffer.img.shape[0]):
+                    buffer.img[rep] = fft_kspace_to_image(buffer.img[rep])
+
+            for ref, buffer in sorted(buffers.items()):
+                label = "phantom" if buffer.is_prescan else "metabolite"
+                writer.write_data(stream_epsi_image(
+                    buffer.img, buffer.xscale,
+                    PHANTOM_SPEC if buffer.is_prescan else spec,
+                    is_prescan=buffer.is_prescan,
+                    label=label,
+                    fit_df=fit_df, fit_dw=fit_dw, fit_dph=fit_dph,
+                    global_df=global_df, width_scale=width_scale))
+
+            # the raw acquisitions are kept in the recon file unchanged, as the legacy kept them
+            writer.write_data(mrd.StreamItem.Acquisition(a) for a in acquisitions)
 
 
 if __name__ == "__main__":
-    # read command line arguments
-    peakoffsets = []
-    peaknames = []
-    biggestpeaklist = []
-    metabolitelist = []
-    targetfiletype = ''
-    sourcepeak = 0
-    get_npy = True
-    for iarg in range(len(sys.argv) - 1):
-        try:
-            floatarg = float(sys.argv[iarg + 1])
-        except:
-            floatarg = np.nan
-        if(sys.argv[iarg] == '-f'):
-            basedir = sys.argv[iarg + 1]
-            print('setting base dir to', basedir, file=sys.stderr)
-            continue
-        if(sys.argv[iarg] == '-n'):
-            targetfiletype = sys.argv[iarg + 1]
-            print('setting target file type to', targetfiletype)
-            continue
-        if(sys.argv[iarg] == '-df'):
-            fit_df = floatarg
-            print('setting fit df to', fit_df)
-            continue
-        if(sys.argv[iarg] == '-dw'):
-            fit_dw = floatarg
-            print('setting fit dw to', fit_dw)
-            continue
-        if(sys.argv[iarg] == '-dph'):
-            fit_dph = floatarg
-            print('setting fit dph to', fit_dph)
-            continue
-        modifiers = '__'
-        if('_' in sys.argv[iarg]):
-            # a peak name string with modifiers
-            modifiers = sys.argv[iarg][(sys.argv[iarg].find('_')):]
-            sys.argv[iarg] = sys.argv[iarg][:sys.argv[iarg].find('_')]
-        if(sys.argv[iarg][0] == '-' and not np.isnan(floatarg)):
-            if('s' in modifiers):
-                sourcepeak = len(peaknames)
-            if(not 't' in modifiers):
-                biggestpeaklist.append(len(peaknames))
-            if('m' in modifiers):
-                metabolitelist.append(len(peaknames))
-            peaknames.append(sys.argv[iarg][1:])
-            peakoffsets.append(floatarg)
-    # run all mrd2 files in the directory for local run
-    if basedir != '.':
-        fnames = findmrd2files(basedir, targetfiletype)
-        # load the list of folders newly converted in this run; only these
-        # folders should be reconstructed. If the manifest is missing fall back
-        # to reconstructing everything found.
-#        convert_manifest_path = os.path.join(basedir, 'new_convert_files.txt')
-        new_convert_dirs = None
-#        if os.path.exists(convert_manifest_path):
-#            with open(convert_manifest_path) as cf:
-#                new_convert_dirs = set(os.path.normpath(line.strip()) for line in cf if line.strip())
-        # collect only the recon.mrd2 files generated in this run so already
-        # reconstructed (skipped) files are not picked up downstream
-        for i, f in enumerate(fnames):
-            folder = os.path.normpath(os.path.dirname(f))
-            if new_convert_dirs is not None and folder not in new_convert_dirs:
-                print(f'Skipping {i+1}/{len(fnames)}, folder not in convert manifest: {folder}', file=sys.stderr, flush=True)
-                continue
-            experiment_name = Path(f).parent.name
-            output_path = f.replace('raw.mrd2', experiment_name + '_recon.mrd2')
-#            if os.path.exists(output_path):
-#                print(f'Skipping {i+1}/{len(fnames)}, recon already exists at filepath: {output_path}', file=sys.stderr, flush=True)
-#                continue
-            print(f'Reconstructing {i+1}/{len(fnames)} at filepath: {f}', file=sys.stderr, flush=True)
-            reconstruct_mrs(f, output_path, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames)
-    else:
-        reconstruct_mrs(sys.stdin.buffer, sys.stdout.buffer, sourcepeak, metabolitelist, biggestpeaklist, np.array(peakoffsets), peaknames)
+    parser = argparse.ArgumentParser(
+        description="Reconstruct MRS data from an mrd2 file. Peaks are named as "
+                    "-<name>[_smt] <ppm>, e.g. -pyr_s 9.7 -lac_m 21.8")
+    parser.add_argument("-f", "--folder", type=Path, required=False, help="Folder to search for converted .mrd2 files, ignoring _recon.mrd2 output")
+    parser.add_argument("-i", "--input", type=Path, required=False, help="Input mrd2 file")
+    parser.add_argument("-o", "--output", type=Path, required=False, help="Output mrd2 file")
+    parser.add_argument("-lb", "--line-broadening", type=float, default=42, required=False, help="Line broadening factor in Hz")
+    parser.add_argument("-df", "--fit-df", type=float, default=0.0, required=False, 
+                        help="How far a peak center may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
+    parser.add_argument("-dw", "--fit-dw", type=float, default=0.0, required=False, 
+                        help="How far a peak width may move from the global fit during the per-voxel fit, in ppm. Default 0, i.e. held at the global fit")
+    parser.add_argument("-dph", "--fit-dph", type=float, default=0.0, required=False, 
+                        help="How far a peak phase may move from the global fit during the per-voxel fit, in radians. Default 0, i.e. held at the global fit")
 
-# now look for specification of metabolite peaks
-# BA's cirrhrat is -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8
-# SZ's mouse kidney is -bic_tm 0.0 -urea 2.3 -pyr_s 9.7 -ala_tm 15.2 -poop_tm 15.9 -hyd_tm 18.1 -lac_m 21.8
-# BA's spectra is -bic_tm -0.4 -urea 2.1 -urea2_t 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8 -w 0.5
-# DT's spectra is -urea 0.0 -KIC_s 8.6 -leu_tm 13.0 -hyd_tm 18.1 -?_tm 21.8 -w 1.
+    parser.add_argument("--fidpad", type=int, default=FIDPAD, required=False,
+                        help=f"Spectral zero fill factor. Default {FIDPAD}. At 1 the spectral "
+                             f"step is one point per switch, which on these scans is wider than "
+                             f"the lines, so a peak becomes a sub-pixel spike whose tail "
+                             f"displaces its weaker neighbours")
+
+    # the peak arguments have to come out before argparse sees them, since a peak's value may be
+    # negative and argparse would read that as another option
+    reserved = {option for action in parser._actions for option in action.option_strings}
+    spec, remaining = split_peak_args(sys.argv[1:], reserved)
+    args = parser.parse_args(remaining)
+
+    # read as a module global by spectral_axis and the buffers, so set it before anything runs
+    FIDPAD = args.fidpad
+
+    recon_kwargs = dict(line_broadening=args.line_broadening,
+                        spec=spec,
+                        fit_df=args.fit_df,
+                        fit_dw=args.fit_dw,
+                        fit_dph=args.fit_dph)
+
+    if args.folder and args.input:
+        raise ValueError("Cannot specify both --folder (local only) and --input")
+    elif args.folder:
+        if not args.folder.is_dir():
+            raise ValueError(f"{args.folder} is not a directory")
+        else:
+            mrd2_filepaths: List[Path] = []
+            for root, dirnames, filenames in os.walk(args.folder):
+                for filename in sorted(filenames):
+                    if filename.endswith(".mrd2") and not filename.endswith("_recon.mrd2"):
+                        mrd2_filepaths.append(Path(os.path.join(root, filename)))
+            if len(mrd2_filepaths) > 0:
+                for i, input_filepath in enumerate(mrd2_filepaths):
+                    # generate output file with suffix '_recon.mrd2' of raw filename
+                    recon_filepath = input_filepath.with_name(input_filepath.stem + "_recon.mrd2")
+                    print(f"Reconstructing {i+1}/{len(mrd2_filepaths)} at: {recon_filepath}", file=sys.stderr)
+                    with open(input_filepath, "rb") as input, open(recon_filepath, "wb") as output:
+                        reconstruct_mrs(input, output, **recon_kwargs)
+                    # except ValueError as err:
+                    #     # a folder holds whatever was converted into it, and this reconstruction is
+                    #     # EPSI only. One spectral scan among the inputs should not abandon the rest,
+                    #     # so drop the empty output it left behind and carry on
+                    #     recon_filepath.unlink(missing_ok=True)
+                    #     print(f"  skipping {input_filepath.name}: {err}", file=sys.stderr)
+            else:
+                raise ValueError(f"No raw mrd2 files found in {args.folder}")
+    elif args.input:
+        # no is_file() check: under tyger --input is a named pipe, for which it is False
+        if args.output is None:
+            raise ValueError("--input needs --output")
+        with open(args.input, "rb") as input, open(args.output, "wb") as output:
+            reconstruct_mrs(input, output, **recon_kwargs)
+    else:
+        raise ValueError("Either --folder or --input must be specified")

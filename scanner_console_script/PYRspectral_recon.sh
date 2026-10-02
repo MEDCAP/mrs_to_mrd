@@ -34,7 +34,7 @@ fi
 
 # call python scripts
 echo "Converting MRS to MRD format..."
-if ! winpty python MRStomrd2.py -f "$folder_path" -u 1; then
+if ! winpty python MRStomrd2.py -f "$folder_path"; then
     echo "❌ MRS to MRD conversion failed!"
     echo "Press any key to exit..."
     read -n 1
@@ -42,7 +42,7 @@ if ! winpty python MRStomrd2.py -f "$folder_path" -u 1; then
 fi
 
 echo "Running reconstruction code..."
-if ! winpty python mrd2recon.py -f "$folder_path" -urea 0.0 -KIC_s 8.6 -leu_tm 13.0 -hyd_tm 18.1 -?_tm 21.8 -w 1.; then
+if ! winpty python mrd2recon.py -f "$folder_path" -bic_tm -0.4 -urea 2.1 -urea2_t 2.3 -pyr_s 9.7 -ala_tm 15.2 -hyd_tm 18.1 -lac_m 21.8 -w 0.5; then
     echo "❌ Reconstruction failed!"
     echo "Press any key to exit..."
     read -n 1

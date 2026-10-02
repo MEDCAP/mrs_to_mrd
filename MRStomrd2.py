@@ -1,361 +1,372 @@
 """
-python script to convert MRS folder to MRD files in place
+Convert MR Solutions .MRD raw data to MRD v2.
+
+Three input modes, one per way a scan arrives:
+
+    -t/--tar     Single experiment epsi folder wrapped in a tar file, where each subdirectory folder 
+                 represent single repetition and pre-scan data that do not have the same dimension 
+                 as rawdata. 
+
+    -i/--input   A single .MRD filepath, or a directory holding exactly one, which is how spectral
+                 fid data usually arrives: one file already holds every repetition, so there is
+                 nothing to collect or group
+
+    -f/--folder  Legacy method for local testing. One experiment folder, walked for its .MRD files
+
+    -w/--window  Plot the echo position and sampling window
+
+Both -t and -f represent one experiment and take their name from it, so mrs_organize reads the
+directories inside only for their scan ids. Which files belong to one scan it decides from the
+sequence and the acquisition matrix, and a file's position in the group decides where its
+repetitions start, so a series split one file per repetition and a series already carried on one
+file's repetition axis number identically in the stream.
 """
 
-import numpy as np
-import sys
-import os
+from __future__ import annotations
+
 import argparse
-from statistics import mode
-from acqtypes import AcqType
+import os
+import sys
+from itertools import product
+from pathlib import Path
+from typing import Iterable, Optional
+
+import numpy as np
 
 # mrd python package
-# https://github.com/MEDCAP/mrd-fork/tree/dev# is added at root of this repository as a git submodule
-# path to mrd python package is 'root/mrd-fork/python' 
-# sys.path.insert(0, 'mrd-fork/python')
 import mrd
 from MRSreader import MRSdata
+from MRSorganize import (ScanGroup, read_scan_tar, organize_folder, organize_members,
+                         report_group)
+from mrd2shift import check_peak_position
 
-mrs = MRSdata()
 
-<<<<<<< HEAD
-def generate_pulseq_acquisition(g, ide):
-    '''
-    Define pulseq fields and extract acquisition from MRSdata structure g 
-    '''
-    # define pulseq definitions with pseudo rf pulses
-    # all time units are aligned to be in ns
-    pulse_length = np.uint64(1.0E+5)   # 100us in ns: guess pulelength to 100us
-    TE = np.uint64(1.8E+5)         # 180us in ns: just an estimate for now, start acquiring 180us after 100us pulse start
-    TR = np.uint64(g.tr * 1.0E+6)  # g.tr from ms to ns
-    definitions = mrd.PulseqDefinitions()
-    # start, end, and duration are measured in multiples of raster times
-    definitions.gradient_raster_time_ns = 1                             # typical pulseq value is 1e-05s=10us
-    definitions.radiofrequency_raster_time_ns = g.sampleperiod * 100    # sample period is units of 100ns
-    definitions.adc_raster_time_ns = 1                                  # typical pulseq value is 1e-07s=100ns 
-    definitions.block_duration_raster_ns = 1                            # typical pulseq value is 1e-05s=10us
-    definitions.name = "MRS epsi"                       
-    definitions.fov = g.FOV
-    definitions.custom['TE_ns'] = str(TE)
-    definitions.custom['TR_ns'] = str(TR)
-    definitions.custom['acq_start_time_ns'] = str(g.acqstarttime * 100)  # acqstarttime in units of 100ns converted to ns
-    definitions.custom['pulse_length_ns'] = str(pulse_length)               
-    yield mrd.StreamItem.PulseqDefinitions(definitions)
+def generate_acquisition(mrs: MRSdata,
+                         rep_idx: int = 0,
+                         encoding_ref: int = 0,
+                         total_rep: int = 0) -> Iterable[mrd.StreamItem]:
+    """
+    Emit one acquisition per adc event from one MRS file.
 
-    # define shape of the RF pulse uncompressed as currently pulseq-mrd conversion does not support compression
-    rf_amp_shape = mrd.shape()
-    rf_amp_shape.id = 1
-    # pulse length=100us / dt=10us = 10samples
-    rf_amp_shape.num_samples = pulse_length // definitions.radiofrequency_raster_time_ns
-    # shape data is normalized to [-1, 1] and amplitude is set in RFPulseEvent field
-    rf_amp_shape.data = np.ones(rf_amp_shape.num_samples, dtype=np.float64)
-    yield mrd.StreamItem.Shape(rf_amp_shape)
+    Only this file's own repetitions are walked, and rep_idx is where they start in the group, so
+    the two ways a series arrives number identically in the stream
+        - EPSI split one repetition per file: nrepetitions=1, rep_idx counting up per file       - EPSI or spectral in a single file:  nrepetitions=N, rep_idx=0
 
-    # define shape of the RF pulse uncompressed as currently pulseq-mrd conversion does not support compression
-    rf_phase_shape = mrd.shape()
-    rf_phase_shape.id = 2
-    # pulse length=100us / dt=10us = 10samples
-    rf_phase_shape.num_samples = pulse_length // definitions.radiofrequency_raster_time_ns
-    # phase is unknown so set to zeros
-    rf_phase_shape.data = np.zeros(rf_amp_shape.num_samples, dtype=np.float64)
-    yield mrd.StreamItem.Shape(rf_phase_shape)
-
-    # define RF event to specify amplitude and phase, offsets
-    rf = mrd.RFPulseEvent()
-    rf.id = 1                       # correspond to block.rf=1
-    rf.amp = float(1E+5)            # peak amplitude in (Hz) in float value is guessed
-    rf.mag_id = rf_amp_shape.id
-    rf.phase_id = rf_phase_shape.id
-    rf.time_id = 0                  # time_id=0 to use radiofrequency_raster_time_ns
-    rf.center_ns = pulse_length // 2 # center of the pulse in ns
-    rf.delay_ns = 0                 # delay before rf pulse start
-    rf.freq_ppm = 0                 # freq offset in ppm relative to main system's freq
-    rf.phase_ppm = 0                # phase offset in rad/MHz proportional to main system's freq
-    rf.freq_offset = 0              # freq offset in Hz
-    rf.phase_offset = 0             # phase offset in rad
-    rf.use = mrd.RFPulseUse.EXCITATION
-    yield mrd.StreamItem.RFPulseEvent(rf)
-
-    # encode pulse events and acquisition in a time-series for EPSI sequence
-    if(g.pplfile.find('epsi') >= 0):
-        [npts, nPE] = g.rawdata.shape   # number of points per acquisition and phase-encoding
-        for iacq in range(nPE):
-            # encode pulse events and acquisition in a time-series for each phase-encoding
-            block = mrd.Block()
-            block.id = iacq*2 + 1      # id is non-zero unique values, starting at 1 for rf pulse, 2 for adc period, 3 for next pulse
-            block.duration = pulse_length  # pulse length in units of definitions.block_duration_raster_ns
-            block.rf = 1                # rf pulse id
-            block.gx = 0                # no gradients for now
-            block.gy = 0
-            block.gz = 0
-            block.adc = 0
-            block.ext = 0               # extension to save LABEL for counters and flags, TRIGGERS
-            yield mrd.StreamItem.Block(block)
-            # to next rf pulse
-            block = mrd.Block
-            block.id += 1               # increment id from the previous value
-            block.duration = TR - pulse_length
-            block.rf = 0
-            block.gx = 0
-            block.gy = 0
-            block.gz = 0
-            block.adc = 0
-            block.ext = 0
-            yield mrd.StreamItem.Block(block)
-
-            # encode acquisition field
-            acq = mrd.Acquisition()
-=======
-def generate_acquisition(g, ide, acqtype):
-    # make the pulse, gradient, and (raw data) acquisitions. g is the MRSdata structure read in from an individual
-    # file, and ide is the index of this file in the image series
-    npts = g.rawdata.shape[0] # number of points per acquisition
-    pulse_len = 100E-6        # guess 100us, I don't know what it is
-    pulsedt = 10.0E-6         # specify pulse in steps of 10us
-    TE = 180E-6               # just an estimate for now, start acquiring 180us after beginning of 100us pulse
-    if(acqtype == AcqType.MRS_EPSI_PHANTOM or acqtype == AcqType.MRS_EPSI):
-        nPE = g.rawdata.shape[1]  # number of acquisitions per image file (phase-encodes)
-        for iacq in range(nPE):
-            # pulse and gradients specified based on original format
-            CO_freq = g.basefreq
-            pulse_start = np.uint64(g.acqstarttime * 100) + np.uint64(iacq * g.tr * 1.0E+6)
-            pulse_end = pulse_start + np.uint64(pulse_len * 1.0E+9)
-            npulsepoints = int(pulse_len / pulsedt)
-            # make the gradients
-            # make the acquisition
-            a = mrd.Acquisition()
-            a.head.user_int = np.array([acqtype.value]).astype(np.int32)
->>>>>>> main
-            if(iacq == 0):
-                acq.head.flags = mrd.AcquisitionFlags.FIRST_IN_PHASE
-            if(iacq == g.rawdata.shape[1] - 1):
-                acq.head.flags = mrd.AcquisitionFlags.LAST_IN_PHASE
-            acq.data = np.transpose(np.expand_dims(g.rawdata[:, iacq, 0, 0, 0, 0], (0)))
-            acq.head.acquisition_center_frequency = g.basefreq
-            acq.head.idx.phase = iacq
-            # pulseq only defines duration
-            # timestamp of each pulse start is recalculated here
-            pulse_start = np.uint64(definitions.custom['acq_start_time_ns']) + np.uint64(iacq * TR)
-            acq.head.acquisition_time_stamp_ns = pulse_start + TE
-            acq.head.idx.contrast = g.nswitch
-            totalppswitch = int(g.rawdata.shape[0] / g.nswitch + 0.7)
-<<<<<<< HEAD
-            acq.head.discard_pre = int((totalppswitch - g.nppswitch) / 2)
-            acq.head.discard_post = acq.head.discard_pre
-            acq.head.sample_time_ns = g.sampleperiod * 100                  # sampleperiod is in units of 100ns
-            acq.phase = np.zeros((g.rawdata.shape[0]), dtype=np.float32)    # acquisition phase array set to zeros
-            yield mrd.StreamItem.Acquisition(acq)
-
-    # MRS->mrd conversion for spectral sequence
-    elif(g.pplfile.find('1pul') >= 0):
-        nrep = g.rawdata.shape[5]  # number of acquisitions per image file (phase-encodes)
-        for iacq in range(nrep):
-            # encode pulse events and acquisition in a time-series for 1pul sequence
-            block = mrd.Block()
-            block.id = iacq*2 + 1      # id is non-zero unique values, starting at 1 for rf pulse, 2 for adc period, 3 for next pulse
-            block.duration = pulse_length  # pulse length in units of definitions.block_duration_raster_ns
-            block.rf = 1                # rf pulse id
-            block.gx = 0                # no gradients for now
-            block.gy = 0
-            block.gz = 0
-            block.adc = 0
-            block.ext = 0               # extension to save LABEL for counters and flags, TRIGGERS
-            yield mrd.StreamItem.Block(block)
-            # to next rf pulse
-            block = mrd.Block
-            block.id += 1               # increment id from the previous value
-            block.duration = TR - pulse_length
-            block.rf = 0
-            block.gx = 0
-            block.gy = 0
-            block.gz = 0
-            block.adc = 0
-            block.ext = 0
-            yield mrd.StreamItem.Block(block)
-
-            # encode acquisition field
-            acq = mrd.Acquisition()
-            acq.data = np.transpose(np.expand_dims(g.rawdata[:, 0, 0, 0, 0, iacq], (0)))
-            acq.head.acquisition_center_frequency = g.basefreq
-            pulse_start = np.uint64(definitions.custom['acq_start_time_ns']) + np.uint64(iacq * TR)
-            acq.head.idx.repetition = iacq
-            acq.head.acquisition_time_stamp_ns = pulse_start + TE
-            acq.head.idx.contrast = 1
-            acq.head.discard_pre = 0
-            acq.head.discard_post = 0
-            acq.head.sample_time_ns = g.sampleperiod * 100                  # convert to ns (sampleperiod is in units of 100ns)
-            acq.phase = np.zeros((g.rawdata.shape[0]), dtype=np.float32)    # acquisition phase array set to zeros
-            yield mrd.StreamItem.Acquisition(acq)
-=======
-            a.head.discard_pre = int((totalppswitch - g.nppswitch) / 2)
-            a.head.discard_post = a.head.discard_pre
-            a.head.sample_time_ns = g.sampleperiod * 100  # convert to ns (sampleperiod is in units of 100ns)
-            a.phase = np.zeros((g.rawdata.shape[0]), dtype=np.float32)
-            yield mrd.StreamItem.Acquisition(a)
-
-    elif(acqtype == AcqType.MRS_FID):
-        nrep = g.rawdata.shape[5]  # number of acquisitions per image file (phase-encodes)
-        for iacq in range(nrep):
-            # make the pulse
-            p = mrd.Pulse()
-            CO_freq = g.basefreq
-            pulse_start = np.uint64(g.acqstarttime * 100) + np.uint64(iacq * g.tr * 1.0E+6)
-            pulse_end = pulse_start + np.uint64(pulse_len * 1.0E+9)
-            p.head.pulse_time_stamp_ns = pulse_start
-            p.head.sample_time_ns = g.sampleperiod * 100  # convert to ns (sampleperiod is in units of 100ns)
-            npulsepoints = int(pulse_len / pulsedt)
-            p.amplitude = np.zeros((1, npulsepoints)).astype(np.float32)
-            p.phase = np.zeros(npulsepoints).astype(np.float32)
-            for idt in range(npulsepoints):
-                p.amplitude[0, idt] = 1.0    # we don't know the pulse amplitude or phase yet
-                p.phase[idt] = 0.0
-            yield mrd.StreamItem.Pulse(p)
-            # no gradients
-            # make the acquisition
-            a = mrd.Acquisition()
-            a.data = np.transpose(np.expand_dims(g.rawdata[:, 0, 0, 0, 0, iacq], (0)))
-            a.head.user_int = np.array([acqtype.value]).astype(np.int32)
-            a.head.acquisition_center_frequency = g.basefreq
-            # print('writing center freq = ', a.head.acquisition_center_frequency)
-            a.head.idx.repetition = iacq
-            a.head.acquisition_time_stamp_ns = pulse_start + np.uint64(TE * 1.0E+9)
-            a.head.idx.contrast = 1
-            a.head.discard_pre = 0
-            a.head.discard_post = 0
-            a.head.sample_time_ns = g.sampleperiod * 100  # convert to ns (sampleperiod is in units of 100ns)
-            a.phase = np.zeros((g.rawdata.shape[0]), dtype=np.float32)
-            yield mrd.StreamItem.Acquisition(a)
->>>>>>> main
-
-def groupMRDfiles_collect(rootdir):
-    '''
-    Find all .MRD files in this directory and subdirectories. Skip files with more than 1 average as they are phantom data.
+    Each axis takes the MRD index that means the same thing
+        nviews       -> kspace_encode_step_1
+        nsliceviews  -> kspace_encode_step_2
+        nslices      -> slice
+        nechoes      -> contrast
+        nrepetitions -> repetition
     Args:
-        rootdir: path to the root directory as a string specified by -f command line argument
-    Returns
-        List of paths of .MRD files as strings with / as path separator
-    '''
-    l = []
-    d = os.listdir(rootdir)
-    for f in d:
-        if(os.path.isdir(rootdir + '/' + f)):
-            l.extend(groupMRDfiles_collect(rootdir + '/' + f))
-        elif(f.find('.MRD') > 0):
-            mrsdata_filepath = rootdir + '/' + f
-            mrs.mread3d(mrsdata_filepath)
-            print(f'Add file {mrsdata_filepath} with {mrs.navg} avg')
-            l.append(mrsdata_filepath)
-    return l
+        - mrs: one parsed MRS file, rawdata indexed
+               (nsamples, nviews, nsliceviews, nslices, nechoes, nrepetitions)
+        - rep_idx: idx position of this file in the total repetition
+        - encoding_ref: which header encoding describes this file's matrix. 0 is the series, 1 the
+          averaged prescan. The prescan flag says what an acquisition is; this says what geometry
+          it has, and a reader needs both
+        - total_rep: total number of repetitions in the whole group, for the LAST_IN_REPETITION flag
+        Defaults to this file being the whole group
+    Returns:
+        - Iterable of mrd.StreamItem.Acquisition
+    """
+    # acquisitions in one repetition: the grid below the repetition axis, in the order product()
+    # walks it, so counter decomposes as irep * per_rep + the position inside that repetition
+    per_rep = mrs.nechoes * mrs.nslices * mrs.nsliceviews * mrs.nviews
+    grid = product(range(mrs.nrepetitions), range(mrs.nechoes), range(mrs.nslices),
+                   range(mrs.nsliceviews), range(mrs.nviews))
+    for counter, (irep, iecho, islice, isliceview, iview) in enumerate(grid):
+        acq = mrd.Acquisition()
+        acq.head.encoding_space_ref = encoding_ref  # header.encoding[idx]: 0 for rawdata, 1 for prescan data
+        acq.head.acquisition_time_stamp_ns = np.uint64(mrs.acquisition_timestamp * 100) # mrs timestamp is in 100ns
+        acq.head.sample_time_ns = mrs.sample_period * 100       # sample_period in units of 100ns
+        acq.head.idx.average = mrs.naverages                    # number of averages, not index
+        # irep=0 for single repetition file and rep_idx=0..N-1 is the position in the group of N files
+        # irep=0...N-1 for N repetition file and rep_idx=0 as position in the group
+        abs_rep = rep_idx + irep
+        if total_rep and abs_rep >= total_rep:
+            raise ValueError(f"repetition {abs_rep} is past the {total_rep} the group declared")
+        acq.head.idx.repetition = abs_rep
+        # position inside each repetition, flag only once for first acq samples in the view*repetitions
+        if abs_rep == 0 and iview == 0:
+            acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_REPETITION
+        if abs_rep == total_rep - 1 and iview == mrs.nviews - 1:
+            acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_REPETITION
+        acq.head.idx.kspace_encode_step_1 = iview
+        acq.head.idx.kspace_encode_step_2 = isliceview
+        acq.head.idx.slice = islice
+        acq.head.idx.contrast = iecho
+        acq.head.scan_counter = counter + rep_idx * per_rep
+        if iview == 0:
+            acq.head.flags |= mrd.AcquisitionFlags.FIRST_IN_PHASE
+        if iview == mrs.nviews - 1:
+            acq.head.flags |= mrd.AcquisitionFlags.LAST_IN_PHASE
+        # epsi sequence acquire in the order of rampup -> readout -> rampdown -> rephasing, so one
+        # switch period is ramp + npoints_per_switch + 3 ramps. tramp is in us and sample_period in
+        # units of 100ns, hence the /10 that puts them both in samples
+        # example cirrhrat_43_1: tramp=112us / 28 = 4, and 4 + 12 + 12 = 1792 samples / 64 switches
+        if mrs.nswitches > 1:
+            ramp = mrs.tramp // (mrs.sample_period // 10)
+            acq.head.discard_pre = ramp
+            acq.head.discard_post = ramp * 3    # rampdown + rephasing, which is two ramps
+        # Only for epsi data, treat this file as prescan phantom data when navg>1 and nrep==1
+        if mrs.naverages > 1 and mrs.nrepetitions == 1 and 'epsi' in mrs.sequence_name:
+            acq.head.flags |= mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT
+        # MRS acquires on one channel, so add the coil axis: acq.data.shape=(coils=1, samples)
+        acq.data = np.expand_dims(mrs.rawdata[:, iview, isliceview, islice, iecho, irep], axis=0)
+        yield mrd.StreamItem.Acquisition(acq)
 
-def groupMRDfiles(rootdir, unifylevel):
-    '''
-    Group .MRD files into groups of files that have the same path up to the unifylevel
+
+def generate_header(mrs: MRSdata, group: ScanGroup) -> mrd.Header:
+    """
+    Fill in the MRD header from one file's parameters. Every file in a group was acquired at the
+    same matrix, which is what let them be combined, so any of them describes the geometry
     Args:
-        rootdir: path to the root directory as a string specified by -f command line argument
-        unifylevel: 3 to concatenate each image file into single MRD file
-                    1 to keep each image file as a separate MRD file
-                    as an integer specified by -u command line argument
-    Returns
-        List of paths of .MRD files to be grouped together
-    '''
-    if(not os.path.isdir(rootdir)):
-        return([])
-    l = groupMRDfiles_collect(rootdir)
-    # PUT NAVG INTO A USER INT FOR EACH ACQUISITION
-    groups = []
-    # for each .MRD files in the list,
-    for f in l:
-        fs = f.split('/')
-        addedtogroup = False
-        for g in groups:
-            gs = g[0].split('/')
-            if(len(fs) == len(gs)):
-                issame = True
-                for i in range(len(fs) - unifylevel):
-                    issame = issame and (fs[i] == gs[i])
-                if(issame):
-                    g.append(f)
-                    addedtogroup = True
-        if(not addedtogroup):
-            groups.append([f])
-    return(groups)
+        - mrs: the file the header describes, chosen by convert_group_to_mrd
+        - group: the ScanGroup, read for the acquisition matrices it recorded. One encoding is
+          written per matrix, so the prescan's is described without any prescan file being read
+    Returns:
+        - mrd.Header
+    """
+    header = mrd.Header()
 
-def make_header(mrs, measID):
-    # make mrd2 header. For now only filling in sequence name but some day should do more
-    h = mrd.Header()
-    h.measurement_information = mrd.MeasurementInformationType()
-    h.measurement_information.sequence_name = mrs.pplfile
-    table_pos = mrd.ThreeDimensionalFloat()
-    table_pos.x = mrs.FOVoff[0]
-    table_pos.y = mrs.FOVoff[1]
-    table_pos.z = mrs.FOVoff[2]
-    h.measurement_information.relative_table_position = table_pos
-    # this may be a misuse of the relative table position but I couldn't find FOV offset anywhere
-    # This is definitely a misuse of h1 resonance frequency for non-1H acquisitions
-    h.experimental_conditions.h1_resonance_frequency_hz = mrs.basefreq
-    h.measurement_information.measurement_id = measID
+    seq = mrd.SequenceParametersType()
+    seq.t_r = [mrs.tr]
+    seq.t_e = [mrs.te]
+    seq.flip_angle_deg = [mrs.flip_angle]
+    header.sequence_parameters = seq 
 
-    limits_avg = mrd.LimitType()
-    limits_avg.minimum = 0
-    limits_avg.maximum = mrs.navg - 1
-    limits = mrd.EncodingLimitsType()
-    limits.average = limits_avg
-    enc = mrd.EncodingType()
-    enc.encoding_limits = limits
-    h.encoding.append(enc)
-    return h
+    meas = mrd.MeasurementInformationType()
+    meas.sequence_name = mrs.sequence_name
+    meas.measurement_id = group.meas_id         # e.g.) cirrhrat_43_1, KIC_Huh7msps5_08-15-2025.mrs
+    meas.protocol_name = group.meas_id.split("_")[0]
+    meas.relative_table_position = mrd.ThreeDimensionalFloat(x=mrs.FOVoffset[0] * 1e3,
+                                                             y=mrs.FOVoffset[1] * 1e3,
+                                                             z=mrs.FOVoffset[2] * 1e3)  # m -> mm
+    header.measurement_information = meas
+    
+    header.experimental_conditions.h1resonance_frequency_hz = mrs.base_frequency
+    
+    user_param = mrd.UserParametersType()
+    for name, value in (("tramp_us", mrs.tramp),
+                        ("nswitches", mrs.nswitches),
+                        ("npoints_per_switch", mrs.npoints_per_switch)):
+        user_param.user_parameter_long.append(
+                mrd.UserParameterLongType(name=name, value=int(value)))
+    header.user_parameters = user_param
 
-# check to see if a directory is specified
-def convert_mrs_to_mrd(basedir, unifylevel):
-    # assemble groups of MRD files
-    groups = groupMRDfiles(basedir, unifylevel)
-    # groups are lists of MRS files to be grouped together in a single .MRD2 file format
-    for g in groups:
-        # get the measurement ID from the first file in the group
-        measID = g[0].split('/')[-(unifylevel + 1)]
-        basedir = '/'.join(g[0].split('/')[:(-unifylevel)])
-        print(f'grouping {len(g)} files into {basedir}', file=sys.stderr)
-        w = mrd.BinaryMrdWriter(basedir + '/' + 'raw.mrd2')
-        header_written = False
-        for ig in range(len(g)):
-            # write the header once for the entire group after continue
-            # re-read the data to set the correct header for each group
-            mrs.mread3d(g[ig])
-            if unifylevel == 3:
-                if "1puls" in mrs.pplfile or "one_pulse" in mrs.pplfile or "fid" in mrs.pplfile:
-                    continue
-                if(mrs.navg > 1):
-                    print(f"Saving file {g[ig]} with {mrs.navg} averages as phantom", file=sys.stderr)
-                    at = AcqType.MRS_EPSI_PHANTOM
-                else:
-                    at = AcqType.MRS_EPSI
-            elif unifylevel == 1:
-                if "epsi" in mrs.pplfile:
-                    continue
-                at = AcqType.MRS_FID
-            else:
-                print('unifylevel not supported', file=sys.stderr)
-                return
-            if not header_written:
-                h = make_header(mrs, measID)
-                w.write_header(h)
-<<<<<<< HEAD
-            w.write_data(generate_pulseq_acquisition(mrs, ig))
-=======
-                header_written = True
-            w.write_data(generate_acquisition(mrs, ig, at))
->>>>>>> main
-        w.close()
+    # group stores rawdata and prescan data shape as dict since rawdata and prescan differ in dimension
+    for shape in (group.rawdata_shape, group.prescan_shape):
+        if not shape:   # if no prescan exist skip
+            continue
+        encoded_space = mrd.EncodingSpaceType()
+        encoded_space.field_of_view_mm = mrd.FieldOfViewMm(x=mrs.FOV * 1e3, y=mrs.FOV * 1e3, z=0)
 
-# -u 3 consolidates the files as appropriate for EPSI. 
-# spectral data like Bukola's and David's uses -u 1
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Convert MRS data folder to MRD2 format')
-    parser.add_argument('-f', '--folder', type=str, required=True,
-                        help='Base directory containing MRS data files')
-    parser.add_argument('-u', '--unifylevel', type=int, required=False, default=1,
-                        help='Directory levels to unify when grouping files (default: 1)')
+        # each limit is the size of one rawdata dimension, as a maximum index, and every dimension
+        limits = mrd.EncodingLimitsType()
+        limits.kspace_encoding_step_0 = mrd.LimitType(maximum=shape["nsamples"] - 1)
+        limits.kspace_encoding_step_1 = mrd.LimitType(maximum=shape["nviews"] - 1)
+        limits.kspace_encoding_step_2 = mrd.LimitType(maximum=shape["nsliceviews"] - 1)
+        limits.phase = mrd.LimitType(maximum=shape["nviews"] - 1)
+        limits.slice = mrd.LimitType(maximum=shape["nslices"] - 1)
+        limits.contrast = mrd.LimitType(maximum=shape["nechoes"] - 1)
+        limits.repetition = mrd.LimitType(minimum=0, maximum=shape["nrepetitions"] - 1)
+        encoding = mrd.EncodingType()
+        encoding.encoded_space = encoded_space
+        encoding.encoding_limits = limits
+        # header.encoding is a list of mrd.EncodingType()
+        # Which encoding to use is stored as idx in acq.head.encoding_space_ref
+        header.encoding.append(encoding)
+    return header
+
+def convert_folder_to_mrd(folder: Path,
+                          dry_run: bool = False,
+                          check_window: bool = False) -> bool:
+
+    """
+    Walk one experiment folder for .MRD files and convert each scan to its own stream inside it
+        spectral: {experiment_folder}/{KIC_Huh7msps5_08-15-2025.MRD}
+            -> KIC_Huh7msps5_08-15-2025.mrs/KIC_Huh7msps5_08-15-2025.mrs_1puls_extrf_KIC.mrd2
+        EPSI:     {experiment_folder}/{modal}/{scan_id}/{24804_000_0.MRD}, one repetition per scan directory
+            -> cirrhrat_43_1/cirrhrat_43_1_epsigre_combined.mrd2
+        EPSI:     a subdirectory among those has navg>1 and nrep=1 instead - an averaged prescan,
+                  converted into the same stream as the data it calibrates rather than a file of
+                  its own, its acquisitions flagged IS_NAVIGATION_DATA
+    Args:
+        - folder: the experiment folder to walk
+        - dry_run: report the grouping and what looks wrong with it, converting nothing
+        - check_window: report sampling window and try shifting the echo position
+    Returns:
+        - True when at least one scan was written, or when a dry run found something to convert
+    """
+    # scan subfolders of provided folder and group them into rawdata and prescan data as object ScanGroup
+    grouped_files = organize_folder(folder)
+    if dry_run:
+        report_group(grouped_files)
+        return bool(grouped_files)
+    if grouped_files is None:
+        print(f"No data to convert in {folder}", file=sys.stderr)
+        return False
+    # plot signals for each switch
+    if check_window:
+        check_peak_position(grouped_files)
+    # summed over the rawdata files by the grouping, so it resolves both arrival shapes without
+    # asking which one this is: one file per repetition, or one file already holding the axis
+    writer: Optional[mrd.BinaryMrdWriter] = None
+    rep_base = 0
+    try:
+        # first convert raw data files before phantom files in the group
+        for i, filepath in enumerate(grouped_files.rawdata_file_list):
+            mrs = MRSdata()                     # one at a time, released once written
+            mrs.read_from_file(filepath)
+            if writer is None:
+                print(f'Writing file at {grouped_files.output_path}', file=sys.stderr)
+                writer = mrd.BinaryMrdWriter(grouped_files.output_path)
+                writer.write_header(generate_header(mrs, grouped_files))
+            writer.write_data(generate_acquisition(mrs, rep_idx=i, encoding_ref=0,
+                                                   total_rep=grouped_files.rawdata_shape["nrepetitions"]))
+        # next, convert the phantom files in the group navg>1 if they exist. They only ever join a
+        # stream the rawdata already opened, since the header is never built from a prescan
+        if writer is not None:
+            for i, filepath in enumerate(grouped_files.prescan_file_list):
+                mrs = MRSdata()
+                mrs.read_from_file(filepath)
+                writer.write_data(generate_acquisition(mrs, rep_idx=i, encoding_ref=1,
+                                                       total_rep=grouped_files.prescan_shape["nrepetitions"]))
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        print(f"No data to convert for {grouped_files.meas_id}", file=sys.stderr)
+        return False
+
+    return True
+
+
+def convert_tar_to_mrd(tar_path: Path, output_path: Path) -> bool:
+    """
+    Convert tar filed directory of single experiment epsi MRS data folder, exactly as --folder
+    converts that directory unpacked
+
+    Tyger hands a job its input buffer as a named FIFO, which is strictly sequential, so the
+    archive is read forward once and held in memory: the parameter block sits after the raw data at
+    EOF, the .SPR sidecar can follow the .MRD members in tar order, and the header needs the whole
+    group before the first acquisition can be written.
+
+    A Tyger job has one output buffer, so the tar holds one experiment and this writes one stream
+    Args:
+        - tar_path: tar archive of one experiment directory, or a FIFO carrying one
+        - output_path: where to write the stream, which may also be a FIFO
+    Returns:
+        - True when a stream was written
+    """
+    # opening a FIFO for read blocks until the buffer sidecar opens the write end
+    with open(tar_path, "rb") as tar_stream:
+        tar_meas_id, spr_frequency, members = read_scan_tar(tar_stream)
+    fallback = tar_meas_id or Path(output_path).stem
+    if not tar_meas_id:
+        # nothing to name the scan after: the archive holds no single root directory
+        print(f"No single root directory in the tar, calling this scan {fallback}", file=sys.stderr)
+    if not spr_frequency:
+        print("No base frequency from a .SPR sidecar in the tar", file=sys.stderr)
+
+    payloads = dict(members)
+    grouped_files = organize_members(members, fallback_meas_id=fallback)
+    if grouped_files is None:
+        # nothing grouped, but on Tyger the output buffer's FIFO still has to open and close, or
+        # the sidecar is left blocked on a stream that never opens
+        print(f"No data to convert in {tar_path}", file=sys.stderr)
+        with open(output_path, "wb"):
+            pass
+        return False
+
+    rep_count = grouped_files.rawdata_shape["nrepetitions"]
+    writer: Optional[mrd.BinaryMrdWriter] = None
+    rep_idx = 0
+    try:
+        for name in grouped_files.rawdata_file_list:
+            mrs = MRSdata()
+            mrs.parse_from_buffer(payloads[name])
+            mrs.set_base_frequency(spr_frequency)  # the .MRD may defer its frequency to the sidecar
+            if writer is None:
+                print(f'Writing file at {output_path}', file=sys.stderr)
+                writer = mrd.BinaryMrdWriter(str(output_path))
+                writer.write_header(generate_header(mrs, grouped_files))
+            writer.write_data(generate_acquisition(mrs, rep_idx=rep_idx, encoding_ref=0,
+                                                   total_rep=rep_count))
+            rep_idx += mrs.nrepetitions
+        if writer is not None:
+            # a prescan is not a repetition of the acquisition it calibrates and is not counted in
+            # rep_count, so it cannot carry a repetition index past the limit the header declared.
+            # It sits at repetition 0 and is told apart by IS_NAVIGATION_DATA instead
+            for name in grouped_files.prescan_file_list:
+                mrs = MRSdata()
+                mrs.parse_from_buffer(payloads[name])
+                mrs.set_base_frequency(spr_frequency)
+                writer.write_data(generate_acquisition(
+                        mrs, rep_idx=0, encoding_ref=1,
+                        total_rep=grouped_files.prescan_shape["nrepetitions"]))
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        print(f"No data to convert for {grouped_files.meas_id}", file=sys.stderr)
+        with open(output_path, "wb"):
+            pass
+        return False
+    return True
+
+
+def main() -> int:
+    """
+    Convert MRS data to MRD2, in exactly one of three input modes, or with -w report where the echo
+    peaks inside each gradient switch of what those modes resolve to and convert nothing.
+
+    Every check that can stop the run lives here. Past this point a file that cannot be converted is
+    reported and skipped, so the run ends with a status rather than a traceback
+    Returns:
+        - 0 when at least one stream was written, or one scan was reported on with -w. 1 when
+          nothing was
+    """
+    parser = argparse.ArgumentParser(description="Convert MR Solutions MRS data to MRD2 format")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("-t", "--tar", type=Path,
+                      help="tar archive of one scan directory, or a FIFO carrying one")
+    mode.add_argument("-f", "--folder", type=Path,
+                      help="directory to walk for MRS .MRD files")
+    parser.add_argument("-o", "--output", type=Path,
+                        help="file or FIFO to write the MRD2 stream to. Required with --tar "
+                             "(default: $OUTPUT_PIPE), optional with --input, unused with --folder")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="with --folder only: report how the files group them, without converting")
+    parser.add_argument("-w", "--window", action="store_true",
+                        help="with --folder only: plot where the echo peaks in each gradient switch, "
+                             "then take the drift along the switch train out and plot it again, "
+                             "converting nothing")
     args = parser.parse_args()
-    print(f'running with base director {args.folder}', file=sys.stderr)
-    print(f'unify level set to {args.unifylevel}', file=sys.stderr)
-    convert_mrs_to_mrd(args.folder, args.unifylevel)
+
+    if args.tar and not args.tar.exists():
+        parser.error(f"{args.tar} does not exist")
+    if args.folder and not args.folder.is_dir():
+        parser.error(f"{args.folder} is not a directory")
+    if args.tar and (args.window or args.dry_run):
+        parser.error(f"-t can only us to convert file")
+
+    if args.folder:
+        # convert folder allows
+        print(f"Converting single experiment folder {args.folder}", file=sys.stderr)
+        written = convert_folder_to_mrd(args.folder, args.dry_run, args.window)
+    elif args.tar:
+        output = args.output or Path(os.environ.get("OUTPUT_PIPE", ""))
+        if not str(output):
+            parser.error("--tar needs --output, or $OUTPUT_PIPE set")
+        print(f"Converting tar of single experiment folder {args.tar}", file=sys.stderr)
+        written = convert_tar_to_mrd(args.tar, output)
+    if not written:
+        print("Nothing was converted", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
