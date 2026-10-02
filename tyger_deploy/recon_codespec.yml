@@ -7,7 +7,7 @@
 #   _s source peak (the injected substrate), _t tiny peak, _m derived metabolite.
 job:
   codespec:
-    image: ghcr.io/medcap/mrs-recon:latest
+    image: ghcr.io/medcap/mrs_to_mrd/mrs-recon:latest
     buffers:
       inputs: ["input"]
       outputs: ["output"]

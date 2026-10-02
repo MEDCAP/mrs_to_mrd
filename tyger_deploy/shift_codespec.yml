@@ -10,7 +10,7 @@
 # tyger is the input FIFO's path.
 job:
   codespec:
-    image: ghcr.io/medcap/mrs-shift:latest
+    image: ghcr.io/medcap/mrs_to_mrd/mrs-shift:latest
     buffers:
       inputs: ["input"]
       outputs: ["output"]

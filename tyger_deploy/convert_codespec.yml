@@ -11,7 +11,7 @@
 # the tar from the input pipe and -o writes the stream to the output pipe.
 job:
   codespec:
-    image: ghcr.io/medcap/mrs-convert:latest
+    image: ghcr.io/medcap/mrs_to_mrd/mrs-convert:latest
     buffers:
       inputs: ["input"]
       outputs: ["output"]

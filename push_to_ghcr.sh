@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Ensure we have git commit hash
 COMMIT_HASH=$(git rev-parse --short HEAD)
-REPO="ghcr.io/medcap"
+REPO="ghcr.io/medcap/mrs_to_mrd"
 TARGETS=("convert" "shift" "recon")
 
 # Check for uncommitted changes to avoid pushing stale code without warning

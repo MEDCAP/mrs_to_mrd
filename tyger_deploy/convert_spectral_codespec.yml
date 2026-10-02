@@ -8,7 +8,7 @@
 # here so the wiring is visible in the codespec.
 job:
   codespec:
-    image: ghcr.io/medcap/mrs-convert-spectral:latest
+    image: ghcr.io/medcap/mrs_to_mrd/mrs-convert-spectral:latest
     buffers:
       inputs: ["input"]
       outputs: ["output"]
