@@ -296,15 +296,15 @@ def convert_tar_to_mrd(tar_path: Path, output_path: Path) -> bool:
                                                    total_rep=rep_count))
             rep_idx += mrs.nrepetitions
         if writer is not None:
-            # a prescan is not a repetition of the acquisition it calibrates and is not counted in
-            # rep_count, so it cannot carry a repetition index past the limit the header declared.
-            # It sits at repetition 0 and is told apart by IS_NAVIGATION_DATA instead
-            for name in grouped_files.prescan_file_list:
+            # a prescan is not a repetition of the acquisition it calibrates, so it fills encoding 1,
+            # whose repetition axis counts the prescan files. Each takes its own index there, as
+            # in convert_group_to_mrd; a shared index 0 had the last prescan overwrite the others
+            for i, name in enumerate(grouped_files.prescan_file_list):
                 mrs = MRSdata()
                 mrs.parse_from_buffer(payloads[name])
                 mrs.set_base_frequency(spr_frequency)
                 writer.write_data(generate_acquisition(
-                        mrs, rep_idx=0, encoding_ref=1,
+                        mrs, rep_idx=i, encoding_ref=1,
                         total_rep=grouped_files.prescan_shape["nrepetitions"]))
     finally:
         if writer is not None:

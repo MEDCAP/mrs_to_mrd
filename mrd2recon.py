@@ -352,6 +352,7 @@ class EncodingBuffer:
     voxel loop clobbered them, and why its answers depended on processing the phantom first.
     """
     img: np.ndarray             # (nreps, ky, kx, t); k-space until fft_kspace_to_image runs
+    filled: np.ndarray          # (nreps, ky) bool, which readouts have landed
     xscale: np.ndarray          # this encoding's own ppm axis
     kept: int                   # flat top points of one switch, which is the readout axis
     samples: int                # the three the homogeneity check compares
@@ -374,6 +375,23 @@ class EncodingBuffer:
                 f"encoding {acq.head.encoding_space_ref} was built at (samples, discard_pre, "
                 f"discard_post)={(self.samples, self.discard_pre, self.discard_post)} but "
                 f"carries an acquisition at {layout}")
+
+    def place(self, acq: mrd.Acquisition, readout: np.ndarray, nswitches: int) -> None:
+        """
+        Put one readout into its (repetition, view) slot, raising if that slot is already full.
+
+        Two acquisitions sharing a slot means two scans were numbered alike, and assigning the
+        second over the first keeps whichever arrived last while the slot it should have filled
+        stays zero - which phase_align and the voxel fit then skip as a repetition never sent.
+        """
+        rep = acq.head.idx.repetition or 0
+        view = acq.head.idx.kspace_encode_step_1 or 0
+        if self.filled[rep, view]:
+            raise ValueError(
+                f"encoding {acq.head.encoding_space_ref} received a second acquisition at "
+                f"repetition {rep}, view {view}; two scans were numbered as the same repetition")
+        self.filled[rep, view] = True
+        self.img[rep, view, :, :nswitches] = readout
 
 
 def make_buffer(header: mrd.Header,
@@ -415,14 +433,11 @@ def make_buffer(header: mrd.Header,
     spectral_bw_hz = 1.0e+9 / (acq.head.sample_time_ns * totalppswitch)
     bw_ppm = spectral_bw_hz / center_freq_hz * 1.0e+6
     nfreq = nswitches * FIDPAD
-    # a prescan is not a repetition of the series and carries no repetition axis of its own; in
-    # tar mode every prescan file is handed rep_idx=0, so two of them would collide here
+    nreps = limits.repetition.maximum + 1
+    nviews = limits.phase.maximum + 1
     return EncodingBuffer(
-        img=np.zeros((limits.repetition.maximum + 1,    # repetition
-                      limits.phase.maximum + 1,         # ky
-                      kept,                             # kx
-                      nfreq),                           # t
-                     dtype='complex'),
+        img=np.zeros((nreps, nviews, kept, nfreq), dtype='complex'),    # (repetition, ky, kx, t)
+        filled=np.zeros((nreps, nviews), dtype=bool),
         xscale=np.arange(nfreq) / nfreq * bw_ppm,
         kept=kept,
         samples=acq.samples(),
@@ -823,13 +838,10 @@ def reconstruct_mrs(input: BinaryIO,
                     buffers[ref] = make_buffer(header, acq, nswitches, center_freq_hz)
                 buffer = buffers[ref]
                 buffer.check(acq)
-                buffer.img[acq.head.idx.repetition or 0,
-                           acq.head.idx.kspace_encode_step_1 or 0,
-                           :,
-                           :nswitches] = apply_line_broadening(
-                               acq, line_broadening,
-                               nswitches=nswitches,
-                               npoints_per_switch=buffer.kept)
+                buffer.place(acq, apply_line_broadening(acq, line_broadening,
+                                                        nswitches=nswitches,
+                                                        npoints_per_switch=buffer.kept),
+                             nswitches)
             if not acquisitions:
                 raise ValueError("this stream holds no acquisitions, so there is nothing to "
                                  "reconstruct")
