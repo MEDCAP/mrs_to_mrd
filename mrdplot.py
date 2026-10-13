@@ -17,6 +17,7 @@ converted stream, on a shift-corrected one and on a reconstruction:
                                        sample by sample, with each peak's offset and the distance
                                        the fit had to move it
     metabolite_amplitude               one map per metabolite across the repetitions
+    phantom                            the fitted area map of each prescan, on one shared scale
 
 With --save the figures are written as PNGs instead of shown, for running without a display, and
 the transformed readouts are written beside them as a .mat.
@@ -345,6 +346,38 @@ def plot_metabolite_maps(contents: Contents, filename: str) -> bool:
     return True
 
 
+def phantom_arrays(contents: Contents) -> Dict[str, mrd.NdArray]:
+    """The arrays the recon flagged ArrayType.PHANTOM, by description."""
+    return {description: arrays[0] for description, arrays in contents.arrays.items()
+            if arrays[0].head.array_type == mrd.ArrayType.PHANTOM}
+
+
+def plot_phantom_maps(contents: Contents, filename: str) -> bool:
+    """The fitted phantom peak area map of each prescan, side by side on one shared scale."""
+    flagged = phantom_arrays(contents)
+    arr = flagged.get("phantom")
+    if arr is None:
+        return False
+    maps = np.asarray(arr.data).real
+    if maps.ndim != 3:
+        return False
+    nreps, ny, nx = maps.shape
+    scales = (np.asarray(flagged["phantom_scales"].data).real
+              if "phantom_scales" in flagged else np.full(nreps, np.nan))
+
+    # one shared scale rather than montage's per-row one, since comparing the prescans is the point
+    figure, axes = plt.subplots(1, nreps, figsize=(3.2 * nreps + 1, 3.6), squeeze=False)
+    figure.suptitle(f'phantom: {filename}')
+    vmax = float(maps.max()) or 1.0
+    for rep, axis in enumerate(axes[0]):
+        image = axis.imshow(maps[rep], cmap='gray', vmin=0, vmax=vmax, interpolation='nearest')
+        axis.set_title(f'prescan {rep}, global area {scales[rep]:.1f}', fontsize=8)
+        axis.set_xticks([])
+        axis.set_yticks([])
+    figure.colorbar(image, ax=axes[0].tolist(), label='peak area')
+    return True
+
+
 def kspace_cube(acqs: List[mrd.Acquisition], nswitch: int) -> np.ndarray:
     """
     One encoding's acquisitions as the complex cube the reconstruction fills.
@@ -393,10 +426,11 @@ def save_mat(contents: Contents, stem: str, save: Path, *, switches: int = 0) ->
     """
     Write the transformed data beside the figures as a .mat, for reading it somewhere else.
 
-    One array per encoding and nothing else: `rawdata` for the series and `phantom` for the
-    averaged prescan, each complex and indexed (repetition, view, readout point, switch). The
-    prescan is written here though the figures skip it, since it is data somebody may want; what
-    it is not is evidence about where the series' echo sits.
+    One array per encoding: `rawdata` for the series and `phantom_image` for the averaged
+    prescan, each complex and indexed (repetition, view, readout point, switch). Beside them go
+    the arrays a recon flagged ArrayType.PHANTOM, each under its own description - `phantom`,
+    the fitted area map with one slice per prescan, `phantom_scales` and `phantom_scale` - which
+    are the keys the legacy recon saved.
 
     Transformed the way mrd2recon transforms it, one repetition at a time over all three of its
     axes at once, because a DFT along the view axis is a sum over every view and no single
@@ -425,10 +459,12 @@ def save_mat(contents: Contents, stem: str, save: Path, *, switches: int = 0) ->
         for rep in range(cube.shape[0]):
             axes = (0, 1, 2)
             cube[rep] = np.fft.fftshift(np.fft.fftn(cube[rep], axes=axes), axes=axes)
-        key = 'phantom' if acqs[0].head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT \
+        key = 'phantom_image' if acqs[0].head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT \
               else 'rawdata'
         # a file with two encodings of the same kind would otherwise write one over the other
         payload[key if key not in payload else f'{key}_{ref}'] = cube
+    for description, arr in phantom_arrays(contents).items():
+        payload[description] = np.asarray(arr.data)
 
     if not payload:
         return False
@@ -448,6 +484,7 @@ def plot_mrd(input: BinaryIO, filename: str, *, switches: int = 0,
     drawn = plot_kspace(contents, filename, switches=switches)
     drawn |= plot_lorentzian_fit(contents, filename)
     drawn |= plot_metabolite_maps(contents, filename)
+    drawn |= plot_phantom_maps(contents, filename)
 
     if not drawn:
         print('nothing in this file has a figure to draw', file=sys.stderr)

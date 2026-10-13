@@ -37,9 +37,11 @@ An averaged phantom prescan, flagged IS_NOISE_MEASUREMENT by the converter, is a
 encoding with its own matrix and its own spectral axis, so it is assembled into its own buffer
 and fitted on its own. It runs through the same alignment and the same fitter as the series -
 only the noise floor, the peak list and the output names differ - and yields phantom_* arrays
-alongside the metabolite_* ones. Its phantom_global_peak_areas is the single number the
-prescan exists to provide: it is recorded, never applied, because what makes two experiments
-comparable is the consumer's decision.
+alongside the metabolite_* ones. Each prescan file is one repetition of that encoding and is
+fitted separately, as the legacy did, and the result is gathered into three arrays flagged
+ArrayType.PHANTOM: the per-prescan area map `phantom`, the per-prescan global area
+`phantom_scales` and their mean `phantom_scale`. The scaling is recorded, never applied,
+because what makes two experiments comparable is the consumer's decision.
 
 Everything the reconstruction produces goes to the output stream as mrd NdArrays, not as the
 mrd Image field, and the raw acquisitions are kept in the recon file unchanged.
@@ -773,6 +775,56 @@ def stream_epsi_image(img: np.ndarray,
                                   global_df=global_df, width_scale=width_scale)
 
 
+def stream_prescan(img: np.ndarray,
+                   xscale: np.ndarray,
+                   **fit_kwargs: Any) -> Iterable[mrd.StreamItem]:
+    """
+    Fit each prescan on its own and emit the phantom scaling the way the legacy saved it.
+
+    Every prescan file is one repetition of the prescan encoding, and each is a separate
+    calibration scan rather than a slice of one series, so each gets its own alignment, its own
+    global one-peak fit and its own voxel fits pinned to that fit - which is what the legacy did
+    per entry of phantom_imgsets. Summing them into one global spectrum instead would make the
+    scaling grow with the number of prescans an experiment happened to have.
+
+    The per-repetition phantom_* arrays go out as stream_epsi_image emits them, tagged with
+    their repetition. After them come three arrays flagged ArrayType.PHANTOM, which is how
+    mrdplot finds what to put in the .mat, each described by the key the legacy used:
+        phantom         (repetition, y, x) peak area map, one slice per prescan
+        phantom_scales  (repetition,) global peak area of each prescan
+        phantom_scale   their mean, the legacy's single phantom_scale
+    """
+    maps, scales = [], []
+    for rep in range(img.shape[0]):
+        for item in stream_epsi_image(img[rep:rep + 1], xscale, PHANTOM_SPEC,
+                                      is_prescan=True, label="phantom", **fit_kwargs):
+            item.value.meta["repetition"] = meta_values(rep)
+            description = item.value.meta["description"][0].value
+            if description == "phantom_area":
+                maps.append(np.asarray(item.value.data)[0, 0])      # (peak, rep) are both 1
+            elif description == "phantom_global_peak_areas":
+                scales.append(float(np.asarray(item.value.data)[0]))
+            yield item
+
+    yield emit(np.stack(maps),
+               dimension_labels=[mrd.ArrayDimension.REPETITION,
+                                 mrd.ArrayDimension.Y,
+                                 mrd.ArrayDimension.X],
+               array_type=mrd.ArrayType.PHANTOM,
+               description="phantom",
+               encoding="phantom")
+    yield emit(np.array(scales),
+               dimension_labels=[mrd.ArrayDimension.REPETITION],
+               array_type=mrd.ArrayType.PHANTOM,
+               description="phantom_scales",
+               encoding="phantom")
+    yield emit(np.array([np.mean(scales)]),
+               dimension_labels=[mrd.ArrayDimension.SAMPLES],
+               array_type=mrd.ArrayType.PHANTOM,
+               description="phantom_scale",
+               encoding="phantom")
+
+
 def reconstruct_mrs(input: BinaryIO,
                     output: BinaryIO,
                     *,
@@ -853,15 +905,15 @@ def reconstruct_mrs(input: BinaryIO,
                 for rep in range(buffer.img.shape[0]):
                     buffer.img[rep] = fft_kspace_to_image(buffer.img[rep])
 
+            fit_kwargs = dict(fit_df=fit_df, fit_dw=fit_dw, fit_dph=fit_dph,
+                              global_df=global_df, width_scale=width_scale)
             for ref, buffer in sorted(buffers.items()):
-                label = "phantom" if buffer.is_prescan else "metabolite"
-                writer.write_data(stream_epsi_image(
-                    buffer.img, buffer.xscale,
-                    PHANTOM_SPEC if buffer.is_prescan else spec,
-                    is_prescan=buffer.is_prescan,
-                    label=label,
-                    fit_df=fit_df, fit_dw=fit_dw, fit_dph=fit_dph,
-                    global_df=global_df, width_scale=width_scale))
+                if buffer.is_prescan:
+                    writer.write_data(stream_prescan(buffer.img, buffer.xscale, **fit_kwargs))
+                else:
+                    writer.write_data(stream_epsi_image(buffer.img, buffer.xscale, spec,
+                                                        is_prescan=False, label="metabolite",
+                                                        **fit_kwargs))
 
             # the raw acquisitions are kept in the recon file unchanged, as the legacy kept them
             writer.write_data(mrd.StreamItem.Acquisition(a) for a in acquisitions)
