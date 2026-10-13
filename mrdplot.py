@@ -20,7 +20,7 @@ converted stream, on a shift-corrected one and on a reconstruction:
     phantom                            the fitted area map of each prescan, on one shared scale
 
 With --save the figures are written as PNGs instead of shown, for running without a display, and
-the transformed readouts are written beside them as a .mat.
+the fitted metabolite and phantom maps are written beside them as a .mat.
 """
 
 import argparse
@@ -378,93 +378,32 @@ def plot_phantom_maps(contents: Contents, filename: str) -> bool:
     return True
 
 
-def kspace_cube(acqs: List[mrd.Acquisition], nswitch: int) -> np.ndarray:
+def save_mat(contents: Contents, stem: str, save: Path) -> bool:
     """
-    One encoding's acquisitions as the complex cube the reconstruction fills.
+    Write the fitted maps beside the figures as a .mat, under the keys the legacy recon used.
 
-    Indexed (repetition, view, readout point, switch), which is the arrangement every stage
-    downstream reads: the readout axis is the points the fft keeps out of each switch, and the
-    switch axis is the spectral one, since one spectral point is acquired per switch. Views and
-    repetitions come off the indices the converter set rather than off their counts, so a group
-    missing a view still lands in the right row.
+        rawdata         (repetition, y, x, metabolite) peak heights, metabolites in the order
+                        the peaks were named on the recon command line
+        phantom_1 ...   (y, x) fitted peak area map of each prescan, one key per prescan file,
+                        numbered from 1 in the order the prescans were acquired
+        phantom_scales  (prescan,) global peak area of each prescan
 
-    The samples are the ones the file holds, with no line broadening: that is a reconstruction
-    parameter rather than a property of the data.
-    Args:
-        - acqs: the acquisitions of one encoding, all at the same geometry
-        - nswitch: the switch count the readout was acquired at
-    Returns:
-        - the cube, or None when the discards leave no readout to keep
-    """
-    samples = acqs[0].samples()
-    total = samples // nswitch
-    discard_pre = acqs[0].head.discard_pre or 0
-    kept = total - discard_pre - (acqs[0].head.discard_post or 0)
-    if total < 1 or kept <= 0:
-        return None
-
-    views = sorted({acq.head.idx.kspace_encode_step_1 or 0 for acq in acqs})
-    reps = sorted({acq.head.idx.repetition or 0 for acq in acqs})
-    view_at = {view: i for i, view in enumerate(views)}
-    rep_at = {rep: i for i, rep in enumerate(reps)}
-
-    used = nswitch * total
-    cube = np.zeros((len(reps), len(views), kept, nswitch), dtype=complex)
-    for acq in acqs:
-        if acq.samples() != samples:
-            continue
-        # reshaped through the sample axis, which comes first, so this is the switch-major order
-        # the samples were acquired in, then cut to the window the fft reads
-        body = np.asarray(acq.data)[0, :used].reshape(nswitch, total)
-        cube[rep_at[acq.head.idx.repetition or 0],
-             view_at[acq.head.idx.kspace_encode_step_1 or 0]] = (
-                 body[:, discard_pre:discard_pre + kept].T)
-    return cube
-
-
-def save_mat(contents: Contents, stem: str, save: Path, *, switches: int = 0) -> bool:
-    """
-    Write the transformed data beside the figures as a .mat, for reading it somewhere else.
-
-    One array per encoding: `rawdata` for the series and `phantom_image` for the averaged
-    prescan, each complex and indexed (repetition, view, readout point, switch). Beside them go
-    the arrays a recon flagged ArrayType.PHANTOM, each under its own description - `phantom`,
-    the fitted area map with one slice per prescan, `phantom_scales` and `phantom_scale` - which
-    are the keys the legacy recon saved.
-
-    Transformed the way mrd2recon transforms it, one repetition at a time over all three of its
-    axes at once, because a DFT along the view axis is a sum over every view and no single
-    acquisition holds more than one of them. The shape is unchanged by that, so the axes stay as
-    named above and read as (repetition, y, x, frequency) afterwards.
-
-    No line broadening is applied. That is a reconstruction parameter rather than a property of
-    the samples, and applying one here would bake a choice the recon still has to make into the
-    export.
+    rawdata is metabolite_amplitude, the height the legacy saved, with the metabolite axis moved
+    last. The phantom arrays are the ones the recon flagged ArrayType.PHANTOM.
     Returns:
         - True when a file was written
     """
-    nswitch = switches or header_nswitches(contents.header)
-    if nswitch <= 1:
-        return False
-
-    groups: Dict[int, List[mrd.Acquisition]] = {}
-    for acq in contents.acquisitions:
-        groups.setdefault(acq.head.encoding_space_ref or 0, []).append(acq)
-
     payload: Dict[str, np.ndarray] = {}
-    for ref, acqs in sorted(groups.items()):
-        cube = kspace_cube(acqs, nswitch)
-        if cube is None:
-            continue
-        for rep in range(cube.shape[0]):
-            axes = (0, 1, 2)
-            cube[rep] = np.fft.fftshift(np.fft.fftn(cube[rep], axes=axes), axes=axes)
-        key = 'phantom_image' if acqs[0].head.flags & mrd.AcquisitionFlags.IS_NOISE_MEASUREMENT \
-              else 'rawdata'
-        # a file with two encodings of the same kind would otherwise write one over the other
-        payload[key if key not in payload else f'{key}_{ref}'] = cube
-    for description, arr in phantom_arrays(contents).items():
-        payload[description] = np.asarray(arr.data)
+    amplitude = contents.first(f"{LABEL}_amplitude")
+    if amplitude is not None:
+        # (metabolite, repetition, y, x) -> (repetition, y, x, metabolite)
+        payload['rawdata'] = np.moveaxis(np.asarray(amplitude.data).real, 0, -1)
+    flagged = phantom_arrays(contents)
+    if "phantom" in flagged:
+        for rep, area_map in enumerate(np.asarray(flagged["phantom"].data).real, start=1):
+            payload[f'phantom_{rep}'] = area_map
+    if "phantom_scales" in flagged:
+        payload['phantom_scales'] = np.asarray(flagged["phantom_scales"].data).real
 
     if not payload:
         return False
@@ -501,7 +440,7 @@ def plot_mrd(input: BinaryIO, filename: str, *, switches: int = 0,
             fig.savefig(path, dpi=150, bbox_inches='tight')
             print(f'wrote {path}', file=sys.stderr)
         plt.close('all')
-        save_mat(contents, stem, save, switches=switches)
+        save_mat(contents, stem, save)
     else:
         plt.show()
 
