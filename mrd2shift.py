@@ -325,31 +325,30 @@ def geometry_closes(total: int, kept: int, start: int) -> bool:
     return 4 * start + kept == total
 
 
-def readout_anchor(lines: dict, signal: np.ndarray, total: int) -> float:
+def readout_anchor(lines: dict, total: int) -> float:
     """
     Where switch 0's *readout* echo sits, read off the fitted lines rather than its own argmax.
 
     A switch crosses k-space centre twice and the two crossings sit exactly total/2 apart, so the two
     candidate anchors are equally far from any target and proximity cannot choose between them.
-    Brightness can: the readout echo is on the gradient plateau where the signal is, and the
-    rephasing one is not, so the family whose peaks average brighter is the readout family.
+    The peak count can: the readout echo is on the gradient plateau where the signal is, so it is
+    the brightest position on more switches than the rephasing one.  Not the family whose peaks
+    average brighter - the signal decays along the train, so that mean measures *when* a family's
+    switches fall rather than which echo it is.  On cirrhrat_48_1 the rephasing family won only 10
+    switches, 7 of them in the first 21, and averaged 95 against the readout family's 80 over 54;
+    anchored on it the correction put the readout echo at 25 of 28, outside the window.
 
     Read off the fitted line rather than off switch 0 itself because switch 0 peaks on whichever of
     its two echoes won there.  On cirrhrat_43_1 that is the rephasing one - its argmax reads 17 where
     its neighbours read 3, 4, 5 - and anchoring on that would aim the whole correction at the wrong
     echo, putting the readout echo at position 1 of 28.
     Args:
-        - lines: what fit_peak_lines returned for `signal`
-        - signal: (switch, position) magnitude, the array `lines` was fitted from
+        - lines: what fit_peak_lines returned
     Returns:
         - switch 0's readout echo position, wrapped into one switch
     """
-    peaks = lines['peaks']
-    first = lines['first_family']
-    brightness = signal[np.arange(len(peaks)), peaks]
-    on_first = float(brightness[first].mean()) if first.any() else -np.inf
-    on_second = float(brightness[~first].mean()) if (~first).any() else -np.inf
-    intercept = lines['first_intercept'] if on_first >= on_second else lines['second_intercept']
+    on_first = lines['on_first'] >= lines['on_second']
+    intercept = lines['first_intercept'] if on_first else lines['second_intercept']
     return float(intercept % total)
 
 
@@ -780,7 +779,7 @@ def correct_stream(input_path: str, output_path: Optional[str], method: str = DE
     # over the raw data rather than over whichever one was already applied to the stream
     raw_lines = pooled_lines(pool) if plot else []
     drift = measure_drift(cube, nswitch, total)
-    anchor = readout_anchor(drift['lines'], raw_signal, total)
+    anchor = readout_anchor(drift['lines'], total)
     measured_pad = measure_pad(anchor, total, start, kept)
     applied_pad = measured_pad if pad is None else int(pad)
     expected = start + kept // 2
@@ -834,12 +833,11 @@ def correct_stream(input_path: str, output_path: Optional[str], method: str = DE
                 # both fit it badly.  A layout that cannot measure its own drift is left alone
                 # rather than corrected by extrapolation - being left alone is the better failure.
                 own_cube, _ = acquisition_cube(group, n, t)
-                own_signal = np.abs(own_cube).sum(axis=(2, 3))
                 own = measure_drift(own_cube, n, t)
                 scaled = own['slope'] if own['usable'] and method != "none" else 0.0
                 # the pad needs `start + kept // 2`, which means nothing when the layout's own
                 # numbers do not account for its switch
-                pad_here = (measure_pad(readout_anchor(own['lines'], own_signal, t), t, s, k)
+                pad_here = (measure_pad(readout_anchor(own['lines'], t), t, s, k)
                             if geometry_closes(t, k, s) else 0)
                 if not own['usable'] or not pad_here:
                     print(f"    the {t} point layout is left as it is: "
@@ -874,15 +872,15 @@ def correct_stream(input_path: str, output_path: Optional[str], method: str = DE
 
     # Where the echo ends up, against the window the reconstruction reads.  With the pad applied
     # these should agree: the pad is what puts the echo on the position the sequence asks for, and
-    # the method is what holds the rest of the train there, so a warning here is now a real finding
-    # rather than the standing complaint it was when nothing moved the readout at all.
+    # the method is what holds the rest of the train there, so an echo outside it means the
+    # correction aimed at the wrong place and the stream is refused rather than written.
     landed = int(np.argmax(corrected_signal.sum(axis=0)))
     inside = start <= landed <= start + kept - 1
     print(f"  the echo lands at {landed}, against the {expected} the sequence puts it at "
           f"(ramp {start} + {kept}/2) and the {start}..{start + kept - 1} the reconstruction reads",
           file=sys.stderr)
     if not inside:
-        print(f"WARNING the echo sits OUTSIDE the window the reconstruction reads, so the drift is "
+        print(f"ERROR the echo sits OUTSIDE the window the reconstruction reads, so the drift is "
               f"straight but the readout is in the wrong place; a base of "
               f"{applied_pad + expected - landed:+d} rather than {applied_pad:+d} would centre it",
               file=sys.stderr)
@@ -903,6 +901,9 @@ def correct_stream(input_path: str, output_path: Optional[str], method: str = DE
                            f"{Path(input_path).name}: {drift['slope']:+.4f} per switch, "
                            f"base {applied_pad:+d}", Path(plot))
 
+    if not inside:
+        print("  nothing was written", file=sys.stderr)
+        return 1
     if output_path:
         write_stream(output_path, header, items)
         print(f"wrote {output_path}", file=sys.stderr)
